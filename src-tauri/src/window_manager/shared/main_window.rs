@@ -28,6 +28,10 @@ pub fn show_or_create_main_window(app_handle: &AppHandle) {
         // 设置加载的入口 URL
         tauri::WebviewUrl::App("index.html".into()),
     )
+    // WebView2 用户数据固定到 D 盘，不写 C 盘 LocalAppData。
+    .data_directory(std::path::PathBuf::from(
+        r"D:\Program Files\li-calendar\webview-data\main",
+    ))
     .title("松鼠日历") // 设置窗口标题
     .inner_size(800.0, 600.0) // 设置窗口内部大小
     .center() // 窗口居中

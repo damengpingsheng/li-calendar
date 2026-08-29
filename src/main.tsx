@@ -7,9 +7,19 @@ import MacosPopupWindow from './windows/MacosPopupWindow.tsx';
 import MainWindow from './windows/MainWindow.tsx';
 import MobileWindow from './windows/mobile/MobileWindow.tsx';
 import PopupWindow from './windows/PopupWindow.tsx';
+import ClockOverlayWindow from './windows/ClockOverlayWindow.tsx';
 import './global.css';
 import { useWindowsTrayClockBootstrap } from './hooks/settings/useWindowsTrayClockBootstrap.ts';
 import { prepareSync } from './sync/base/crossWindowSync.ts';
+import { emit } from '@tauri-apps/api/event';
+
+// 前端运行时错误上报给后端写日志（诊断窗口未渲染等问题）
+window.addEventListener('error', (e) => {
+  void emit('ov-err', e.message ?? String(e.error));
+});
+window.addEventListener('unhandledrejection', (e) => {
+  void emit('ov-err', 'rej:' + String(e.reason));
+});
 
 /** 根据当前平台和 URL 参数，决定应用根节点应该渲染哪一种窗口视图。 */
 const resolveWindow = (
@@ -27,6 +37,9 @@ const resolveWindow = (
   }
   if (kind === 'desktop') {
     return <DesktopWindow />;
+  }
+  if (kind === 'clock_overlay') {
+    return <ClockOverlayWindow />;
   }
   if (isMobile) {
     if (mobileView === 'settings') {

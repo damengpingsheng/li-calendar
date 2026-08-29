@@ -6,12 +6,15 @@ use tauri::{
 };
 use windows::Win32::Foundation::HWND;
 
+#[path = "windows/clock_overlay.rs"]
+mod clock_overlay;
 #[path = "windows/desktop_widget.rs"]
 mod desktop_widget;
 #[path = "windows/main_window.rs"]
 pub mod main_window;
 #[path = "windows/taskbar_popup.rs"]
 mod taskbar_popup;
+pub use clock_overlay::relocate_clock_overlay;
 
 /// 管理任务栏日历弹窗、桌面日历与可选叠加说明窗口。
 pub struct CalendarWindowManager {

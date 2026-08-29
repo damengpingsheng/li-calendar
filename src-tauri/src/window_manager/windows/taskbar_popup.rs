@@ -183,11 +183,18 @@ impl CalendarWindowManager {
         suppress_popup_auto_hide: Arc<AtomicBool>,
         popup_last_show_input_tick: Arc<std::sync::atomic::AtomicU32>,
     ) -> Option<WebviewWindow> {
-        let popup_window = tauri::WebviewWindowBuilder::new(
+        let mut builder = tauri::WebviewWindowBuilder::new(
             app_handle,
             "calendar",
             tauri::WebviewUrl::App("index.html?window=popup".into()),
-        )
+        );
+        // 固定 WebView2 用户数据目录（主窗口数据同目录下子目录），
+        // 避免非主窗口默认写入 %TEMP% 导致每次启动堆积 ~68MB EBWebView。
+        // WebView2 用户数据固定到 D 盘，不再写 C 盘。
+        builder = builder.data_directory(std::path::PathBuf::from(
+            r"D:\Program Files\li-calendar\webview-data\popup",
+        ));
+        let popup_window = builder
         .title("松鼠日历")
         .inner_size(360.0, 520.0)
         .resizable(false)

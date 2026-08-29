@@ -291,3 +291,10 @@ pub async fn test_clock_detection(state: State<'_, AppState>) -> Result<String, 
         Err("无法访问Hook管理器".to_string())
     }
 }
+
+/// 重新定位并贴合任务栏时钟覆盖层窗口（前端在挂载、时钟区域可能变化时调用）。
+#[tauri::command]
+pub async fn relocate_clock_overlay_command(app_handle: AppHandle) -> Result<(), String> {
+    crate::window_manager::relocate_clock_overlay(&app_handle);
+    Ok(())
+}

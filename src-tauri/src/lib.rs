@@ -18,11 +18,11 @@ use commands::{
     apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
     get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
     get_supported_window_effects, get_system_time_millis_since_epoch, greet, hide_calendar,
-    open_main_window, popup_ready,
-    restore_default_clock, set_calendar_pin, set_desktop_widget_enabled,
-    set_macos_tray_bar_icon, set_macos_tray_date_icon_style, set_macos_tray_icon_px,
-    set_macos_tray_title_template, set_macos_vibrancy, set_taskbar_widget_enabled_command,
-    show_calendar, test_clock_detection, toggle_calendar, toggle_calendar_at_position,
+    open_main_window, popup_ready, relocate_clock_overlay_command, restore_default_clock,
+    set_calendar_pin, set_desktop_widget_enabled, set_macos_tray_bar_icon,
+    set_macos_tray_date_icon_style, set_macos_tray_icon_px, set_macos_tray_title_template,
+    set_macos_vibrancy, set_taskbar_widget_enabled_command, show_calendar, test_clock_detection,
+    toggle_calendar, toggle_calendar_at_position,
 };
 #[cfg(desktop)]
 use menu::handle_menu_event;
@@ -75,10 +75,24 @@ pub struct AppState {
 static ALLOW_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(desktop)]
+/// 追加写入诊断日志（定位右键菜单「退出」无反应）。
+fn dbg_log(msg: &str) {
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(r"D:\agents_tmp\menu_dbg.log")
+    {
+        use std::io::Write;
+        let _ = writeln!(f, "{}", msg);
+    }
+}
+
+#[cfg(desktop)]
 /// 触发应用安全退出。
 ///
 /// * `app` - 应用程序句柄
 pub(crate) fn request_app_exit(app: &tauri::AppHandle) {
+    dbg_log("request_app_exit called");
     // 设置允许退出标志为真
     ALLOW_EXIT.store(true, Ordering::SeqCst);
     // 退出程序并返回状态码 0
@@ -108,7 +122,9 @@ pub fn run() {
         ))
         .on_menu_event(|app, event| {
             // 处理系统菜单事件
-            handle_menu_event(app, event.id().as_ref());
+            let mid = event.id().as_ref().to_string();
+            dbg_log(&format!("menu_event:{}", mid));
+            handle_menu_event(app, &mid);
         })
         .manage(shared_state) // 注入应用状态
         .invoke_handler(tauri::generate_handler![
@@ -137,6 +153,7 @@ pub fn run() {
             set_taskbar_widget_enabled_command,
             set_macos_vibrancy,
             open_main_window,
+            relocate_clock_overlay_command,
             set_calendar_pin
         ])
         .setup(|app| app_runtime::desktop::setup_desktop_app(app)) // 设置生命周期钩子
@@ -167,7 +184,9 @@ pub fn run() {
                 // 监听退出请求事件
                 if let RunEvent::ExitRequested { api, .. } = event {
                     // 如果不允许退出，则阻止退出（实现最小化到托盘）
-                    if !ALLOW_EXIT.load(Ordering::SeqCst) {
+                    let allow = ALLOW_EXIT.load(Ordering::SeqCst);
+                    dbg_log(&format!("exit_requested allow={}", allow));
+                    if !allow {
                         api.prevent_exit();
                     }
                 }

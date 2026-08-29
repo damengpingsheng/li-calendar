@@ -30,5 +30,4 @@ pub static TASKBAR_WIDGET_ENABLED: AtomicBool = AtomicBool::new(false);
 /// 任务栏时钟区域矩形缓存（钩子初始化或应用/恢复自定义时钟后 UIA 写入；[`super::clock_window::is_mouse_in_clock_area`] 只读）。
 ///
 /// 绝不能在 `WH_MOUSE_LL` 回调里调用 UIA，否则会造成全系统输入卡顿。
-pub static CLOCK_AREA_RECT_CACHE: Lazy<RwLock<Option<RECT>>> =
-    Lazy::new(|| RwLock::new(None));
+pub static CLOCK_AREA_RECT_CACHE: Lazy<RwLock<Option<RECT>>> = Lazy::new(|| RwLock::new(None));

@@ -7,7 +7,7 @@ use crate::AppState;
 #[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tauri::{Manager, State};
+use tauri::{Listener, Manager, State};
 
 /// 构建桌面端共享状态，按平台初始化对应字段。
 pub fn create_shared_state() -> AppState {
@@ -54,8 +54,13 @@ pub fn create_shared_state() -> AppState {
 pub fn setup_desktop_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let app_handle = app.handle();
     let app_state: State<AppState> = app.state();
+    // 前端运行时错误写入文件，便于诊断窗口未渲染等问题。
+    let _ = app_handle.listen("ov-err", move |ev| {
+        let msg = format!("{:?}", ev.payload());
+        let _ = std::fs::write(r"D:\agents_tmp\overlay_err.log", msg);
+    });
     #[cfg(windows)]
-    let show_startup_popup = !std::env::args().any(|arg| arg == "--autostart");
+    let show_startup_popup = false;
 
     #[cfg(target_os = "macos")]
     {

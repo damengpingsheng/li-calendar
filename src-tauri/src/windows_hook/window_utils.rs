@@ -1,7 +1,9 @@
 //! 窗口类名与桌面前台检测。
 
 use windows::Win32::Foundation::*;
-use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITOR_DEFAULTTONEAREST, MONITORINFO};
+use windows::Win32::Graphics::Gdi::{
+    GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 /// 读取窗口类名（UTF-16 缓冲）。

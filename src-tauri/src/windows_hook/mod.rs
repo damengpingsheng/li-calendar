@@ -25,6 +25,8 @@ pub use mouse_hook::{set_taskbar_widget_enabled, start_hook_message_thread, Wind
 pub use registry_clock::{
     disable_custom_clock, get_current_system_time_format, set_custom_clock_text,
 };
+/// 任务栏时钟区域矩形缓存（UIA 定位），供覆盖层贴合时钟使用。
+pub use state::CLOCK_AREA_RECT_CACHE;
 /// 任务栏右键菜单是否正在显示（防重复弹出）。
 pub use state::IS_MENU_OPEN;
 /// 钩子向 Tokio 侧发送的点击事件与按键枚举。

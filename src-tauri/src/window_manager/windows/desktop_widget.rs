@@ -118,11 +118,16 @@ impl CalendarWindowManager {
         app_handle: &tauri::AppHandle,
         initial_position: Option<(i32, i32)>,
     ) -> Result<tauri::WebviewWindow, Box<dyn std::error::Error>> {
-        let window = tauri::WebviewWindowBuilder::new(
+        let mut builder = tauri::WebviewWindowBuilder::new(
             app_handle,
             "desktop_calendar",
             tauri::WebviewUrl::App("index.html?window=desktop".into()),
-        )
+        );
+        // WebView2 用户数据固定到 D 盘（webview-data/desktop），不再写 C 盘 LocalAppData。
+        builder = builder.data_directory(std::path::PathBuf::from(
+            r"D:\Program Files\li-calendar\webview-data\desktop",
+        ));
+        let window = builder
         .title("桌面日历")
         .inner_size(360.0, 520.0)
         .resizable(false)

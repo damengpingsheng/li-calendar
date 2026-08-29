@@ -11,6 +11,8 @@ mod windows;
 #[cfg(windows)]
 pub use windows::main_window::show_or_create_main_window;
 #[cfg(windows)]
+pub use windows::relocate_clock_overlay;
+#[cfg(windows)]
 pub use windows::CalendarWindowManager;
 
 #[cfg(target_os = "macos")]
