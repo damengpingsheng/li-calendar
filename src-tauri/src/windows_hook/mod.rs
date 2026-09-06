@@ -17,7 +17,9 @@ mod window_utils;
 // ---- 对外 API（与拆分前 `windows_hook` 根模块保持一致）----
 
 /// 主任务栏几何信息与是否横向；供弹窗定位使用。
-pub use clock_window::{find_clock_window, get_taskbar_info, refresh_clock_rect_if_in_taskbar};
+pub use clock_window::{
+    find_clock_window, get_taskbar_info, is_mouse_in_clock_area, refresh_clock_rect_if_in_taskbar,
+};
 pub(crate) use clock_window::refresh_clock_area_cache;
 /// 任务栏组件开关、钩子消息泵线程、钩子管理器、退出时显式卸钩。
 pub use mouse_hook::{

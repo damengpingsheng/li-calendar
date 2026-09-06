@@ -31,8 +31,9 @@ pub struct WindowsHookManager {
 static LEFT_LAST_PASSED: AtomicBool = AtomicBool::new(false);
 /// 时钟区最近一次右键按下是否被放行（成对处置：抬起按此决定吞放）。
 static RIGHT_LAST_PASSED: AtomicBool = AtomicBool::new(false);
-/// 菜单刚被时钟区内的按下关闭：吞掉随后的右键抬起（使该右键成为纯粹的
-/// "关闭菜单"操作，不弹原生菜单不产生孤儿事件）。
+/// 时钟区内的右键按下了刚关闭菜单：随后的右键抬起被吞掉，但作为一次
+/// **新的右键**投递——按「每次右键都重新弹出菜单」的预期，菜单在抬起时
+/// 重新弹出（而非静默吞掉后需要第三次右键才再弹出）。
 static NATIVE_DISMISS_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 设置是否启用任务栏日历组件；关闭时会清理自定义时钟。
@@ -307,8 +308,8 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
     // 右键菜单显示期间（原生路径，无前台——TPM 不处理菜单项点击与菜单外关闭，
     // 由钩子全权代管交互），按三区域处置：
-    // - 时钟区按下：关闭菜单 + 整体吞掉（右键置 pending 吞掉随后的抬起，
-    //   使这次右键成为纯粹的"关闭菜单"操作，不弹原生菜单不卡输入）；
+    // - 时钟区按下：关闭菜单 + 整体吞掉（右键置 pending，随后的抬起吞掉并把
+    //   这次右键作为新右键投递 → 菜单重新弹出，符合"每次右键都重新弹出"）；
     // - 菜单外其他位置按下：关闭菜单 + 放行（点击送达下层目标）；
     // - 抬起在菜单内 → 按上/下半路由：上半=设置，下半=退出（左右键均支持）；
     // - 菜单内的其他事件放行（TPM 菜单窗口自行处理/忽略）。
@@ -372,8 +373,17 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             }
             return LRESULT(1);
         }
-        // 菜单刚被时钟区内的按下关闭：这次抬起静默吞掉（不弹原生菜单不触发）
+        // 菜单刚被本次右键的按下关闭：吞掉这对事件的同时，把这次右键作为
+        // 新的右键投递——菜单在抬起时重新弹出（与"每次右键都重新弹出"的
+        // 系统菜单习惯一致）。重新弹出走监听端的完整路径（含 tooltip 压制）。
         if NATIVE_DISMISS_PENDING.swap(false, Ordering::SeqCst) {
+            if let Ok(sender_guard) = EVENT_SENDER.lock() {
+                if let Some(sender) = sender_guard.as_ref() {
+                    let event =
+                        ClickEvent { x, y, in_clock_area: true, button: MouseButton::Right };
+                    let _ = sender.send(event);
+                }
+            }
             return LRESULT(1);
         }
         if RIGHT_LAST_PASSED.load(Ordering::SeqCst) {

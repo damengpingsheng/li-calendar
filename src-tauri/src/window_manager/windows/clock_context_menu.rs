@@ -15,7 +15,7 @@ use std::sync::RwLock;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use windows::core::BOOL;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LRESULT, LPARAM, WPARAM};
+use windows::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, ReleaseCapture, INPUT, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
@@ -23,12 +23,13 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, EnumWindows,
-    FindWindowW, GetClassNameW, GetForegroundWindow, GetSystemMetrics, GetWindowThreadProcessId,
-    HWND_TOPMOST, IsWindowVisible, MF_STRING, PostMessageW, RegisterClassW,
-    SetForegroundWindow, SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN, SPI_GETWORKAREA,
-    SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS,
-    SystemParametersInfoW, TPM_BOTTOMALIGN, TPM_CENTERALIGN, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WINDOW_EX_STYLE, WM_CANCELMODE, WNDCLASSW, WS_POPUP,
+    FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
+    GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, MF_STRING, PostMessageW,
+    RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
+    SPI_GETWORKAREA, SW_HIDE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SystemParametersInfoW, TPM_BOTTOMALIGN, TPM_CENTERALIGN,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WINDOW_EX_STYLE, WM_CANCELMODE, WNDCLASSW,
+    WS_POPUP,
 };
 
 /// 菜单窗口逻辑尺寸（与前端样式保持一致）。项目做大以保证点击命中宽容度。
@@ -381,6 +382,46 @@ pub fn native_menu_rect() -> Option<(i32, i32, i32, i32)> {
     NATIVE_MENU_RECT.read().ok().and_then(|g| *g)
 }
 
+/// 菜单跟踪期间的「时钟区悬停守护」线程：指针在时钟区连续停留超过 300ms
+/// 时主动关闭菜单。
+///
+/// 动机：菜单开着时用户把指针移回时钟悬停，系统 tooltip 会重新弹出并盖在
+/// 菜单上（菜单跟踪期间悬停输入仍流向任务栏，实测复现）。要阻止 tooltip
+/// 只能在指针进入时钟区时争抢用户光标（反复挪动用户鼠标，不可取），因此
+/// 选择：**悬停时钟 = 用户已离开菜单 → 关闭菜单**，让 tooltip 独立显示、
+/// 不再与菜单重叠；之后再右键会重新弹出菜单（见 mouse_hook 的
+/// `NATIVE_DISMISS_PENDING` 重开路径）。300ms 阈值保证快速划过时钟区、
+/// 以及移回时钟立刻右键（重开菜单）都不受影响。
+fn spawn_menu_hover_guard() {
+    std::thread::spawn(|| {
+        let mut in_clock_since: Option<std::time::Instant> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !crate::windows_hook::NATIVE_MENU_TRACKING.load(Ordering::SeqCst) {
+                return;
+            }
+            if !IS_MENU_OPEN.load(Ordering::SeqCst) {
+                in_clock_since = None;
+                continue;
+            }
+            let mut pt = POINT::default();
+            let pos = unsafe { GetCursorPos(&mut pt) }.is_ok();
+            let in_clock =
+                pos && crate::windows_hook::is_mouse_in_clock_area(pt.x, pt.y);
+            if !in_clock {
+                in_clock_since = None;
+                continue;
+            }
+            let since = *in_clock_since.get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() >= std::time::Duration::from_millis(300) {
+                in_clock_since = None;
+                crate::dbg_log("menu hover guard: pointer dwelling on clock, dismiss menu");
+                dismiss_native_menu_from_hook();
+            }
+        }
+    });
+}
+
 /// 原生 TrackPopupMenu 菜单：同步跟踪至选择/取消。
 ///
 /// 关键设计（血泪教训，勿回退）：
@@ -392,6 +433,7 @@ pub fn native_menu_rect() -> Option<(i32, i32, i32, i32)> {
 pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static str> {
     IS_MENU_OPEN.store(true, Ordering::SeqCst);
     crate::windows_hook::NATIVE_MENU_TRACKING.store(true, Ordering::SeqCst);
+    spawn_menu_hover_guard();
     let result;
     unsafe {
         let Some(owner) = ensure_menu_owner_window() else {
