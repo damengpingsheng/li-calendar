@@ -31,7 +31,7 @@
 1. **禁止跨进程 `GWLP_HWNDPARENT`**：桌面日历曾挂为 Progman 的 owned window——跨进程 owner 会让系统**隐式合并两线程输入队列**（等价 AttachThreadInput，从启动起持续），导致桌面左键失灵/任务栏正常/右键自愈/退出残留。现为普通置底顶层窗口（`HWND_BOTTOM`，壁纸之上、应用之下），WIN+D 后由钩子在任意桌面左键点击时经 `ensure_desktop_widget_on_desktop`（IsIconic 检测）恢复。
 2. **禁止 `AttachThreadInput`**（所有路径已全删；原生菜单前台获取只用 ALT 解锁 + SetForegroundWindow）。
 3. **禁止失焦隐藏菜单**：真实环境焦点常被抢走，失焦即隐藏会让用户点在空处。
-4. **tooltip 压制**：任务栏 tooltip 悬浮在时钟正上方（菜单「退出」项位置），置顶且视觉遮挡菜单；菜单显示时隐藏任务栏线程所有 `tooltips_class32` 窗口（`hide_taskbar_tooltips`；原生菜单靠 TPM 捕获保证点击可达）。
+4. **tooltip 压制（两套手段缺一不可）**：任务栏 tooltip 悬浮在时钟正上方（菜单「退出」项位置），会视觉遮挡菜单。① 老系统（经典任务栏）：菜单显示时隐藏任务栏线程所有 `tooltips_class32` 窗口（`hide_taskbar_tooltips`）。② 新版 Win11（26200 实测）：时钟 tooltip 由 XAML 画在任务栏合成层，**没有可隐藏的 Win32 窗口**，且对 `WM_CANCELMODE`/`WM_MOUSELEAVE`(674/675) 消息注入免疫，`SetCursorPos` 也不触发/不消除它（不走指针输入管线）——唯一有效手段是菜单弹出前用 **`SendInput` 两段式移动光标**：先移到任务栏最右缘「显示桌面」细条（指针必须**进入其他任务栏元素**才会重算悬停，直接移出任务栏带 tooltip 仍残留），~120ms 后跳到菜单落点（`move_cursor_to_dismiss_tooltip`）。时钟按钮几乎占据整个托盘区（喇叭右侧全算），别选它左边当落点。
 5. **右键抬起（UP）才触发菜单**；菜单显示期间钩子按 `MENU_RECT` 精确判定：点菜单内放行、点菜单外隐藏菜单并放行点击给下层。
 6. **退出用 `std::process::exit(0)` 硬退出**：先恢复时钟注册表（留 300ms 传播）→ 卸钩 → exit。`app.exit(0)` 间歇失效会留下半退出状态。
 
