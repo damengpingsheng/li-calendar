@@ -9,16 +9,40 @@
 use super::{get_window_hwnd, CalendarWindowManager};
 use crate::window_manager::shared::popup_manager::PopupManager;
 use tauri::WebviewWindow;
+use windows::core::w;
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    GetForegroundWindow, GetWindow, GetWindowLongPtrW, IsIconic, SetForegroundWindow,
-    SetWindowPos, ShowWindow, GWL_STYLE, GW_HWNDLAST, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE,
-    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WS_CHILD,
+    FindWindowW, GetForegroundWindow, GetWindow, GetWindowLongPtrW, IsIconic,
+    SetForegroundWindow, SetWindowLongPtrW, SetWindowPos, ShowWindow, GWL_STYLE, GW_HWNDLAST,
+    GWLP_HWNDPARENT, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WS_CHILD,
 };
 
 /// 把窗口压到非置顶层最底部（壁纸/桌面之上、其他应用窗口之下）。
 /// 仅当尚不处于最底时才调用 `SetWindowPos`，避免每次点击都产生层级抖动。
 fn pin_window_to_bottom(window_hwnd: HWND) {
+    // 诊断开关：存在标记文件时恢复旧的 Progman 跨进程挂接（层 1 变量隔离实验用）——
+    // 跨进程 owner 会隐式合并两线程输入队列（等价 AttachThreadInput）。
+    if std::path::Path::new(r"D:\agents_tmp\pin_progman").exists() {
+        unsafe {
+            if let Ok(progman) = FindWindowW(w!("Progman"), None) {
+                if !progman.0.is_null() {
+                    SetWindowLongPtrW(window_hwnd, GWLP_HWNDPARENT, progman.0 as isize);
+                    let _ = SetWindowPos(
+                        window_hwnd,
+                        None,
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+                    );
+                    println!("⚠️ 诊断：桌面日历已挂接 Progman（pin_progman 开关）");
+                    return;
+                }
+            }
+        }
+    }
     unsafe {
         // 已是最底层（前面没有同带窗口）则跳过。
         let last = GetWindow(window_hwnd, GW_HWNDLAST).unwrap_or_default();

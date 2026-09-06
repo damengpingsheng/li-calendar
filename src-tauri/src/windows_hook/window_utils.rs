@@ -49,10 +49,14 @@ pub fn is_foreground_fullscreen() -> bool {
         if hwnd.0.is_null() {
             return false;
         }
-        // 桌面本身不算全屏应用
-        if is_desktop_in_foreground() {
+    // 桌面本身不算全屏应用
+    if is_desktop_in_foreground() {
+        // 诊断开关：存在标记文件时恢复旧的误判行为（层 5 变量隔离实验用）——
+        // 桌面前台时视为全屏 → 钩子放行时钟点击（点时钟无反应/原生菜单）。
+        if !std::path::Path::new(r"D:\agents_tmp\fs_desktop_fullscreen").exists() {
             return false;
         }
+    }
         let mut win_rect = RECT::default();
         if GetWindowRect(hwnd, &mut win_rect).is_err() {
             return false;
