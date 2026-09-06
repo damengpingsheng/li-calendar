@@ -10,7 +10,10 @@ use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use super::clock_window::{find_clock_window, is_mouse_in_clock_area, update_clock_area_cache};
+use super::clock_window::{
+    find_clock_window, is_mouse_in_clock_area, refresh_clock_rect_if_in_taskbar,
+    update_clock_area_cache,
+};
 use super::registry_clock::disable_custom_clock;
 use super::state::{
     EVENT_SENDER, HOOK_HANDLE, IS_MENU_OPEN, NATIVE_MENU_TRACKING, TASKBAR_WIDGET_ENABLED,
@@ -150,6 +153,18 @@ pub fn start_hook_message_thread() {
                         println!("✅ 已在专用消息泵线程上安装鼠标钩子");
                         // 初始化时做一次 UIA 取矩形；钩子回调内只读缓存，不得在此线程之外重复轮询刷新。
                         update_clock_area_cache();
+                        // 周期性重探时钟矩形（独立线程，UIA 不进钩子回调）：
+                        // 启动时探测发生在自定义时钟文本写入前后，任务栏重排会令矩形过期；
+                        // 周期刷新保证任何重排后最多 ~2 秒自愈（表现为点时钟无反应/弹原生菜单）。
+                        std::thread::spawn(|| {
+                            loop {
+                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                if !TASKBAR_WIDGET_ENABLED.load(Ordering::SeqCst) {
+                                    continue;
+                                }
+                                update_clock_area_cache();
+                            }
+                        });
                     }
                     Err(e) => {
                         eprintln!("❌ 安装鼠标钩子失败: {:?}", e);
@@ -258,6 +273,13 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     // 用于定位”桌面左键失灵”时点击实际被谁接收。
     forensics_log_event(msg, x, y);
 
+    // 任务栏带内按下时轻量重探时钟矩形（IsWindow+GetWindowRect，微秒级）：
+    // 任务栏重排（自定义文本应用、图标增减等）会让启动时缓存的时钟矩形过期，
+    // 不自愈则时钟点击全部放行给原生（表现为点时钟无反应/弹原生菜单）。
+    if is_down {
+        crate::windows_hook::refresh_clock_rect_if_in_taskbar(x, y);
+    }
+
     let in_clock = is_mouse_in_clock_area(x, y);
     let menu_open = IS_MENU_OPEN.load(Ordering::SeqCst);
     let native_tracking = NATIVE_MENU_TRACKING.load(Ordering::SeqCst);
@@ -289,6 +311,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         if native_tracking {
             if is_down && msg == WM_RBUTTONDOWN {
                 crate::window_manager::dismiss_native_menu_from_hook();
+                // 该按下被我们吞掉（系统无感知），必须修正配对标记为"已吞"——
+                // 否则抬起会被放行为孤儿事件，搅乱任务栏输入状态（表现为
+                // 菜单关闭后我们的菜单再也弹不出）。
+                RIGHT_LAST_PASSED.store(false, Ordering::SeqCst);
             }
             if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
                 return LRESULT(1);

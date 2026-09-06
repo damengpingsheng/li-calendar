@@ -4,6 +4,9 @@
 //! 后端把透明窗口贴合到任务栏时钟矩形、并让鼠标穿透（点击落到系统时钟→由低级鼠标钩子
 //! 处理弹日历/右键菜单），前端 `ClockOverlayWindow` 负责渲染农历与天气。
 use tauri::{AppHandle, Manager, WebviewWindow};
+use windows::Win32::Foundation::HWND;
+
+use super::get_window_hwnd;
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明、置顶、无边框、忽略鼠标）。
 impl super::CalendarWindowManager {
@@ -38,6 +41,12 @@ impl super::CalendarWindowManager {
         let _ = window.set_ignore_cursor_events(true);
         Some(window)
     }
+}
+
+/// 供低级钩子等模块获取指定标签窗口的 Win32 句柄。
+/// （时钟点击判定使用覆盖窗口矩形：可见的自定义时钟在哪里，点击区就在哪里。）
+pub fn window_hwnd_by_label(app_handle: &AppHandle, label: &str) -> Option<HWND> {
+    app_handle.get_webview_window(label).and_then(|w| get_window_hwnd(&w))
 }
 
 /// 重新将覆盖层窗口贴合到任务栏时钟矩形（UIA 定位），并调整尺寸覆盖原时钟文字。

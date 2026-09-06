@@ -21,6 +21,7 @@ pub use clock_context_menu::{
     menu_rect_contains, precreate_clock_context_menu, show_clock_context_menu,
     track_native_clock_menu,
 };
+pub use clock_overlay::window_hwnd_by_label;
 pub use clock_overlay::relocate_clock_overlay;
 
 /// 管理任务栏日历弹窗、桌面日历与可选叠加说明窗口。

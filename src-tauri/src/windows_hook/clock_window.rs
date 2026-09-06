@@ -1,14 +1,64 @@
 //! 任务栏时钟窗口查找、矩形探测与点击区域判定。
 
+use std::ffi::c_void;
 use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::Variant::VARIANT;
+use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Accessibility::*;
+use windows::Win32::UI::HiDpi::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::state::CLOCK_AREA_RECT_CACHE;
 use super::window_utils::get_window_class_name;
+
+/// 校验/修正时钟矩形：物理矩形必须完整落在任务栏带内（允许 20px 容差，越界部分收拢）。
+///
+/// UIA `BoundingRectangle` 在进程 DPI 感知与系统不匹配时会返回**逻辑坐标**
+/// （本机 4K/175% 实测约 (2085,1186)），与物理坐标差一个缩放系数——
+/// 按系统 DPI 缩放修正后若能落入任务栏带则采用修正值；仍不符则返回 None。
+unsafe fn validate_or_scale_clock_rect(rect: RECT) -> Option<RECT> {
+    let Some((taskbar, _)) = get_taskbar_info() else {
+        return Some(rect);
+    };
+    const TOL: i32 = 20;
+    let fits = |r: &RECT| {
+        r.right > r.left
+            && r.bottom > r.top
+            && r.left >= taskbar.left - TOL
+            && r.right <= taskbar.right + TOL
+            && r.top >= taskbar.top - TOL
+            && r.bottom <= taskbar.bottom + TOL
+    };
+    let clamp = |mut r: RECT| {
+        r.left = r.left.clamp(taskbar.left, taskbar.right);
+        r.right = r.right.clamp(r.left, taskbar.right);
+        r.top = r.top.clamp(taskbar.top, taskbar.bottom);
+        r.bottom = r.bottom.clamp(r.top, taskbar.bottom);
+        r
+    };
+    if fits(&rect) {
+        return Some(clamp(rect));
+    }
+    let dpi = GetDpiForSystem();
+    let scale = dpi as f32 / 96.0;
+    if scale <= 0.01 {
+        return None;
+    }
+    let to_i32 = |v: f32| v as i32;
+    let scaled = RECT {
+        left: to_i32(rect.left as f32 * scale),
+        top: to_i32(rect.top as f32 * scale),
+        right: to_i32(rect.right as f32 * scale),
+        bottom: to_i32(rect.bottom as f32 * scale),
+    };
+    if fits(&scaled) {
+        Some(clamp(scaled))
+    } else {
+        None
+    }
+}
 
 /// 通过 UI Automation 在 Shell 托盘树上查找时钟控件屏幕矩形。
 pub fn get_clock_rect_via_uia() -> Option<RECT> {
@@ -23,11 +73,13 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
                 && rect.right > rect.left
                 && rect.bottom > rect.top
             {
-                return Some(rect);
+                if let Some(valid) = validate_or_scale_clock_rect(rect) {
+                    return Some(valid);
+                }
             }
         }
 
-        // 原 UIA 兜底（逻辑坐标，仅在高 DPI 下会错位——已被上面物理优先覆盖）。
+        // 原 UIA 兜底（返回值经 validate_or_scale_clock_rect 校验/DPI 修正）。
         let automation: IUIAutomation =
             CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
         let hwnd_tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
@@ -40,7 +92,9 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
         if let Some(condition) = automation_id_condition {
             if let Ok(clock_element) = tray_element.FindFirst(TreeScope_Descendants, &condition) {
                 if let Ok(rect) = clock_element.CurrentBoundingRectangle() {
-                    return Some(rect);
+                    if let Some(valid) = validate_or_scale_clock_rect(rect) {
+                        return Some(valid);
+                    }
                 }
             }
         }
@@ -55,7 +109,9 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
             };
             if let Ok(clock_element) = tray_element.FindFirst(TreeScope_Descendants, &condition) {
                 if let Ok(rect) = clock_element.CurrentBoundingRectangle() {
-                    return Some(rect);
+                    if let Some(valid) = validate_or_scale_clock_rect(rect) {
+                        return Some(valid);
+                    }
                 }
             }
         }
@@ -67,6 +123,144 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
 /// 将 UIA 得到的时钟矩形写入 [`super::state::CLOCK_AREA_RECT_CACHE`]。
 pub fn update_clock_area_cache() {
     if let Some(rect) = get_clock_rect_via_uia() {
+        persist_clock_rect(&rect);
+        if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
+            *w = Some(rect);
+        }
+        return;
+    }
+    // 探测失败（Win11 XAML 任务栏可能无常驻经典时钟窗口）：
+    // 回退到持久化的最后已知正确物理矩形（注册表 HKCU\Software\liCalendar\ClockRect）。
+    if let Some(rect) = load_persisted_clock_rect() {
+        if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
+            *w = Some(rect);
+        }
+    }
+}
+
+/// 持久化最后已知正确的时钟物理矩形（HKCU\Software\liCalendar\ClockRect，"l,t,r,b"）。
+fn persist_clock_rect(rect: &RECT) {
+    unsafe {
+        let mut key = HKEY::default();
+        if RegCreateKeyExW(
+            HKEY_CURRENT_USER,
+            w!("Software\\liCalendar"),
+            Some(0),
+            None,
+            REG_OPTION_NON_VOLATILE,
+            KEY_ALL_ACCESS,
+            None,
+            &mut key,
+            None,
+        ) != WIN32_ERROR(0)
+        {
+            return;
+        }
+        let text = format!("{},{},{},{}", rect.left, rect.top, rect.right, rect.bottom);
+        let mut wide: Vec<u16> = text.encode_utf16().collect();
+        wide.push(0);
+        let _ = RegSetValueExW(
+            key,
+            w!("ClockRect"),
+            Some(0),
+            REG_SZ,
+            Some(std::slice::from_raw_parts(
+                wide.as_ptr().cast::<u8>(),
+                wide.len() * 2,
+            )),
+        );
+        let _ = RegCloseKey(key);
+    }
+}
+
+/// 读取持久化的时钟矩形（读出后经任务栏带校验/修正）。
+fn load_persisted_clock_rect() -> Option<RECT> {
+    unsafe {
+        let mut key = HKEY::default();
+        if RegOpenKeyExW(HKEY_CURRENT_USER, w!("Software\\liCalendar"), Some(0), KEY_READ, &mut key)
+            != WIN32_ERROR(0)
+        {
+            return None;
+        }
+        let mut buf = [0u16; 64];
+        let mut size = (buf.len() * 2) as u32;
+        let mut kind = REG_VALUE_TYPE::default();
+        if RegQueryValueExW(
+            key,
+            w!("ClockRect"),
+            None,
+            Some(&mut kind),
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        ) != WIN32_ERROR(0)
+        {
+            let _ = RegCloseKey(key);
+            return None;
+        }
+        let _ = RegCloseKey(key);
+        let len = (size as usize / 2).min(buf.len());
+        let text = String::from_utf16_lossy(&buf[..len]);
+        let parts: Vec<i32> = text
+            .trim_end_matches('\0')
+            .split(',')
+            .filter_map(|p| p.trim().parse::<i32>().ok())
+            .collect();
+        if parts.len() != 4 {
+            return None;
+        }
+        validate_or_scale_clock_rect(RECT {
+            left: parts[0],
+            top: parts[1],
+            right: parts[2],
+            bottom: parts[3],
+        })
+    }
+}
+
+/// 时钟窗口句柄缓存（isize 形式；配合 IsWindow 校验，避免每次点击都全量枚举窗口）。
+static CLOCK_HWND_CACHE: std::sync::Mutex<Option<isize>> = std::sync::Mutex::new(None);
+
+/// 钩子下探使用：点击位于任务栏带内时，轻量刷新时钟矩形缓存。
+///
+/// 任务栏会在自定义时钟文本应用、图标增减等时机重排，时钟矩形随之变化——
+/// 启动时探测的缓存矩形会过期（表现为时钟右键/左键无反应、弹原生菜单）。
+/// 此函数仅做 IsWindow 校验 + GetWindowRect（微秒级、无 UIA），钩子回调可安全调用。
+pub fn refresh_clock_rect_if_in_taskbar(x: i32, y: i32) {
+    let Some((taskbar, _)) = get_taskbar_info() else {
+        return;
+    };
+    if x < taskbar.left || x > taskbar.right || y < taskbar.top || y > taskbar.bottom {
+        return;
+    }
+    unsafe {
+        let hwnd = {
+            let cached = CLOCK_HWND_CACHE.lock().ok().and_then(|g| *g);
+            match cached {
+                Some(h) if IsWindow(Some(HWND(h as *mut c_void))).as_bool() => {
+                    HWND(h as *mut c_void)
+                }
+                _ => {
+                    let found = find_clock_window().unwrap_or_default();
+                    if !found.0.is_null() {
+                        if let Ok(mut g) = CLOCK_HWND_CACHE.lock() {
+                            *g = Some(found.0 as isize);
+                        }
+                    }
+                    found
+                }
+            }
+        };
+        if hwnd.0.is_null() {
+            return;
+        }
+        let mut rect = RECT::default();
+        let ok = GetWindowRect(hwnd, &mut rect).is_ok()
+            && rect.right > rect.left
+            && rect.bottom > rect.top
+            && validate_or_scale_clock_rect(rect).is_some();
+        if !ok {
+            return;
+        }
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }

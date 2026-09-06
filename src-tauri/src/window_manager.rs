@@ -16,6 +16,7 @@ pub use windows::relocate_clock_overlay;
 pub use windows::{
     dismiss_native_menu_from_hook, hide_clock_context_menu, hide_from_hook, menu_rect_contains,
     precreate_clock_context_menu, show_clock_context_menu, track_native_clock_menu,
+    window_hwnd_by_label,
 };
 #[cfg(windows)]
 pub use windows::CalendarWindowManager;

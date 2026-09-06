@@ -13,11 +13,12 @@ use crate::windows_hook::IS_MENU_OPEN;
 use std::sync::atomic::{AtomicIsize, Ordering};
 use std::sync::RwLock;
 use tauri::{AppHandle, Manager, WebviewWindow};
-use windows::core::{w, BOOL};
+use windows::core::BOOL;
+use windows::core::w;
 use windows::Win32::Foundation::{HWND, LRESULT, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
+    keybd_event, ReleaseCapture, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, EnumWindows,
@@ -359,12 +360,15 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         };
         let pre_menu_foreground = GetForegroundWindow();
 
-        if !acquire_foreground(owner) {
-            crate::dbg_log("native: abort, foreground not acquired");
-            IS_MENU_OPEN.store(false, Ordering::SeqCst);
-            crate::windows_hook::NATIVE_MENU_TRACKING.store(false, Ordering::SeqCst);
-            return None;
+        // 释放本线程可能残留的鼠标捕获（上一轮菜单关闭时可能遗留）。残留捕获会把
+        // 后续所有点击路由到属主窗口——桌面图标点击将全部失效、新菜单瞬关。
+        unsafe {
+            let _ = ReleaseCapture();
         }
+
+        // 说明：不做 SetForegroundWindow/ALT 抢前台。实测抢前台（尤其 ALT 注入的
+        // 异步按键在 TPM 启动后送达）会导致菜单瞬关；而 TPM 自带鼠标捕获，
+        // 菜单显示与菜单外点击关闭均不依赖前台。
 
         // tooltip 会盖在菜单「退出」项上方（视觉遮挡）；TPM 持有捕获不影响点击送达
         hide_taskbar_tooltips();
@@ -398,17 +402,52 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         ));
 
         // TPM_RETURNCMD：同步返回所选命令 ID；取消/点外部返回 0。
-        let ret = TrackPopupMenu(
-            hmenu,
-            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_CENTERALIGN | TPM_BOTTOMALIGN,
-            menu_x,
-            menu_y,
-            None,
-            owner,
-            None,
-        );
+        // 瞬关重试：菜单在 <150ms 内无选择消失（前台被系统瞬时抢走/未及显示）→
+        // 重试最多 2 次——人手从菜单弹出到点击不可能快于 150ms。
+        let mut ret = BOOL(0);
+        let mut attempt: u32 = 0;
+        let track_start;
+        loop {
+            let start = std::time::Instant::now();
+            ret = TrackPopupMenu(
+                hmenu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_CENTERALIGN | TPM_BOTTOMALIGN,
+                menu_x,
+                menu_y,
+                None,
+                owner,
+                None,
+            );
+            let elapsed = start.elapsed();
+            crate::dbg_log(&format!(
+                "native: TPM attempt={attempt} ret={} elapsed={elapsed:?}",
+                ret.0
+            ));
+            if ret.0 != 0 || elapsed >= std::time::Duration::from_millis(150) || attempt >= 2 {
+                track_start = start;
+                break;
+            }
+            attempt += 1;
+            // 重新抢前台再弹一次
+            let _ = SetForegroundWindow(owner);
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            if GetForegroundWindow() != owner {
+                unsafe {
+                    keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
+                    keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                let _ = SetForegroundWindow(owner);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+        }
         let _ = DestroyMenu(hmenu);
         let _ = PostMessageW(Some(owner), 0, WPARAM(0), LPARAM(0)); // WM_NULL 收尾
+        // 跟踪结束后释放 TPM 遗留的鼠标捕获，避免影响后续点击路由。
+        unsafe {
+            let _ = ReleaseCapture();
+        }
+        let _ = track_start;
 
         restore_foreground(pre_menu_foreground, owner);
         let cmd = match ret.0 as u32 {
