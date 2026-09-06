@@ -18,7 +18,8 @@ use windows::core::w;
 use windows::Win32::Foundation::{HWND, LRESULT, LPARAM, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    keybd_event, ReleaseCapture, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP, VK_MENU,
+    keybd_event, ReleaseCapture, INPUT, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
+    MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, EnumWindows,
@@ -139,7 +140,7 @@ unsafe extern "system" fn enum_hide_tooltip_proc(hwnd: HWND, lparam: LPARAM) -> 
 }
 
 /// 隐藏任务栏的所有 tooltip，并取消其鼠标模式。
-/// tooltip 悬浮在时钟正上方（即菜单「退出」项位置），置顶且会吃掉点击。
+/// tooltip 悬浮在时钟正上方（即菜单「退出」项的位置），置顶且会吃掉点击。
 fn hide_taskbar_tooltips() {
     unsafe {
         let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
@@ -155,6 +156,61 @@ fn hide_taskbar_tooltips() {
             Some(enum_hide_tooltip_proc),
             LPARAM(HIDE_TARGET_THREAD.load(Ordering::SeqCst)),
         );
+    }
+}
+
+/// 通过 `SendInput` 两段式真实移动光标，使任务栏时钟 tooltip 消失并把光标
+/// 落到 `(final_x, final_y)`（菜单落点）。
+///
+/// Win11 新版任务栏（26200 实测）的时钟 tooltip 由 XAML 直接绘制在任务栏
+/// 合成层里：既不是 `tooltips_class32` 窗口（`hide_taskbar_tooltips` 枚举不到
+/// 任何可见窗口），也对 `WM_CANCELMODE` / `WM_MOUSELEAVE`(674/675) 等消息注入
+/// 完全免疫（悬停复现 + 逐项消息实验均无效）。它只响应真实指针输入，且
+/// **必须等指针进入其他任务栏元素**才重算悬停——直接把光标移出任务栏带
+/// （如菜单落点）tooltip 依然残留（实测）。因此分两段：
+/// ① 移到任务栏最右缘「显示桌面」细条（时钟按钮之外、必在任务栏带内），
+///    指针离开时钟按钮，tooltip 立即被取消；
+/// ② 停留约 120ms（细条自身 tooltip 需 ~400ms 延迟，来不及弹出）后跳到
+///    菜单落点。`SetCursorPos` 不走指针输入管线，同样无效，必须 `SendInput`。
+fn move_cursor_to_dismiss_tooltip(final_x: i32, final_y: i32) {
+    unsafe {
+        let send_move = |x: i32, y: i32| {
+            let screen_width = GetSystemMetrics(SM_CXSCREEN).max(1) as i64;
+            let screen_height = GetSystemMetrics(SM_CYSCREEN).max(1) as i64;
+            let nx = (x.clamp(0, screen_width as i32 - 1) as i64) * 65535 / (screen_width - 1);
+            let ny = (y.clamp(0, screen_height as i32 - 1) as i64) * 65535 / (screen_height - 1);
+            let mut input = INPUT::default();
+            input.r#type = INPUT_MOUSE;
+            input.Anonymous.mi = MOUSEINPUT {
+                dx: nx as i32,
+                dy: ny as i32,
+                mouseData: 0,
+                dwFlags: MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE,
+                time: 0,
+                dwExtraInfo: 0,
+            };
+            let _ = SendInput(&[input], std::mem::size_of::<INPUT>() as i32);
+        };
+        let screen_height = GetSystemMetrics(SM_CYSCREEN);
+        // 任务栏竖直中点：工作区底缘与屏幕底缘的中点（任务栏在底部时成立）
+        let mut work = windows::Win32::Foundation::RECT::default();
+        let _ = SystemParametersInfoW(
+            SPI_GETWORKAREA,
+            0,
+            Some(&mut work as *mut windows::Win32::Foundation::RECT as *mut core::ffi::c_void),
+            SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0),
+        );
+        let strip_y = if work.bottom > 0 && work.bottom < screen_height {
+            work.bottom + (screen_height - work.bottom) / 2
+        } else {
+            screen_height - 40
+        };
+        // ① 「显示桌面」细条：任务栏最右缘
+        send_move(GetSystemMetrics(SM_CXSCREEN) - 3, strip_y);
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        // ② 跳到菜单落点
+        send_move(final_x, final_y);
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
@@ -198,6 +254,9 @@ pub fn show_clock_context_menu(
     }
     let mut x = (click_x - width / 2).clamp(x_min, (x_max - width).max(x_min));
     let mut y = (click_y - height * 3 / 4).clamp(0, (work_bottom - height).max(0));
+    // 同原生路径：先消除 XAML 时钟 tooltip 并把光标落到菜单区域内
+    // （两段式真实移动，见 `move_cursor_to_dismiss_tooltip` 注释），再显示菜单。
+    move_cursor_to_dismiss_tooltip(x + width / 2, y + height / 2);
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
     let _ = window.show();
     // 收起任务栏 tooltip：它会悬浮在时钟正上方（即菜单「退出」项的位置），
@@ -372,6 +431,11 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
             screen_height
         };
         let menu_x = click_x.clamp(0, (screen_width - 160).max(0));
+
+        // 关键：TrackPopupMenu 之前先消除 XAML 时钟 tooltip 并把光标落到菜单
+        // 上（两段式真实移动，见 `move_cursor_to_dismiss_tooltip` 注释）。
+        // 菜单整体位于任务栏上方（menu_y 为工作区底缘），落点取菜单竖直中点。
+        move_cursor_to_dismiss_tooltip(menu_x, menu_y - 48);
 
         // 记录菜单估算矩形，供钩子做菜单内（上/下半动作路由）与菜单外（关闭）判定
         MENU_RECT
