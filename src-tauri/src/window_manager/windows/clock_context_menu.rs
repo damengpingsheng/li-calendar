@@ -304,49 +304,32 @@ unsafe fn ensure_menu_owner_window() -> Option<HWND> {
 
 /// 前台获取（无 AttachThreadInput）：直接 SetForegroundWindow，失败则瞬时 ALT
 /// 解锁前台保护后重试；同步等待按键排空再检查（ALT 异步送达菜单会致其自关）。
-unsafe fn acquire_foreground(owner: HWND) -> bool {
-    for _ in 0..3 {
-        let _ = SetForegroundWindow(owner);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-        if GetForegroundWindow() == owner {
-            return true;
-        }
-        unsafe {
-            keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-            keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-        let _ = SetForegroundWindow(owner);
-        std::thread::sleep(std::time::Duration::from_millis(40));
-        if GetForegroundWindow() == owner {
-            return true;
-        }
-    }
-    false
-}
+/// 原生菜单的估算屏幕矩形（物理坐标 x1,y1,x2,y2），供低级钩子判定
+/// 「点击在菜单内（上/下半路由动作）」与「点击在菜单外（关闭菜单+放行）」。
+/// `None` 表示菜单未显示。估算尺寸：宽 250 × 高 95 物理像素（含少量余量）。
+static NATIVE_MENU_RECT: RwLock<Option<(i32, i32, i32, i32)>> = RwLock::new(None);
 
-/// 归还前台：优先原前台窗口，仍不奏效则落到桌面（Progman）。
-unsafe fn restore_foreground(pre_menu: HWND, owner: HWND) {
-    let target = if pre_menu.0.is_null() || pre_menu == owner {
-        FindWindowW(w!("Progman"), None).unwrap_or_default()
-    } else {
-        pre_menu
-    };
-    if !target.0.is_null() && target != owner {
-        let _ = SetForegroundWindow(target);
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    if GetForegroundWindow() == owner {
-        let desktop = FindWindowW(w!("Progman"), None).unwrap_or_default();
-        if !desktop.0.is_null() && desktop != owner {
-            let _ = SetForegroundWindow(desktop);
-        }
+/// 供低级钩子查询：坐标是否在原生菜单矩形内。
+pub fn native_menu_rect_contains(x: i32, y: i32) -> bool {
+    match NATIVE_MENU_RECT.read().ok().and_then(|g| *g) {
+        Some((x1, y1, x2, y2)) => x >= x1 && x < x2 && y >= y1 && y < y2,
+        None => false,
     }
 }
 
-/// 原生 TrackPopupMenu 菜单：同步跟踪至选择/取消，返回所选动作。
-/// 需要的防护全部沿用现版经验：属主窗口、ALT 解锁前台（无 AttachThreadInput）、
-/// tooltip 压制、工作区定位（BOTTOMALIGN 使菜单整体位于任务栏上方）、硬退出。
+/// 供低级钩子查询：原生菜单矩形，用于菜单内点击的上/下半动作路由。
+pub fn native_menu_rect() -> Option<(i32, i32, i32, i32)> {
+    NATIVE_MENU_RECT.read().ok().and_then(|g| *g)
+}
+
+/// 原生 TrackPopupMenu 菜单：同步跟踪至选择/取消。
+///
+/// 关键设计（血泪教训，勿回退）：
+/// 1. **无前台获取**——`SetForegroundWindow`/ALT 注入的异步按键会在 TPM 启动后
+///    送达并致菜单瞬关；而 TPM 自带鼠标捕获，显示与交互均不依赖前台。
+/// 2. 菜单项点击与菜单外关闭由低级钩子依据 `NATIVE_MENU_RECT` 全权代管
+///    （见 mouse_hook.rs），TPM 在无前台下不处理项交互。
+/// 3. 瞬关重试：菜单 <150ms 内无选择消失 → 重新弹出（最多 3 次）。
 pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static str> {
     IS_MENU_OPEN.store(true, Ordering::SeqCst);
     crate::windows_hook::NATIVE_MENU_TRACKING.store(true, Ordering::SeqCst);
@@ -358,19 +341,11 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
             crate::windows_hook::NATIVE_MENU_TRACKING.store(false, Ordering::SeqCst);
             return None;
         };
-        let pre_menu_foreground = GetForegroundWindow();
 
-        // 释放本线程可能残留的鼠标捕获（上一轮菜单关闭时可能遗留）。残留捕获会把
-        // 后续所有点击路由到属主窗口——桌面图标点击将全部失效、新菜单瞬关。
-        unsafe {
-            let _ = ReleaseCapture();
-        }
+        // 释放本线程可能残留的鼠标捕获（上一轮菜单关闭时可能遗留）。
+        let _ = ReleaseCapture();
 
-        // 说明：不做 SetForegroundWindow/ALT 抢前台。实测抢前台（尤其 ALT 注入的
-        // 异步按键在 TPM 启动后送达）会导致菜单瞬关；而 TPM 自带鼠标捕获，
-        // 菜单显示与菜单外点击关闭均不依赖前台。
-
-        // tooltip 会盖在菜单「退出」项上方（视觉遮挡）；TPM 持有捕获不影响点击送达
+        // tooltip 会盖在菜单「退出」项上方（视觉遮挡）
         hide_taskbar_tooltips();
 
         let Ok(hmenu) = CreatePopupMenu() else {
@@ -397,16 +372,21 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
             screen_height
         };
         let menu_x = click_x.clamp(0, (screen_width - 160).max(0));
+
+        // 记录菜单估算矩形，供钩子做菜单内（上/下半动作路由）与菜单外（关闭）判定
+        MENU_RECT
+            .write()
+            .map(|mut g| *g = Some((menu_x - 125, menu_y - 95, menu_x + 125, menu_y)))
+            .ok();
+
         crate::dbg_log(&format!(
             "native: TrackPopupMenu at ({menu_x},{menu_y}) click=({click_x},{click_y})"
         ));
 
         // TPM_RETURNCMD：同步返回所选命令 ID；取消/点外部返回 0。
-        // 瞬关重试：菜单在 <150ms 内无选择消失（前台被系统瞬时抢走/未及显示）→
-        // 重试最多 2 次——人手从菜单弹出到点击不可能快于 150ms。
+        // 瞬关重试：菜单在 <150ms 内无选择消失 → 重新弹出（最多 3 次）。
         let mut ret = BOOL(0);
         let mut attempt: u32 = 0;
-        let track_start;
         loop {
             let start = std::time::Instant::now();
             ret = TrackPopupMenu(
@@ -424,32 +404,16 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
                 ret.0
             ));
             if ret.0 != 0 || elapsed >= std::time::Duration::from_millis(150) || attempt >= 2 {
-                track_start = start;
                 break;
             }
             attempt += 1;
-            // 重新抢前台再弹一次
-            let _ = SetForegroundWindow(owner);
-            std::thread::sleep(std::time::Duration::from_millis(30));
-            if GetForegroundWindow() != owner {
-                unsafe {
-                    keybd_event(VK_MENU.0 as u8, 0, KEYBD_EVENT_FLAGS(0), 0);
-                    keybd_event(VK_MENU.0 as u8, 0, KEYEVENTF_KEYUP, 0);
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                let _ = SetForegroundWindow(owner);
-                std::thread::sleep(std::time::Duration::from_millis(30));
-            }
+            // 无前台状态下瞬关的常见原因是系统输入层的瞬时扰动，稍候重弹即可
+            std::thread::sleep(std::time::Duration::from_millis(80));
         }
         let _ = DestroyMenu(hmenu);
         let _ = PostMessageW(Some(owner), 0, WPARAM(0), LPARAM(0)); // WM_NULL 收尾
-        // 跟踪结束后释放 TPM 遗留的鼠标捕获，避免影响后续点击路由。
-        unsafe {
-            let _ = ReleaseCapture();
-        }
-        let _ = track_start;
+        let _ = ReleaseCapture();
 
-        restore_foreground(pre_menu_foreground, owner);
         let cmd = match ret.0 as u32 {
             MENU_EXIT_ID => Some("exit"),
             MENU_SETTINGS_ID => Some("settings"),

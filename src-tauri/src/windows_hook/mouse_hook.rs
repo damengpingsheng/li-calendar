@@ -302,30 +302,37 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         }
     }
 
-    // 右键菜单显示期间：
-    // - 原生 TrackPopupMenu 跟踪期间：再次右键按下 → 主动以 WM_CANCELMODE 关闭
-    //   菜单，且整个第二次右键（按下+抬起）都吞掉——若放行给系统，任务栏会弹
-    //   出原生时钟菜单并使桌面左键卡死（实测复现）；左键仍放行（选择菜单项）。
-    // - Tauri 菜单路径：按下落在菜单窗口外 → 隐藏菜单；事件一律放行。
-    if menu_open {
-        if native_tracking {
-            if is_down && msg == WM_RBUTTONDOWN {
-                crate::window_manager::dismiss_native_menu_from_hook();
-                // 该按下被我们吞掉（系统无感知），必须修正配对标记为"已吞"——
-                // 否则抬起会被放行为孤儿事件，搅乱任务栏输入状态（表现为
-                // 菜单关闭后我们的菜单再也弹不出）。
-                RIGHT_LAST_PASSED.store(false, Ordering::SeqCst);
-            }
-            if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
-                return LRESULT(1);
-            }
+    // 右键菜单显示期间（原生路径，无前台——TPM 不处理菜单项点击与菜单外关闭，
+    // 由钩子全权代管交互）：
+    // - 按下在菜单外（任意位置，左/右键均可）→ 关闭菜单，点击放行给下层目标
+    //   （左键选桌面图标 / 右键弹原生菜单——与系统行为一致）；
+    // - 抬起在菜单内 → 按上/下半路由：上半=设置，下半=退出（左右键均支持）；
+    // - 菜单内的其他事件放行（TPM 菜单窗口自行处理/忽略）。
+    if menu_open && native_tracking {
+        if is_down && !crate::window_manager::menu_rect_contains(x, y) {
+            crate::window_manager::dismiss_native_menu_from_hook();
             return CallNextHookEx(None, code, wparam, lparam);
         }
-        if is_down
-            && !crate::window_manager::menu_rect_contains(x, y)
-            && !fullscreen
+        if is_up
+            && (msg == WM_RBUTTONUP || msg == WM_LBUTTONUP)
+            && crate::window_manager::menu_rect_contains(x, y)
         {
-            crate::window_manager::hide_from_hook();
+            if let Some((rx1, ry1, rx2, ry2)) = crate::window_manager::native_menu_rect() {
+                if x >= rx1 && x <= rx2 && y >= ry1 && y <= ry2 {
+                    crate::window_manager::dismiss_native_menu_from_hook();
+                    if let Some(app) = crate::windows_hook::app_handle() {
+                        let exit = y > (ry1 + ry2) / 2;
+                        std::thread::spawn(move || {
+                            if exit {
+                                crate::request_app_exit(&app);
+                            } else {
+                                crate::window_manager::show_or_create_main_window(&app);
+                            }
+                        });
+                    }
+                    return LRESULT(1);
+                }
+            }
         }
         return CallNextHookEx(None, code, wparam, lparam);
     }
