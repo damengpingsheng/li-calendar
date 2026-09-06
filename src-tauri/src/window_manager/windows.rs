@@ -17,8 +17,9 @@ pub mod main_window;
 #[path = "windows/taskbar_popup.rs"]
 mod taskbar_popup;
 pub use clock_context_menu::{
-    hide_clock_context_menu, hide_from_hook, menu_rect_contains, precreate_clock_context_menu,
-    show_clock_context_menu, track_native_clock_menu,
+    dismiss_native_menu_from_hook, hide_clock_context_menu, hide_from_hook,
+    menu_rect_contains, precreate_clock_context_menu, show_clock_context_menu,
+    track_native_clock_menu,
 };
 pub use clock_overlay::relocate_clock_overlay;
 

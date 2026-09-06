@@ -14,8 +14,8 @@ pub use windows::main_window::show_or_create_main_window;
 pub use windows::relocate_clock_overlay;
 #[cfg(windows)]
 pub use windows::{
-    hide_clock_context_menu, hide_from_hook, menu_rect_contains, precreate_clock_context_menu,
-    show_clock_context_menu, track_native_clock_menu,
+    dismiss_native_menu_from_hook, hide_clock_context_menu, hide_from_hook, menu_rect_contains,
+    precreate_clock_context_menu, show_clock_context_menu, track_native_clock_menu,
 };
 #[cfg(windows)]
 pub use windows::CalendarWindowManager;

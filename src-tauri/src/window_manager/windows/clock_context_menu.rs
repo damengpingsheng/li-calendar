@@ -101,6 +101,23 @@ pub fn precreate_clock_context_menu(app_handle: &AppHandle) {
     let _ = ensure_window(app_handle);
 }
 
+/// 供低级钩子调用：以 `WM_CANCELMODE` 关闭正在跟踪的原生菜单。
+/// 菜单开着时的第二次右键必须由我们主动关闭菜单并整体吞掉——若把这对事件
+/// 放行给系统，任务栏会弹出原生时钟菜单并使桌面左键卡死（实测复现）。
+pub fn dismiss_native_menu_from_hook() {
+    let hwnd = MENU_OWNER_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut std::ffi::c_void)),
+                WM_CANCELMODE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
 /// 枚举回调上下文：任务栏线程 ID。
 static HIDE_TARGET_THREAD: AtomicIsize = AtomicIsize::new(0);
 

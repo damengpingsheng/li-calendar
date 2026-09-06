@@ -1,7 +1,7 @@
 //! 低级鼠标钩子安装、消息泵线程与点击事件投递。
 
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use tokio::sync::mpsc;
 use windows::core::*;
@@ -23,6 +23,11 @@ pub struct WindowsHookManager {
     /// 从钩子线程接收点击事件的异步接收端（仅 [`Self::take_event_receiver`] 可取走一次）。
     event_receiver: Option<mpsc::UnboundedReceiver<ClickEvent>>,
 }
+
+/// 时钟区最近一次左键按下是否被放行（成对处置：抬起按此决定吞放）。
+static LEFT_LAST_PASSED: AtomicBool = AtomicBool::new(false);
+/// 时钟区最近一次右键按下是否被放行（成对处置：抬起按此决定吞放）。
+static RIGHT_LAST_PASSED: AtomicBool = AtomicBool::new(false);
 
 /// 设置是否启用任务栏日历组件；关闭时会清理自定义时钟。
 ///
@@ -250,83 +255,117 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     let y = mouse_struct.pt.y;
 
     // 取证日志（诊断构建）：记录每个按钮事件的落点窗口与 GUI 线程状态，
-    // 用于定位"桌面左键失灵"时点击实际被谁接收。
+    // 用于定位”桌面左键失灵”时点击实际被谁接收。
     forensics_log_event(msg, x, y);
 
-    // 右键菜单窗口显示期间：按下落在菜单窗口外（任意位置）→ 隐藏菜单；
-    // 其余事件一律放行：菜单本身是普通可见窗口，点击直接送达即可，
-    // 吞掉会导致菜单收不到点击（表现为点「退出」没反应）。
-    // 原生 TrackPopupMenu 跟踪期间：它自带鼠标捕获并自行处理菜单外点击，
-    // 钩子对所有事件纯放行。
-    if IS_MENU_OPEN.load(Ordering::SeqCst) {
-        if NATIVE_MENU_TRACKING.load(Ordering::SeqCst) {
+    let in_clock = is_mouse_in_clock_area(x, y);
+    let menu_open = IS_MENU_OPEN.load(Ordering::SeqCst);
+    let native_tracking = NATIVE_MENU_TRACKING.load(Ordering::SeqCst);
+    let fullscreen = is_foreground_fullscreen();
+    // 本对按下/抬起不归我们处置（整体放行）的条件：
+    // 不在时钟区、全屏前台（游戏/视频）、或右键菜单正在显示。
+    let passthrough = !in_clock
+        || menu_open
+        || fullscreen;
+
+    // 成对处置铁律：系统只能看到完整的”按下+抬起”，绝不能出现只吞其一的孤儿
+    // 事件——孤儿事件曾使任务栏输入状态卡死（表现为桌面图标左键点选失灵，
+    // 右键一次重建状态后恢复）。每次按下记录是否放行，抬起按配对决定吞放。
+    if is_down {
+        let passed = passthrough;
+        if msg == WM_LBUTTONDOWN {
+            LEFT_LAST_PASSED.store(passed, Ordering::SeqCst);
+        } else {
+            RIGHT_LAST_PASSED.store(passed, Ordering::SeqCst);
+        }
+    }
+
+    // 右键菜单显示期间：
+    // - 原生 TrackPopupMenu 跟踪期间：再次右键按下 → 主动以 WM_CANCELMODE 关闭
+    //   菜单，且整个第二次右键（按下+抬起）都吞掉——若放行给系统，任务栏会弹
+    //   出原生时钟菜单并使桌面左键卡死（实测复现）；左键仍放行（选择菜单项）。
+    // - Tauri 菜单路径：按下落在菜单窗口外 → 隐藏菜单；事件一律放行。
+    if menu_open {
+        if native_tracking {
+            if is_down && msg == WM_RBUTTONDOWN {
+                crate::window_manager::dismiss_native_menu_from_hook();
+            }
+            if msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP {
+                return LRESULT(1);
+            }
             return CallNextHookEx(None, code, wparam, lparam);
         }
         if is_down
             && !crate::window_manager::menu_rect_contains(x, y)
-            && !is_foreground_fullscreen()
+            && !fullscreen
         {
             crate::window_manager::hide_from_hook();
         }
         return CallNextHookEx(None, code, wparam, lparam);
     }
 
-    if is_mouse_in_clock_area(x, y) {
-        // 全屏前台（游戏/全屏视频等）时不拦截，避免吞掉本应交给前台的鼠标消息
-        if is_foreground_fullscreen() {
-            return CallNextHookEx(None, code, wparam, lparam);
-        }
-        let mouse_button =
-            if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP { MouseButton::Left } else { MouseButton::Right };
-
-        if is_down {
-            crate::dbg_log(&format!(
-                "hook: down in clock area ({},{}) msg=0x{:X} button={:?}",
-                x, y, msg, mouse_button
-            ));
-
-            if mouse_button == MouseButton::Right {
-                unsafe {
-                    // 取消模式并伪造时钟区 `WM_MOUSELEAVE`（数值 675），收起系统 Tooltip
-                    if let Ok(shell_tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
-                        let _ = PostMessageW(Some(shell_tray), WM_CANCELMODE, WPARAM(0), LPARAM(0));
-                    }
-                    if let Some(clock_hwnd) = find_clock_window() {
-                        let _ = PostMessageW(Some(clock_hwnd), 675, WPARAM(0), LPARAM(0));
-                    }
-                }
-                // 右键菜单在「抬起」时才投递：若在按下时进入 TrackPopupMenu 循环，
-                // 随后的物理抬起会被菜单视为“点击外部”而立即关闭（表现为白框一闪而过）。
-            } else if let Ok(sender_guard) = EVENT_SENDER.lock() {
-                if let Some(sender) = sender_guard.as_ref() {
-                    let event = ClickEvent { x, y, in_clock_area: true, button: mouse_button };
-                    let _ = sender.send(event);
-                }
-            }
-        } else if mouse_button == MouseButton::Right {
-            // 右键抬起：此时按钮已释放，弹出的菜单不会被随后的抬起事件关闭
+    if !in_clock {
+        // 非时钟区域：放行，同时把左键按下投递给监听端——
+        // 用于 WIN+D 之后桌面日历被最小化时的自动恢复（桌面处于前台即可恢复）。
+        if is_down && msg == WM_LBUTTONDOWN {
             if let Ok(sender_guard) = EVENT_SENDER.lock() {
                 if let Some(sender) = sender_guard.as_ref() {
-                    let event = ClickEvent { x, y, in_clock_area: true, button: mouse_button };
+                    let event = ClickEvent { x, y, in_clock_area: false, button: MouseButton::Left };
                     let _ = sender.send(event);
                 }
             }
         }
-
-        // 在时钟区域内吞掉消息，阻止系统弹出原生任务栏右键菜单
-        return LRESULT(1);
+        return CallNextHookEx(None, code, wparam, lparam);
     }
 
-    // 非时钟区域：放行消息，同时把左键按下投递给监听端——
-    // 用于 WIN+D 之后桌面日历被最小化时的自动恢复（桌面处于前台即可恢复）。
-    if is_down && msg == WM_LBUTTONDOWN {
+    // ---- 时钟区域正常拦截路径（fs=false、无菜单）----
+    let is_left = msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP;
+
+    if is_up {
+        // 抬起：仅当对应按下也被吞时才吞并触发动作；按下被放行过则配对放行
+        if is_left {
+            if LEFT_LAST_PASSED.load(Ordering::SeqCst) {
+                return CallNextHookEx(None, code, wparam, lparam);
+            }
+            return LRESULT(1);
+        }
+        if RIGHT_LAST_PASSED.load(Ordering::SeqCst) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        // 右键抬起：按钮已释放，弹出的菜单不会被随后的抬起事件关闭
         if let Ok(sender_guard) = EVENT_SENDER.lock() {
             if let Some(sender) = sender_guard.as_ref() {
-                let event = ClickEvent { x, y, in_clock_area: false, button: MouseButton::Left };
+                let event = ClickEvent { x, y, in_clock_area: true, button: MouseButton::Right };
                 let _ = sender.send(event);
             }
         }
+        return LRESULT(1);
     }
 
-    CallNextHookEx(None, code, wparam, lparam)
+    // ---- 按下 ----
+    if is_left {
+        LEFT_LAST_PASSED.store(false, Ordering::SeqCst);
+        // 左键按下：投递切换月历事件
+        if let Ok(sender_guard) = EVENT_SENDER.lock() {
+            if let Some(sender) = sender_guard.as_ref() {
+                let event = ClickEvent { x, y, in_clock_area: true, button: MouseButton::Left };
+                let _ = sender.send(event);
+            }
+        }
+        return LRESULT(1);
+    }
+
+    RIGHT_LAST_PASSED.store(false, Ordering::SeqCst);
+    unsafe {
+        // 取消模式并伪造时钟区 `WM_MOUSELEAVE`（数值 675），收起系统 Tooltip
+        if let Ok(shell_tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            let _ = PostMessageW(Some(shell_tray), WM_CANCELMODE, WPARAM(0), LPARAM(0));
+        }
+        if let Some(clock_hwnd) = find_clock_window() {
+            let _ = PostMessageW(Some(clock_hwnd), 675, WPARAM(0), LPARAM(0));
+        }
+    }
+    // 右键菜单在「抬起」时才投递：若在按下时弹菜单，随后的物理抬起会被
+    // 菜单视为“点击外部”而立即关闭（表现为白框一闪而过）。
+    LRESULT(1)
 }
