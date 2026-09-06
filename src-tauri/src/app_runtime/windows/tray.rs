@@ -1,5 +1,4 @@
 //! Windows 系统托盘：左键切换弹窗、失败时回退显示主窗口。
-use crate::app_runtime::shared::tray::{normalize_click_position, toggle_popup_by_click};
 use crate::AppState;
 use tauri::tray::{
     MouseButton as TrayMouseButton, MouseButtonState as TrayMouseButtonState, TrayIconBuilder,
@@ -26,13 +25,19 @@ pub fn setup_windows_tray(app_handle: &AppHandle, state: &State<'_, AppState>) {
                 .show_menu_on_left_click(false)
                 .tooltip("松鼠日历")
                 .on_tray_icon_event(move |_tray, event| {
-                    if let TrayIconEvent::Click { button, button_state, rect, .. } = event {
+                    if let TrayIconEvent::Click { button, button_state, .. } = event {
                         if button == TrayMouseButton::Left
                             && button_state == TrayMouseButtonState::Up
                         {
-                            // 提取点击坐标并执行弹窗切换。
-                            let (click_x, click_y) = normalize_click_position(rect.position);
-                            if toggle_popup_by_click(&shared_window_manager, click_x, click_y) {
+                            // 与任务栏时钟左键一致：优先切换桌面日历，避免弹出第二个月历。
+                            let toggled = shared_window_manager
+                                .lock()
+                                .ok()
+                                .and_then(|mut guard| {
+                                    guard.as_mut().map(|wm| wm.toggle_clock_calendar().is_ok())
+                                })
+                                .unwrap_or(false);
+                            if toggled {
                                 return;
                             }
                             // 找不到窗口管理器时回退显示主窗口。

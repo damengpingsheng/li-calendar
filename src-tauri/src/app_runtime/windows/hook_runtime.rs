@@ -1,26 +1,14 @@
 //! 任务栏低级鼠标钩子与点击事件分发。
-use crate::window_manager::shared::popup_manager::PopupManager;
 use crate::window_manager::CalendarWindowManager;
 use crate::windows_hook::{
     is_desktop_in_foreground, start_hook_message_thread, ClickEvent, MouseButton,
-    WindowsHookManager, IS_MENU_OPEN,
+    WindowsHookManager,
 };
 use crate::AppState;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tokio::sync::mpsc;
-use windows::core::w;
-use windows::Win32::Foundation::HWND;
-use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, DestroyMenu, TrackPopupMenu, MF_STRING, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON,
-};
-
-// Win32 菜单命令 ID。不使用 tauri 的 `popup_menu`/`MenuEvent`——detached popup 菜单在 Windows 上
-// 不会把点击事件派发到 `on_menu_event`（实测菜单点「退出」无反应），故改用原生 TrackPopupMenu。
-const MENU_SETTINGS_ID: u32 = 1001;
-const MENU_EXIT_ID: u32 = 1002;
 
 /// 启动任务栏 Hook 运行时并接管点击事件流。
 pub fn start_taskbar_runtime(app_handle: AppHandle, state: &AppState) {
@@ -64,73 +52,75 @@ pub async fn start_hook_listener(
     window_manager: Arc<Mutex<Option<CalendarWindowManager>>>,
 ) {
     while let Some(click_event) = event_receiver.recv().await {
-        if is_desktop_in_foreground() {
-            if let Ok(window_manager_guard) = window_manager.lock() {
-                if let Some(calendar_window_manager) = window_manager_guard.as_ref() {
-                    calendar_window_manager.refresh_desktop_window_visibility();
+        match click_event.button {
+            MouseButton::Left => {
+                // WIN+D / 显示桌面后桌面日历可能被最小化：任意桌面左键点击时恢复。
+                // `ensure_desktop_widget_on_desktop` 仅在窗口最小化时做事，可见时零开销。
+                if is_desktop_in_foreground() {
+                    if let Ok(mut window_manager_guard) = window_manager.lock() {
+                        if let Some(calendar_window_manager) = window_manager_guard.as_mut() {
+                            calendar_window_manager.ensure_desktop_widget_on_desktop();
+                        }
+                    }
+                }
+                if click_event.in_clock_area {
+                    handle_left_click(&window_manager, click_event.x, click_event.y);
                 }
             }
-        }
-
-        if !click_event.in_clock_area {
-            continue;
-        }
-        match click_event.button {
-            MouseButton::Left => handle_left_click(&window_manager, click_event.x, click_event.y),
-            MouseButton::Right => handle_right_click(&app_handle, click_event.x, click_event.y),
+            MouseButton::Right => {
+                if !click_event.in_clock_area {
+                    continue;
+                }
+                // 隔离实验开关：存在标记文件时不弹菜单（仅记录事件）。
+                if std::path::Path::new(r"D:\agents_tmp\ccm_disabled").exists() {
+                    crate::dbg_log("right click (menu suppressed by experiment A)");
+                    continue;
+                }
+                crate::dbg_log(&format!(
+                    "right click received at ({}, {})",
+                    click_event.x, click_event.y
+                ));
+                // 菜单实现双模式：默认原生 TrackPopupMenu（系统风格）；
+                // 存在 `ccm_tauri_menu` 标记文件时改用 Tauri 置顶窗口菜单（备用）。
+                let use_tauri_menu =
+                    std::path::Path::new(r"D:\agents_tmp\ccm_tauri_menu").exists();
+                if use_tauri_menu {
+                    if let Err(error) = crate::window_manager::show_clock_context_menu(
+                        &app_handle,
+                        click_event.x,
+                        click_event.y,
+                    ) {
+                        eprintln!("显示时钟右键菜单失败: {error}");
+                    }
+                } else if let Some(action) = crate::window_manager::track_native_clock_menu(
+                    click_event.x,
+                    click_event.y,
+                ) {
+                    match action {
+                        "exit" => crate::request_app_exit(&app_handle),
+                        "settings" => {
+                            crate::window_manager::show_or_create_main_window(&app_handle)
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 }
 
-/// 处理左键点击事件并切换日历弹窗。
+/// 处理左键点击事件：只保留一个日历，优先切换桌面日历的显示/隐藏，
+/// 不再在时钟旁弹出第二个月历；桌面组件未启用时回退为弹窗切换。
 fn handle_left_click(
     window_manager: &Arc<Mutex<Option<CalendarWindowManager>>>,
-    click_x: i32,
-    click_y: i32,
+    _click_x: i32,
+    _click_y: i32,
 ) {
     if let Ok(mut window_manager_guard) = window_manager.lock() {
         if let Some(calendar_window_manager) = window_manager_guard.as_mut() {
-            if let Err(error) = calendar_window_manager.toggle_popup_at_position(click_x, click_y) {
+            if let Err(error) = calendar_window_manager.toggle_clock_calendar() {
                 eprintln!("❌ 切换日历窗口失败: {}", error);
-                if let Err(fallback_error) = calendar_window_manager.toggle_popup() {
-                    eprintln!("❌ 回退到默认切换也失败: {}", fallback_error);
-                }
             }
         }
     }
-}
-
-/// 处理右键点击事件：用 Win32 原生 `TrackPopupMenu` 弹出「设置/退出」菜单。
-///
-/// 使用 `TPM_RETURNCMD` 让 `TrackPopupMenu` **同步返回所选命令 ID**，从而完全避开 tauri
-/// `popup_menu` 在 Windows 上不派发 `MenuEvent` 的缺陷（修复右键菜单点「退出」无反应）。
-fn handle_right_click(app_handle: &AppHandle, mouse_x: i32, mouse_y: i32) {
-    if IS_MENU_OPEN.load(Ordering::SeqCst) {
-        return;
-    }
-    IS_MENU_OPEN.store(true, Ordering::SeqCst);
-    unsafe {
-        if let Ok(hmenu) = CreatePopupMenu() {
-            let _ = AppendMenuW(hmenu, MF_STRING, MENU_SETTINGS_ID as usize, w!("设置"));
-            let _ = AppendMenuW(hmenu, MF_STRING, MENU_EXIT_ID as usize, w!("退出"));
-            // windows crate 将 TrackPopupMenu 返回类型标为 BOOL；在 TPM_RETURNCMD 下该值即选中的命令 ID。
-            let ret = TrackPopupMenu(
-                hmenu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                mouse_x,
-                mouse_y,
-                Some(0),
-                HWND::default(),
-                None,
-            );
-            let _ = DestroyMenu(hmenu);
-            let cmd_id = ret.0 as u32;
-            match cmd_id {
-                MENU_EXIT_ID => crate::request_app_exit(app_handle),
-                MENU_SETTINGS_ID => crate::window_manager::show_or_create_main_window(app_handle),
-                _ => {}
-            }
-        }
-    }
-    IS_MENU_OPEN.store(false, Ordering::SeqCst);
 }

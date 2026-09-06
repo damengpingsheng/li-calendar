@@ -293,3 +293,15 @@ pub async fn set_macos_vibrancy(
         windows_only_error()
     }
 }
+
+/// 时钟右键菜单动作：仅支持 Windows。
+#[tauri::command]
+pub async fn clock_menu_action(_app_handle: AppHandle, _action: String) -> Result<(), String> {
+    windows_only_error()
+}
+
+/// 隐藏时钟右键菜单：仅支持 Windows。
+#[tauri::command]
+pub async fn hide_clock_context_menu(_app_handle: AppHandle) -> Result<(), String> {
+    windows_only_error()
+}

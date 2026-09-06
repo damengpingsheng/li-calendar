@@ -7,6 +7,7 @@ import MacosPopupWindow from './windows/MacosPopupWindow.tsx';
 import MainWindow from './windows/MainWindow.tsx';
 import MobileWindow from './windows/mobile/MobileWindow.tsx';
 import PopupWindow from './windows/PopupWindow.tsx';
+import ClockContextMenuWindow from './windows/ClockContextMenuWindow.tsx';
 import ClockOverlayWindow from './windows/ClockOverlayWindow.tsx';
 import './global.css';
 import { useWindowsTrayClockBootstrap } from './hooks/settings/useWindowsTrayClockBootstrap.ts';
@@ -40,6 +41,9 @@ const resolveWindow = (
   }
   if (kind === 'clock_overlay') {
     return <ClockOverlayWindow />;
+  }
+  if (kind === 'clock_context_menu') {
+    return <ClockContextMenuWindow />;
   }
   if (isMobile) {
     if (mobileView === 'settings') {

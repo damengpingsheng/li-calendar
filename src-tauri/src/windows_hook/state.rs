@@ -14,6 +14,10 @@ pub static HOOK_HANDLE: Lazy<Arc<Mutex<Option<isize>>>> = Lazy::new(|| Arc::new(
 /// 用于防止右键菜单重复弹出的原子锁。
 pub static IS_MENU_OPEN: AtomicBool = AtomicBool::new(false);
 
+/// 原生 TrackPopupMenu 正在跟踪菜单（其自带鼠标捕获，菜单外点击由它自行处理，
+/// 钩子对时钟区域/菜单区域一律纯放行，不做 MENU_RECT 隐藏——那是 Tauri 菜单路径的逻辑）。
+pub static NATIVE_MENU_TRACKING: AtomicBool = AtomicBool::new(false);
+
 /// 钩子线程向异步运行时发送点击事件的发送端（可选）。
 pub static EVENT_SENDER: Lazy<Arc<Mutex<Option<mpsc::UnboundedSender<ClickEvent>>>>> =
     Lazy::new(|| Arc::new(Mutex::new(None)));
@@ -31,3 +35,6 @@ pub static TASKBAR_WIDGET_ENABLED: AtomicBool = AtomicBool::new(false);
 ///
 /// 绝不能在 `WH_MOUSE_LL` 回调里调用 UIA，否则会造成全系统输入卡顿。
 pub static CLOCK_AREA_RECT_CACHE: Lazy<RwLock<Option<RECT>>> = Lazy::new(|| RwLock::new(None));
+
+/// 应用句柄（setup 时写入），供钩子回调内需要操作窗口的场景使用。
+pub static APP_HANDLE: std::sync::OnceLock<tauri::AppHandle> = std::sync::OnceLock::new();

@@ -41,10 +41,16 @@ pub fn is_desktop_in_foreground() -> bool {
 /// 前台窗口是否近似铺满其所在显示器的物理区域（全屏游戏、全屏视频、无边框全屏等）。
 ///
 /// 用于在命中任务栏时钟缓存矩形时进一步判断：全屏前台应用时不拦截鼠标，避免干扰游戏。
+/// 注意：桌面（Progman/WorkerW）天然铺满显示器，会被此处误判为全屏——但桌面处于
+/// 前台时必须照常拦截时钟点击（切换月历/右键菜单），否则表现为"点时钟没反应"。
 pub fn is_foreground_fullscreen() -> bool {
     unsafe {
         let hwnd = GetForegroundWindow();
         if hwnd.0.is_null() {
+            return false;
+        }
+        // 桌面本身不算全屏应用
+        if is_desktop_in_foreground() {
             return false;
         }
         let mut win_rect = RECT::default();

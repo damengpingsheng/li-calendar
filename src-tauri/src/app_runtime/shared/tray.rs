@@ -1,5 +1,8 @@
+#[cfg(target_os = "macos")]
 use crate::window_manager::shared::popup_manager::PopupManager;
+#[cfg(target_os = "macos")]
 use crate::window_manager::CalendarWindowManager;
+#[cfg(target_os = "macos")]
 use std::sync::{Arc, Mutex};
 use tauri::Position;
 
@@ -15,6 +18,7 @@ pub fn normalize_click_position(position: Position) -> (i32, i32) {
 }
 
 /// 尝试使用共享窗口管理器在点击位置切换弹窗。
+#[cfg(target_os = "macos")]
 pub fn toggle_popup_by_click(
     window_manager: &Arc<Mutex<Option<CalendarWindowManager>>>,
     click_x: i32,

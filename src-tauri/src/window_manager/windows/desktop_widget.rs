@@ -1,57 +1,44 @@
-//! 桌面日历窗口：挂接到 `Progman`、被动显示与刷新。
+//! 桌面日历窗口：普通置底顶层窗口、被动显示与刷新。
+//!
+//! 历史：曾用 `SetWindowLongPtrW(GWLP_HWNDPARENT, Progman)` 把窗口挂为 Progman
+//! 的 owned window。跨进程的 owner 关系会让系统**隐式合并两个线程的输入队列**
+//! （等价 AttachThreadInput），导致本进程与 explorer 桌面线程共享队列状态；
+//! 交互/退出时队列残留坏状态，表现为桌面左键点选失灵而任务栏正常、右键一次
+//! 自愈。已改为普通置底顶层窗口（HWND_BOTTOM，壁纸之上、应用之下），不再与
+//! explorer 建立任何跨进程窗口关系。
 use super::{get_window_hwnd, CalendarWindowManager};
+use crate::window_manager::shared::popup_manager::PopupManager;
 use tauri::WebviewWindow;
+use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetForegroundWindow, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
-    ShowWindow, GWLP_HWNDPARENT, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOOWNERZORDER, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
+    GetForegroundWindow, GetWindow, GetWindowLongPtrW, IsIconic, SetForegroundWindow,
+    SetWindowPos, ShowWindow, GWL_STYLE, GW_HWNDLAST, HWND_BOTTOM, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOOWNERZORDER, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE, WS_CHILD,
 };
 
-/// 将桌面组件窗口挂载到 Progman 下并置底，保持当前位置和尺寸不变。
-fn pin_window_to_desktop(desktop_widget_window: &WebviewWindow) {
-    let window_hwnd = match get_window_hwnd(desktop_widget_window) {
-        Some(hwnd) => hwnd,
-        None => return,
-    };
+/// 把窗口压到非置顶层最底部（壁纸/桌面之上、其他应用窗口之下）。
+/// 仅当尚不处于最底时才调用 `SetWindowPos`，避免每次点击都产生层级抖动。
+fn pin_window_to_bottom(window_hwnd: HWND) {
     unsafe {
-        if let Ok(progman_hwnd) = FindWindowW(windows::core::w!("Progman"), None) {
-            if !progman_hwnd.0.is_null() {
-                SetWindowLongPtrW(window_hwnd, GWLP_HWNDPARENT, progman_hwnd.0 as isize);
-                let _ = SetWindowPos(
-                    window_hwnd,
-                    None,
-                    0,
-                    0,
-                    0,
-                    0,
-                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
-                );
-                println!("✅ 桌面日历窗口已挂接到 Progman（GWLP_HWNDPARENT）");
-            }
+        // 已是最底层（前面没有同带窗口）则跳过。
+        let last = GetWindow(window_hwnd, GW_HWNDLAST).unwrap_or_default();
+        if last.0 == window_hwnd.0 {
+            return;
         }
-    }
-}
-
-/// 以不抢焦点的方式在指定物理坐标处显示桌面组件并固定到底层。
-/// `position` 为 `Some((x, y))` 时移动到目标位置，为 `None` 时保持当前位置。
-fn show_desktop_window_at(desktop_widget_window: &WebviewWindow, position: Option<(i32, i32)>) {
-    let window_hwnd = match get_window_hwnd(desktop_widget_window) {
-        Some(hwnd) => hwnd,
-        None => return,
-    };
-    unsafe {
-        let _ = ShowWindow(window_hwnd, SW_SHOWNOACTIVATE);
-        let (x, y, flags) = match position {
-            Some((x, y)) => {
-                (x, y, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW)
-            }
-            None => (
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
-            ),
-        };
-        let _ = SetWindowPos(window_hwnd, None, x, y, 0, 0, flags);
+        // 已被设为其他窗口的子窗口时不要盲目置底（异常状态，交由重建处理）。
+        if GetWindowLongPtrW(window_hwnd, GWL_STYLE) & WS_CHILD.0 as isize != 0 {
+            println!("⚠️ 桌面日历窗口处于子窗口状态，跳过置底");
+            return;
+        }
+        let _ = SetWindowPos(
+            window_hwnd,
+            Some(HWND_BOTTOM),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW,
+        );
     }
 }
 
@@ -74,9 +61,6 @@ impl CalendarWindowManager {
         initial_position: Option<(i32, i32)>,
     ) {
         let hwnd = get_window_hwnd(window);
-
-        // 先把窗口挂到 Progman 下（此时还隐藏）
-        pin_window_to_desktop(window);
 
         // 若有持久化位置，在 show() 前用 Win32 直接移动到目标物理坐标，
         // 这样 Tauri show() 触发时窗口已在正确位置，彻底消除闪烁。
@@ -101,15 +85,13 @@ impl CalendarWindowManager {
         unsafe {
             if let Some(hwnd) = get_window_hwnd(window) {
                 let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+                // 置底到非置顶层最底（壁纸之上、应用之下），替代旧的 Progman 挂接。
+                pin_window_to_bottom(hwnd);
             }
             if !prev_foreground.0.is_null() {
                 let _ = SetForegroundWindow(prev_foreground);
             }
         }
-
-        // show() 后再做一次置底，防止 Tauri 内部重新调整层级
-        show_desktop_window_at(window, None);
-        pin_window_to_desktop(window);
     }
 
     /// 构建桌面组件 WebviewWindow，**不需要持有 `window_manager` 锁**，可在锁外并发调用。
@@ -169,16 +151,45 @@ impl CalendarWindowManager {
         Ok(())
     }
 
-    /// 重新显示并置顶桌面组件窗口（用于 WIN+D 或显示桌面后的恢复）。
+    /// 任务栏时钟左键点击时只保留一个日历：优先切换桌面日历的显示/隐藏，
+    /// 若任务栏弹窗仍在显示则先隐藏它，避免同时出现两个月历。
+    /// 桌面组件未启用（无窗口）时回退为原有的任务栏弹窗切换。
+    ///
+    /// 可见性完全以 `desktop_widget_visible` 状态位为准：启动阶段窗口的
+    /// `is_visible()` 可能返回与实际不符的值（曾表现为首次点击时钟不隐藏）。
+    pub fn toggle_clock_calendar(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if let Some(desktop_window) = self.desktop_widget_window.clone() {
+            if let Some(popup_window) = &self.taskbar_popup_window {
+                if popup_window.is_visible().unwrap_or(false) {
+                    let _ = popup_window.hide();
+                }
+            }
+            if self.desktop_widget_visible {
+                self.desktop_widget_visible = false;
+                desktop_window.hide()?;
+            } else {
+                self.desktop_widget_visible = true;
+                self.refresh_desktop_window_visibility();
+            }
+            return Ok(());
+        }
+        self.toggle_popup()
+    }
+
+    /// 重新显示并置底桌面组件窗口（用于 WIN+D 或显示桌面后的恢复）。
+    /// 用户主动隐藏（`desktop_widget_visible == false`）时不恢复。
     /// 调用 `show()` 后立即用 SW_SHOWNOACTIVATE 压制激活，防止失焦导致窗口自动隐藏。
-    pub fn refresh_desktop_window_visibility(&self) {
+    pub fn refresh_desktop_window_visibility(&mut self) {
+        if !self.desktop_widget_visible {
+            return;
+        }
         if let Some(ref window) = self.desktop_widget_window {
             let prev_foreground = unsafe { GetForegroundWindow() };
             let _ = window.show();
             unsafe {
                 if let Some(hwnd) = get_window_hwnd(window) {
                     let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
-                    pin_window_to_desktop(window);
+                    pin_window_to_bottom(hwnd);
                     let _ = SetWindowPos(
                         hwnd,
                         None,
@@ -197,6 +208,24 @@ impl CalendarWindowManager {
                     let _ = SetForegroundWindow(prev_foreground);
                 }
             }
+        }
+    }
+
+    /// 仅当窗口被最小化（如 WIN+D）时才恢复显示与置底；可见时零开销返回。
+    /// 供钩子在任意桌面左键点击时调用（任何点击都可能发生在 WIN+D 之后）。
+    pub fn ensure_desktop_widget_on_desktop(&mut self) {
+        if !self.desktop_widget_visible {
+            return;
+        }
+        let Some(ref window) = self.desktop_widget_window else {
+            return;
+        };
+        let iconic = get_window_hwnd(window)
+            .map(|hwnd| unsafe { IsIconic(hwnd).as_bool() })
+            .unwrap_or(false);
+        if iconic {
+            println!("桌面日历窗口处于最小化（WIN+D），恢复显示");
+            self.refresh_desktop_window_visibility();
         }
     }
 }

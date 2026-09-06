@@ -298,3 +298,28 @@ pub async fn relocate_clock_overlay_command(app_handle: AppHandle) -> Result<(),
     crate::window_manager::relocate_clock_overlay(&app_handle);
     Ok(())
 }
+
+/// 时钟右键菜单动作：设置 / 退出（由 clock_context_menu 窗口前端调用）。
+#[tauri::command]
+pub async fn clock_menu_action(app_handle: AppHandle, action: String) -> Result<(), String> {
+    // 先隐藏菜单窗口并复位钩子放行状态。
+    crate::window_manager::hide_clock_context_menu(&app_handle);
+    match action.as_str() {
+        "exit" => {
+            crate::request_app_exit(&app_handle);
+            Ok(())
+        }
+        "settings" => {
+            crate::window_manager::show_or_create_main_window(&app_handle);
+            Ok(())
+        }
+        _ => Err(format!("未知操作: {action}")),
+    }
+}
+
+/// 隐藏时钟右键菜单（Esc 键）。
+#[tauri::command]
+pub async fn hide_clock_context_menu(app_handle: AppHandle) -> Result<(), String> {
+    crate::window_manager::hide_clock_context_menu(&app_handle);
+    Ok(())
+}

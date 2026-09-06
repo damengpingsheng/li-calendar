@@ -6,6 +6,8 @@ use tauri::{
 };
 use windows::Win32::Foundation::HWND;
 
+#[path = "windows/clock_context_menu.rs"]
+mod clock_context_menu;
 #[path = "windows/clock_overlay.rs"]
 mod clock_overlay;
 #[path = "windows/desktop_widget.rs"]
@@ -14,6 +16,10 @@ mod desktop_widget;
 pub mod main_window;
 #[path = "windows/taskbar_popup.rs"]
 mod taskbar_popup;
+pub use clock_context_menu::{
+    hide_clock_context_menu, hide_from_hook, menu_rect_contains, precreate_clock_context_menu,
+    show_clock_context_menu, track_native_clock_menu,
+};
 pub use clock_overlay::relocate_clock_overlay;
 
 /// 管理任务栏日历弹窗、桌面日历与可选叠加说明窗口。
@@ -42,6 +48,9 @@ pub struct CalendarWindowManager {
     pub(super) desktop_vibrancy_enabled: bool,
     /// 桌面日历使用的视觉效果键名。
     pub(super) desktop_vibrancy_effect: Option<String>,
+    /// 桌面日历的期望可见状态：false 表示被用户（时钟点击）主动隐藏，
+    /// 此时不应因“桌面处于前台”的自动恢复逻辑而重新显示。
+    pub(super) desktop_widget_visible: bool,
 }
 
 /// 任务栏弹窗合成时的默认浅色 tint（RGBA）。
@@ -115,6 +124,7 @@ impl CalendarWindowManager {
             popup_vibrancy_effect: None,
             desktop_vibrancy_enabled: false,
             desktop_vibrancy_effect: None,
+            desktop_widget_visible: true,
         })
     }
 

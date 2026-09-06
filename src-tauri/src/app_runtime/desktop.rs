@@ -130,6 +130,11 @@ pub fn setup_desktop_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
             taskbar_widget_enabled,
             initial_pos,
         );
+
+        // 预创建时钟右键菜单窗口：首次右键即显示，避免 WebView 加载延迟内点击无效。
+        crate::window_manager::precreate_clock_context_menu(app_handle);
+        // 保存应用句柄供钩子回调内操作窗口（如点击菜单外时隐藏菜单）。
+        crate::windows_hook::set_app_handle(app_handle.clone());
     }
 
     #[cfg(not(windows))]

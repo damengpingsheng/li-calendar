@@ -13,19 +13,19 @@ pub use common::{
 
 #[cfg(not(windows))]
 pub use macos::{
-    apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
+    clock_menu_action, apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
     get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
-    get_supported_window_effects, restore_default_clock, set_desktop_widget_enabled,
-    set_macos_tray_bar_icon, set_macos_tray_date_icon_style, set_macos_tray_icon_px,
-    set_macos_tray_title_template, set_macos_vibrancy, set_taskbar_widget_enabled_command,
-    test_clock_detection,
-};
-#[cfg(windows)]
-pub use windows::{
-    apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
-    get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
-    get_supported_window_effects, relocate_clock_overlay_command, restore_default_clock,
+    get_supported_window_effects, hide_clock_context_menu, restore_default_clock,
     set_desktop_widget_enabled, set_macos_tray_bar_icon, set_macos_tray_date_icon_style,
     set_macos_tray_icon_px, set_macos_tray_title_template, set_macos_vibrancy,
     set_taskbar_widget_enabled_command, test_clock_detection,
+};
+#[cfg(windows)]
+pub use windows::{
+    clock_menu_action, apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
+    get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
+    get_supported_window_effects, hide_clock_context_menu, relocate_clock_overlay_command,
+    restore_default_clock, set_desktop_widget_enabled, set_macos_tray_bar_icon,
+    set_macos_tray_date_icon_style, set_macos_tray_icon_px, set_macos_tray_title_template,
+    set_macos_vibrancy, set_taskbar_widget_enabled_command, test_clock_detection,
 };

@@ -15,11 +15,11 @@ mod window_manager;
 mod windows_hook;
 #[cfg(desktop)]
 use commands::{
-    apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
+    apply_custom_clock_text, clock_menu_action, get_clock_text, get_macos_tray_bar_icon,
     get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
     get_supported_window_effects, get_system_time_millis_since_epoch, greet, hide_calendar,
-    open_main_window, popup_ready, relocate_clock_overlay_command, restore_default_clock,
-    set_calendar_pin, set_desktop_widget_enabled, set_macos_tray_bar_icon,
+    hide_clock_context_menu, open_main_window, popup_ready, relocate_clock_overlay_command,
+    restore_default_clock, set_calendar_pin, set_desktop_widget_enabled, set_macos_tray_bar_icon,
     set_macos_tray_date_icon_style, set_macos_tray_icon_px, set_macos_tray_title_template,
     set_macos_vibrancy, set_taskbar_widget_enabled_command, show_calendar, test_clock_detection,
     toggle_calendar, toggle_calendar_at_position,
@@ -93,10 +93,27 @@ fn dbg_log(msg: &str) {
 /// * `app` - 应用程序句柄
 pub(crate) fn request_app_exit(app: &tauri::AppHandle) {
     dbg_log("request_app_exit called");
-    // 设置允许退出标志为真
-    ALLOW_EXIT.store(true, Ordering::SeqCst);
-    // 退出程序并返回状态码 0
-    app.exit(0);
+    #[cfg(all(desktop, windows))]
+    {
+        // 恢复系统任务栏时钟（注册表 + 刷新），避免退出后时钟停留在替换文案。
+        crate::windows_hook::disable_custom_clock();
+        // 显式卸载低级鼠标钩子。
+        crate::windows_hook::uninstall_global_mouse_hook();
+        // **硬退出**：`app.exit(0)` 依赖主线程事件循环处理 ExitRequested，
+        // 实测存在间歇性不生效（进程滞留在半退出状态：钩子已卸、窗口已藏、
+        // 但输入路由异常）。清理完成后直接终止进程，确保退出确定性。
+        // 时钟刷新通知是异步传播的，留 300ms 让任务栏完成还原刷新。
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        dbg_log("process::exit(0)");
+        std::process::exit(0);
+    }
+    #[cfg(not(all(desktop, windows)))]
+    {
+        // 设置允许退出标志为真
+        ALLOW_EXIT.store(true, Ordering::SeqCst);
+        // 退出程序并返回状态码 0
+        app.exit(0);
+    }
 }
 
 #[cfg(desktop)]
@@ -154,7 +171,9 @@ pub fn run() {
             set_macos_vibrancy,
             open_main_window,
             relocate_clock_overlay_command,
-            set_calendar_pin
+            set_calendar_pin,
+            clock_menu_action,
+            hide_clock_context_menu
         ])
         .setup(|app| app_runtime::desktop::setup_desktop_app(app)) // 设置生命周期钩子
         .on_page_load(|window, _payload| app_runtime::desktop::on_page_load(window))

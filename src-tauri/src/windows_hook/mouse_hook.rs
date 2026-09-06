@@ -12,7 +12,9 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::clock_window::{find_clock_window, is_mouse_in_clock_area, update_clock_area_cache};
 use super::registry_clock::disable_custom_clock;
-use super::state::{EVENT_SENDER, HOOK_HANDLE, IS_MENU_OPEN, TASKBAR_WIDGET_ENABLED};
+use super::state::{
+    EVENT_SENDER, HOOK_HANDLE, IS_MENU_OPEN, NATIVE_MENU_TRACKING, TASKBAR_WIDGET_ENABLED,
+};
 use super::types::{ClickEvent, MouseButton};
 use super::window_utils::is_foreground_fullscreen;
 
@@ -32,6 +34,26 @@ pub fn set_taskbar_widget_enabled(enabled: bool) {
             *global_sender = None;
         }
         let _ = disable_custom_clock();
+    }
+}
+
+/// 退出前的确定性清理：显式卸载低级鼠标钩子并清空事件通道。
+///
+/// 不依赖「进程终止时系统隐式移除钩子」——若退出瞬间钩子回调正在执行，
+/// 隐式清理可能留下短暂的全局输入卡顿/路由异常；显式卸载可彻底避免。
+pub fn uninstall_global_mouse_hook() {
+    if let Ok(handle) = super::state::HOOK_HANDLE.lock() {
+        if let Some(hook) = *handle {
+            unsafe {
+                let _ = UnhookWindowsHookEx(HHOOK(hook as *mut c_void));
+            }
+        }
+    }
+    if let Ok(mut handle) = super::state::HOOK_HANDLE.lock() {
+        *handle = None;
+    }
+    if let Ok(mut global_sender) = super::state::EVENT_SENDER.lock() {
+        *global_sender = None;
     }
 }
 
@@ -144,6 +166,61 @@ pub fn start_hook_message_thread() {
     });
 }
 
+/// 取证日志文件句柄（诊断构建专用；追加模式，进程内复用）。
+static FORENSICS_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// 简述窗口：句柄 + 类名 + 进程 ID；空句柄返回 "null"。
+unsafe fn describe_hwnd(hwnd: HWND) -> String {
+    if hwnd.0.is_null() {
+        return "null".to_string();
+    }
+    let mut pid = 0u32;
+    GetWindowThreadProcessId(hwnd, Some(&mut pid));
+    let mut cls = [0u16; 64];
+    let len = GetClassNameW(hwnd, &mut cls);
+    let class = String::from_utf16_lossy(&cls[..len as usize]);
+    format!("0x{:X}(class={class},pid={pid})", hwnd.0 as usize)
+}
+
+/// 在低级钩子回调内记录按钮事件的落点窗口与 GUI 线程状态（诊断构建专用，保持轻量）。
+fn forensics_log_event(msg: u32, x: i32, y: i32) {
+    let in_clock = is_mouse_in_clock_area(x, y);
+    let menu_open = IS_MENU_OPEN.load(Ordering::SeqCst);
+    let fullscreen = is_foreground_fullscreen();
+    let will_swallow = in_clock && !menu_open && !fullscreen;
+    let line = unsafe {
+        let under = WindowFromPoint(POINT { x, y });
+        let mut gti: GUITHREADINFO = std::mem::zeroed();
+        gti.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
+        let _ = GetGUIThreadInfo(0, &mut gti);
+        let fg = GetForegroundWindow();
+        format!(
+            "fx: msg=0x{msg:X} at=({x},{y}) under={} cap={} active={} fg={} clock={in_clock} menu={menu_open} fs={fullscreen} decision={}",
+            describe_hwnd(under),
+            describe_hwnd(gti.hwndCapture),
+            describe_hwnd(gti.hwndActive),
+            describe_hwnd(fg),
+            if will_swallow { "swallow" } else { "pass" }
+        )
+    };
+    if let Ok(mut guard) = FORENSICS_FILE.lock() {
+        if guard.is_none() {
+            match std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(r"D:\agents_tmp\hook_forensics.log")
+            {
+                Ok(f) => *guard = Some(f),
+                Err(_) => return,
+            }
+        }
+        {
+            use std::io::Write;
+            let _ = writeln!(guard.as_mut().expect("checked"), "{line}");
+        }
+    }
+}
+
 /// 低级鼠标钩子过程：在任务栏时钟区域内吞掉按键并投递 [`ClickEvent`]。
 ///
 /// * `code` - 钩子代码；`<0` 时必须转发。
@@ -172,19 +249,41 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     let x = mouse_struct.pt.x;
     let y = mouse_struct.pt.y;
 
+    // 取证日志（诊断构建）：记录每个按钮事件的落点窗口与 GUI 线程状态，
+    // 用于定位"桌面左键失灵"时点击实际被谁接收。
+    forensics_log_event(msg, x, y);
+
+    // 右键菜单窗口显示期间：按下落在菜单窗口外（任意位置）→ 隐藏菜单；
+    // 其余事件一律放行：菜单本身是普通可见窗口，点击直接送达即可，
+    // 吞掉会导致菜单收不到点击（表现为点「退出」没反应）。
+    // 原生 TrackPopupMenu 跟踪期间：它自带鼠标捕获并自行处理菜单外点击，
+    // 钩子对所有事件纯放行。
+    if IS_MENU_OPEN.load(Ordering::SeqCst) {
+        if NATIVE_MENU_TRACKING.load(Ordering::SeqCst) {
+            return CallNextHookEx(None, code, wparam, lparam);
+        }
+        if is_down
+            && !crate::window_manager::menu_rect_contains(x, y)
+            && !is_foreground_fullscreen()
+        {
+            crate::window_manager::hide_from_hook();
+        }
+        return CallNextHookEx(None, code, wparam, lparam);
+    }
+
     if is_mouse_in_clock_area(x, y) {
         // 全屏前台（游戏/全屏视频等）时不拦截，避免吞掉本应交给前台的鼠标消息
         if is_foreground_fullscreen() {
             return CallNextHookEx(None, code, wparam, lparam);
         }
-        if is_down {
-            let mouse_button =
-                if msg == WM_LBUTTONDOWN { MouseButton::Left } else { MouseButton::Right };
+        let mouse_button =
+            if msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP { MouseButton::Left } else { MouseButton::Right };
 
-            // 与任务栏右键菜单配合：菜单已打开时不再重复投递右键按下
-            if mouse_button == MouseButton::Right && IS_MENU_OPEN.load(Ordering::SeqCst) {
-                return LRESULT(1);
-            }
+        if is_down {
+            crate::dbg_log(&format!(
+                "hook: down in clock area ({},{}) msg=0x{:X} button={:?}",
+                x, y, msg, mouse_button
+            ));
 
             if mouse_button == MouseButton::Right {
                 unsafe {
@@ -196,8 +295,16 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
                         let _ = PostMessageW(Some(clock_hwnd), 675, WPARAM(0), LPARAM(0));
                     }
                 }
+                // 右键菜单在「抬起」时才投递：若在按下时进入 TrackPopupMenu 循环，
+                // 随后的物理抬起会被菜单视为“点击外部”而立即关闭（表现为白框一闪而过）。
+            } else if let Ok(sender_guard) = EVENT_SENDER.lock() {
+                if let Some(sender) = sender_guard.as_ref() {
+                    let event = ClickEvent { x, y, in_clock_area: true, button: mouse_button };
+                    let _ = sender.send(event);
+                }
             }
-
+        } else if mouse_button == MouseButton::Right {
+            // 右键抬起：此时按钮已释放，弹出的菜单不会被随后的抬起事件关闭
             if let Ok(sender_guard) = EVENT_SENDER.lock() {
                 if let Some(sender) = sender_guard.as_ref() {
                     let event = ClickEvent { x, y, in_clock_area: true, button: mouse_button };
@@ -208,6 +315,17 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
         // 在时钟区域内吞掉消息，阻止系统弹出原生任务栏右键菜单
         return LRESULT(1);
+    }
+
+    // 非时钟区域：放行消息，同时把左键按下投递给监听端——
+    // 用于 WIN+D 之后桌面日历被最小化时的自动恢复（桌面处于前台即可恢复）。
+    if is_down && msg == WM_LBUTTONDOWN {
+        if let Ok(sender_guard) = EVENT_SENDER.lock() {
+            if let Some(sender) = sender_guard.as_ref() {
+                let event = ClickEvent { x, y, in_clock_area: false, button: MouseButton::Left };
+                let _ = sender.send(event);
+            }
+        }
     }
 
     CallNextHookEx(None, code, wparam, lparam)
