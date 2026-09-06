@@ -31,6 +31,9 @@ pub struct WindowsHookManager {
 static LEFT_LAST_PASSED: AtomicBool = AtomicBool::new(false);
 /// 时钟区最近一次右键按下是否被放行（成对处置：抬起按此决定吞放）。
 static RIGHT_LAST_PASSED: AtomicBool = AtomicBool::new(false);
+/// 菜单刚被时钟区内的按下关闭：吞掉随后的右键抬起（使该右键成为纯粹的
+/// "关闭菜单"操作，不弹原生菜单不产生孤儿事件）。
+static NATIVE_DISMISS_PENDING: AtomicBool = AtomicBool::new(false);
 
 /// 设置是否启用任务栏日历组件；关闭时会清理自定义时钟。
 ///
@@ -303,14 +306,21 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     }
 
     // 右键菜单显示期间（原生路径，无前台——TPM 不处理菜单项点击与菜单外关闭，
-    // 由钩子全权代管交互）：
-    // - 按下在菜单外（任意位置，左/右键均可）→ 关闭菜单，点击放行给下层目标
-    //   （左键选桌面图标 / 右键弹原生菜单——与系统行为一致）；
+    // 由钩子全权代管交互），按三区域处置：
+    // - 时钟区按下：关闭菜单 + 整体吞掉（右键置 pending 吞掉随后的抬起，
+    //   使这次右键成为纯粹的"关闭菜单"操作，不弹原生菜单不卡输入）；
+    // - 菜单外其他位置按下：关闭菜单 + 放行（点击送达下层目标）；
     // - 抬起在菜单内 → 按上/下半路由：上半=设置，下半=退出（左右键均支持）；
     // - 菜单内的其他事件放行（TPM 菜单窗口自行处理/忽略）。
     if menu_open && native_tracking {
         if is_down && !crate::window_manager::menu_rect_contains(x, y) {
             crate::window_manager::dismiss_native_menu_from_hook();
+            if is_mouse_in_clock_area(x, y) {
+                if msg == WM_RBUTTONDOWN {
+                    NATIVE_DISMISS_PENDING.store(true, Ordering::SeqCst);
+                }
+                return LRESULT(1);
+            }
             return CallNextHookEx(None, code, wparam, lparam);
         }
         if is_up
@@ -360,6 +370,10 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
             if LEFT_LAST_PASSED.load(Ordering::SeqCst) {
                 return CallNextHookEx(None, code, wparam, lparam);
             }
+            return LRESULT(1);
+        }
+        // 菜单刚被时钟区内的按下关闭：这次抬起静默吞掉（不弹原生菜单不触发）
+        if NATIVE_DISMISS_PENDING.swap(false, Ordering::SeqCst) {
             return LRESULT(1);
         }
         if RIGHT_LAST_PASSED.load(Ordering::SeqCst) {
