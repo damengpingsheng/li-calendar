@@ -117,8 +117,17 @@ unsafe extern "system" fn overlay_win_event_proc(
         return;
     }
     if event == EVENT_OBJECT_LOCATIONCHANGE {
-        // 位移事件来自所有窗口（拖动任意窗口都触发）：只放行任务栏自身
-        if !hwnd.0.is_null() && get_window_class_name_checked(hwnd) != "Shell_TrayWnd" {
+        // 位移事件来自所有窗口（拖动任意窗口都触发），只放行两类：
+        // 1) 任务栏自身——自动隐藏滑入/滑出跟随；
+        // 2) 前台窗口——全屏进入/退出是前台窗口自身的矩形展开/缩回（前台
+        //    不变、任务栏不动，FOREGROUND 事件收不到），必须逐帧做全屏检测，
+        //    否则显隐要等 2s 兜底轮询（进入时浮在视频上"闪现"、退出时原生
+        //    时钟露出一段）。
+        if hwnd.0.is_null() {
+            return;
+        }
+        let is_foreground = GetForegroundWindow() == hwnd;
+        if !is_foreground && get_window_class_name_checked(hwnd) != "Shell_TrayWnd" {
             return;
         }
     }
