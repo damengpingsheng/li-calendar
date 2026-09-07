@@ -136,6 +136,8 @@ PotPlayer / Edge 退出视频全屏时：
 
 **回归**：`phase->covered → phase->normal` 全程持有 endorsed 3660，零采纳、+100ms 截图对齐无残影。
 
+**第二次真机复验仍失败（PotPlayer）→ 门槛升级**：PotPlayer 的退出过渡比 ffplay 慢，过渡期布局值可存活数秒——"两次一致且 ≥500ms" 的门被合法骗过（宽矩形被采纳数秒后弹回，即真机所见）。采纳门持久性门槛 **500ms → 8s**（commit `ba74a28`）：任何短于 8s 的过渡态结构性不可采纳；真实布局重排（图标增减/DPI）8s 后正常跟进，代价可忽略。诊断标记文件 `clockrect_debug` 已开启，真机复验时 menu_dbg.log 会记录全部几何应用。
+
 ## 5. 验证工具（复现/回归用）
 
 - `D:\agents_tmp\zslip_test.ps1`——ffplay 全屏进出 + 时钟中心点 WindowFromPoint 命中翻转 + 翻转后 100/400ms 截图（本轮主验证脚本）；
