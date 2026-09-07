@@ -44,12 +44,10 @@ static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// 覆盖层几何状态机阶段（P1+P2）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GeomPhase {
-    /// 常规：探测确认后即时更新认可矩形
+    /// 常规：探测差异需经采纳门（连续两次一致且间隔足够）才更新认可矩形
     Normal,
     /// 被盖（全屏窗口压住任务栏）：几何冻结，探测样本忽略
     Covered,
-    /// 退出待确认：保持认可矩形，等探测确认布局恢复（或稳定为新布局）
-    ExitPending,
 }
 
 struct GeomState {
@@ -57,23 +55,23 @@ struct GeomState {
     /// 认可矩形：覆盖层位置/尺寸的唯一权威（与钩子点击路由缓存解耦——
     /// 缓存如实跟踪全屏期布局 3660→3618，覆盖层绝不直接消费它）
     endorsed: Option<RECT>,
-    /// 进入退出待确认的时刻
-    exit_since: Option<std::time::Instant>,
-    /// 退出待确认期间的上一个样本（连续两次一致才采纳新布局）
-    last_sample: Option<RECT>,
+    /// 待采纳候选（与认可位不同的探测样本）
+    candidate: Option<RECT>,
+    /// 候选首次出现时刻
+    candidate_since: Option<std::time::Instant>,
 }
 
 static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     phase: GeomPhase::Normal,
     endorsed: None,
-    exit_since: None,
-    last_sample: None,
+    candidate: None,
+    candidate_since: None,
 });
 
-/// 退出待确认：采纳新稳定布局所需的最短退出时长（避开退出动画中间态）。
-const EXIT_ADOPT_MIN_MS: u128 = 1000;
-/// 退出待确认：无确认时的兜底采纳时长。
-const EXIT_ADOPT_MAX_MS: u128 = 5000;
+/// 采纳门：与认可位不同的候选需存活 ≥500ms 且再次探测一致才采纳——
+/// 2s 探测节奏下，存活不足一个周期的过渡态中间值（如退出全屏时的宽矩形）
+/// 永远凑不齐两次，结构性无法被采纳；真实布局重排则 2~4s 内正常跟进。
+const ADOPT_MIN_SPACING_MS: u128 = 500;
 
 /// RECT 字段级比较（不依赖 derive）。
 fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
@@ -102,47 +100,35 @@ pub fn clock_overlay_note_probe(rect: RECT) {
     let Ok(mut g) = GEOM.lock() else {
         return;
     };
-    match g.phase {
-        GeomPhase::Covered => {} // 全屏期布局样本：不更新认可矩形
-        GeomPhase::Normal => {
-            if !rect_eq(g.endorsed, Some(rect)) {
-                g.endorsed = Some(rect);
-                crate::dbg_log(&format!(
-                    "clockrect: endorsed adopt (normal) ({},{},{},{})",
-                    rect.left, rect.top, rect.right, rect.bottom
-                ));
-            }
-        }
-        GeomPhase::ExitPending => {
-            let elapsed = g
-                .exit_since
-                .map(|t| t.elapsed().as_millis())
-                .unwrap_or(u128::MAX);
-            if rect_eq(g.endorsed, Some(rect)) {
-                // 布局已恢复认可位：确认退出完成
-                g.phase = GeomPhase::Normal;
-                g.exit_since = None;
-                g.last_sample = None;
-                crate::dbg_log("clockrect: exit confirmed (probe==endorsed)");
-            } else if elapsed >= EXIT_ADOPT_MAX_MS {
-                // 长时间无确认：兜底采纳最新样本（失败保护）
-                g.endorsed = Some(rect);
-                g.phase = GeomPhase::Normal;
-                g.exit_since = None;
-                g.last_sample = None;
-                crate::dbg_log("clockrect: exit fail-safe adopt");
-            } else if elapsed >= EXIT_ADOPT_MIN_MS && g.last_sample == Some(rect) {
-                // 连续两次一致且已避开动画期：真实的新稳定布局，采纳
-                g.endorsed = Some(rect);
-                g.phase = GeomPhase::Normal;
-                g.exit_since = None;
-                g.last_sample = None;
-                crate::dbg_log("clockrect: exit adopt new stable layout");
-            } else {
-                g.last_sample = Some(rect);
-            }
-        }
+    if g.phase == GeomPhase::Covered {
+        return; // 全屏期布局样本：不更新认可矩形
     }
+    if rect_eq(g.endorsed, Some(rect)) {
+        // 与认可位一致：清除悬而未决的候选（布局已回到认可位）
+        if g.candidate.is_some() {
+            g.candidate = None;
+            g.candidate_since = None;
+            crate::dbg_log("clockrect: candidate cleared (probe==endorsed)");
+        }
+        return;
+    }
+    // 与认可位不同：走采纳门（两次一致 + 间隔足够），绝不即时采纳——
+    // 退出全屏的过渡期宽矩形/全屏期布局值就是这么混进去的（实测）。
+    let same_as_candidate = rect_eq(g.candidate, Some(rect));
+    let elapsed = g.candidate_since.map(|t| t.elapsed().as_millis()).unwrap_or(0);
+    if same_as_candidate && elapsed >= ADOPT_MIN_SPACING_MS {
+        g.endorsed = Some(rect);
+        g.candidate = None;
+        g.candidate_since = None;
+        crate::dbg_log(&format!(
+            "clockrect: endorsed adopt ({},{},{},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
+    } else if !same_as_candidate {
+        g.candidate = Some(rect);
+        g.candidate_since = Some(std::time::Instant::now());
+    }
+    // 同候选但间隔不足：继续等下一针
 }
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
@@ -258,8 +244,8 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 }
 
 /// 直接按缓存矩形重贴（不再触发 UIA，供 2 秒周期重探线程复用其刷新结果）。
-/// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用——Covered/
-/// ExitPending 阶段缓存可能携带全屏期布局值，一律冻结不消费。
+/// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用——Covered 阶段
+/// 缓存可能携带全屏期布局值，一律冻结不消费；差异矩形须经采纳门才进 endorsed。
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
     let (endorsed, phase_is_normal) = match GEOM.lock() {
         Ok(g) => (g.endorsed, g.phase == GeomPhase::Normal),
@@ -501,8 +487,8 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             if let Ok(mut g) = GEOM.lock() {
                 if g.phase != GeomPhase::Covered {
                     g.phase = GeomPhase::Covered;
-                    g.exit_since = None;
-                    g.last_sample = None;
+                    g.candidate = None;
+                    g.candidate_since = None;
                     crate::dbg_log(&format!(
                         "clockrect: phase->covered (hold endorsed ({},{},{},{}))",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
@@ -516,11 +502,9 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
         TrayCover::Visible => {
             if let Ok(mut g) = GEOM.lock() {
                 if g.phase == GeomPhase::Covered {
-                    g.phase = GeomPhase::ExitPending;
-                    g.exit_since = Some(std::time::Instant::now());
-                    g.last_sample = None;
+                    g.phase = GeomPhase::Normal;
                     crate::dbg_log(&format!(
-                        "clockrect: phase->exit-pending (hold endorsed ({},{},{},{}))",
+                        "clockrect: phase->normal (exit cover, hold endorsed ({},{},{},{}))",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
                 }

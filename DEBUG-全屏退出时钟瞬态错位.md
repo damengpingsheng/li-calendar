@@ -123,6 +123,19 @@ PotPlayer / Edge 退出视频全屏时：
 
 **ffplay 自动化回归**：`phase->covered (hold endorsed 3660)` → `phase->exit-pending (hold endorsed 3660)` → `exit confirmed (probe==endorsed)`；+100ms 截图对齐、内容完整。（ffplay 为自动化辅助，最终以 PotPlayer 真机为准。）
 
+### 第二次真机反馈 → 采纳门统一（最终形态，2026-09-09）
+
+**真机新现象**：退出全屏瞬间时钟左右边缘都变宽（左缘稍偏左、右缘几乎到桌面最右端），随即极快弹回——**短暂的"超宽矩形"（~3612-3819，宽 ~207）被即时采纳**。
+
+**机理**：ExitPending 的确认（probe==endorsed）在退出动画刚露出 3660 时就发生 → 回 Normal 态 → Normal 态对差异探测是**即时采纳** → 紧接着的过渡期宽矩形直接进 endorsed。ExitPending 只保护了确认前的窗口，确认后的大门仍然敞开。
+
+**修复：采纳门统一化（ExitPending 简化掉）**——任何与认可位不同的探测，必须**连续两次一致且间隔 ≥500ms** 才采纳：
+- 2s 探测节奏下，存活不足一个周期的过渡态中间值（宽矩形/全屏期布局值）永远凑不齐两次，**结构性不可被采纳**；
+- 真实布局重排（图标增减等持久变化）2~4s 内正常跟进；
+- 阶段简化为 Normal/Covered 两种（ExitPending 的语义已被候选门覆盖）。
+
+**回归**：`phase->covered → phase->normal` 全程持有 endorsed 3660，零采纳、+100ms 截图对齐无残影。
+
 ## 5. 验证工具（复现/回归用）
 
 - `D:\agents_tmp\zslip_test.ps1`——ffplay 全屏进出 + 时钟中心点 WindowFromPoint 命中翻转 + 翻转后 100/400ms 截图（本轮主验证脚本）；
