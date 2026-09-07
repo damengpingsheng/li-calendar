@@ -284,42 +284,64 @@ fn system_uses_light_theme() -> bool {
     }
 }
 
-/// 从任务栏实采底色：水平 5 点采样取**通道均值**。任务栏底色沿横向有壁纸
-/// 透出的微妙渐变（实测 5 点 5 值），精确众数永不成立，必须取均值。
-/// 采样点全失败返回 None（调用方按主题色兜底）。
+/// 从任务栏实采底色：采样**时钟矩形右侧、屏幕右缘之前的细条**（「显示桌面」区）。
+///
+/// 该区域没有任何图标/按钮像素，且紧邻时钟——底色与时钟局部最贴近。
+/// 旧版采任务栏横向全宽中带，点位大量落在开始按钮/图标上，均值被污染产生色差。
+/// 时钟矩形本身被覆盖层盖住（采到的是自己），也必须避开。
 fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
     unsafe {
+        // 覆盖层贴合的时钟矩形：右缘之右即「显示桌面」细条
+        let clock = crate::windows_hook::CLOCK_AREA_RECT_CACHE
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().copied())?;
         let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
-        let mut rect = RECT::default();
-        GetWindowRect(tray, &mut rect).ok()?;
-        let width = rect.right - rect.left;
-        let height = rect.bottom - rect.top;
-        if width <= 0 || height <= 0 {
+        let mut tray_rect = RECT::default();
+        GetWindowRect(tray, &mut tray_rect).ok()?;
+        // 时钟所在显示器右缘（「显示桌面」条右边界）
+        let hmon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_invalid() {
             return None;
         }
+        let mut mi = MONITORINFO::default();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return None;
+        }
+        let screen_right = mi.rcMonitor.right;
+        // 条内取 3 个纵向位置、每列 3 点（上/中/下错开，抗单点噪点）
+        let y_mid = (tray_rect.top + tray_rect.bottom) / 2;
+        let y_top = tray_rect.top + (tray_rect.bottom - tray_rect.top) / 4;
+        let y_bot = tray_rect.bottom - (tray_rect.bottom - tray_rect.top) / 4;
         let dc = GetDC(None);
         let mut sum = (0u32, 0u32, 0u32);
         let mut count = 0u32;
-        for frac in [0.12f64, 0.3, 0.5, 0.7, 0.88] {
-            let x = rect.left + (width as f64 * frac) as i32;
-            let y = rect.top + height / 2;
-            let color = GetPixel(dc, x, y).0;
-            if color == 0xFFFF_FFFF {
-                continue;
+        for dx in [3i32, 8, 13] {
+            let x = clock.right + dx;
+            if x >= screen_right - 1 {
+                break;
             }
-            sum.0 += (color & 0xFF) as u32;
-            sum.1 += ((color >> 8) & 0xFF) as u32;
-            sum.2 += ((color >> 16) & 0xFF) as u32;
-            count += 1;
+            for y in [y_top, y_mid, y_bot] {
+                let color = GetPixel(dc, x, y).0;
+                if color == 0xFFFF_FFFF {
+                    continue;
+                }
+                sum.0 += (color & 0xFF) as u32;
+                sum.1 += ((color >> 8) & 0xFF) as u32;
+                sum.2 += ((color >> 16) & 0xFF) as u32;
+                count += 1;
+            }
         }
         ReleaseDC(None, dc);
-        (count > 0).then(|| {
-            (
-                (sum.0 / count) as u8,
-                (sum.1 / count) as u8,
-                (sum.2 / count) as u8,
-            )
-        })
+        if count < 3 {
+            return None;
+        }
+        Some((
+            (sum.0 / count) as u8,
+            (sum.1 / count) as u8,
+            (sum.2 / count) as u8,
+        ))
     }
 }
 
