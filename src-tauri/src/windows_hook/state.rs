@@ -11,6 +11,9 @@ use super::types::ClickEvent;
 /// 全局低级钩子句柄。
 pub static HOOK_HANDLE: Lazy<Arc<Mutex<Option<isize>>>> = Lazy::new(|| Arc::new(Mutex::new(None)));
 
+/// WinEvent 钩子句柄（前台切换 + 任务栏位移，驱动覆盖层显隐与任务栏同步）。
+pub static WIN_EVENT_HANDLES: Lazy<Mutex<Vec<isize>>> = Lazy::new(|| Mutex::new(Vec::new()));
+
 /// 用于防止右键菜单重复弹出的原子锁。
 pub static IS_MENU_OPEN: AtomicBool = AtomicBool::new(false);
 

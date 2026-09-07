@@ -171,3 +171,5 @@
   - 重贴阈值：Phase 0 的 `LAST_APPLIED_RECT` 精确匹配已覆盖（矩形未变零窗口操作，只重申 topmost）；
   - **偏离记录**：PLAN 原定的 `TaskbarCreated` 监听**未实现**——explorer 重启后 2s 重探线程天然完成重探+重贴+topmost 重申（≤2s 自愈），专设消息窗口收广播的复杂度不值；若日后用户对重启恢复的 2s 延迟敏感再补。
   - **部署中顺带实测**：重启后时钟矩形自发变化（207→158 宽，任务栏重排），重探线程 attempt 0 贴合新矩形，验证了变化跟踪链路。
+  - **Phase 1 追加（用户反馈驱动）**：初版可见性挂在 2s 轮询上，用户实测"隐藏/出现比任务栏慢"（最坏 2s 滞后）。改为 **WinEvent 事件驱动**：`SetWinEventHook` 监听 `EVENT_SYSTEM_FOREGROUND`（全屏进出）+ `EVENT_OBJECT_LOCATIONCHANGE`（过滤 `Shell_TrayWnd`，自动隐藏滑入/滑出），挂在与鼠标钩子同泵线程；回调只做轻量判定+ShowWindow，2s 轮询降级为兜底。卸载对称（`uninstall_global_mouse_hook` 与 `WindowsHookManager::uninstall_hook` 双路径 `UnhookWinEvent`）。
+  - 事件路径验证：程序化弹铺满屏窗体 400ms 后截图——覆盖层已隐藏（纯轮询在此窗口内来不及，判定为事件驱动生效）；关闭后恢复。自动隐藏滑入/滑出路径待用户真机验。
