@@ -68,10 +68,11 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     candidate_since: None,
 });
 
-/// 采纳门：与认可位不同的候选需存活 ≥500ms 且再次探测一致才采纳——
-/// 2s 探测节奏下，存活不足一个周期的过渡态中间值（如退出全屏时的宽矩形）
-/// 永远凑不齐两次，结构性无法被采纳；真实布局重排则 2~4s 内正常跟进。
-const ADOPT_MIN_SPACING_MS: u128 = 500;
+/// 采纳门：与认可位不同的候选需**持续存在 ≥8s** 才采纳——
+/// 退出全屏/进入全屏的过渡态布局（宽矩形、全屏期布局值）存活仅零点几到几秒，
+/// 永远达不到门槛，结构性无法被采纳（PotPlayer 慢退出实测可骗过 500ms 门）；
+/// 真实布局重排（图标增减/DPI 变更等持久变化）8s 后正常跟进，代价可忽略。
+const PERSIST_ADOPT_MS: u128 = 8000;
 
 /// RECT 字段级比较（不依赖 derive）。
 fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
@@ -112,11 +113,12 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         }
         return;
     }
-    // 与认可位不同：走采纳门（两次一致 + 间隔足够），绝不即时采纳——
-    // 退出全屏的过渡期宽矩形/全屏期布局值就是这么混进去的（实测）。
+    // 与认可位不同：走采纳门（候选需持续存在 ≥8s），绝不即时采纳——
+    // 退出全屏的过渡期宽矩形/全屏期布局值就是这么混进去的（实测）；
+    // PotPlayer 慢退出的过渡布局可存活数秒，500ms 门曾被骗过（实测）。
     let same_as_candidate = rect_eq(g.candidate, Some(rect));
     let elapsed = g.candidate_since.map(|t| t.elapsed().as_millis()).unwrap_or(0);
-    if same_as_candidate && elapsed >= ADOPT_MIN_SPACING_MS {
+    if same_as_candidate && elapsed >= PERSIST_ADOPT_MS {
         g.endorsed = Some(rect);
         g.candidate = None;
         g.candidate_since = None;
@@ -128,7 +130,7 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         g.candidate = Some(rect);
         g.candidate_since = Some(std::time::Instant::now());
     }
-    // 同候选但间隔不足：继续等下一针
+    // 同候选但持久时长不足：继续等下一针
 }
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
