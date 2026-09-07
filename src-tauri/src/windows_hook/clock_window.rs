@@ -13,6 +13,14 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use super::state::CLOCK_AREA_RECT_CACHE;
 use super::window_utils::get_window_class_name;
 
+/// 时钟矩形诊断日志：存在标记文件 `D:\agents_tmp\clockrect_debug` 时才写
+/// （周期探测每 2s 一条，常开会刷爆 menu_dbg.log）。
+fn clockrect_log(msg: &str) {
+    if std::path::Path::new(r"D:\agents_tmp\clockrect_debug").exists() {
+        crate::dbg_log(&format!("clockrect: {msg}"));
+    }
+}
+
 /// 校验/修正时钟矩形：物理矩形必须完整落在任务栏带内（允许 20px 容差，越界部分收拢）。
 ///
 /// UIA `BoundingRectangle` 在进程 DPI 感知与系统不匹配时会返回**逻辑坐标**
@@ -123,6 +131,10 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
 /// 将 UIA 得到的时钟矩形写入 [`super::state::CLOCK_AREA_RECT_CACHE`]。
 pub fn update_clock_area_cache() {
     if let Some(rect) = get_clock_rect_via_uia() {
+        clockrect_log(&format!(
+            "uia rect=({},{},{},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
         persist_clock_rect(&rect);
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
@@ -132,6 +144,10 @@ pub fn update_clock_area_cache() {
     // 探测失败（Win11 XAML 任务栏可能无常驻经典时钟窗口）：
     // 回退到持久化的最后已知正确物理矩形（注册表 HKCU\Software\liCalendar\ClockRect）。
     if let Some(rect) = load_persisted_clock_rect() {
+        clockrect_log(&format!(
+            "registry-echo rect=({},{},{},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }
@@ -261,6 +277,10 @@ pub fn refresh_clock_rect_if_in_taskbar(x: i32, y: i32) {
         if !ok {
             return;
         }
+        clockrect_log(&format!(
+            "hook-hwnd rect=({},{},{},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }

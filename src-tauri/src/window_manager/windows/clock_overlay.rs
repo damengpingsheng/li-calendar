@@ -40,6 +40,12 @@ static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, isize)>> = Mutex::new(None);
 static CURRENT_BELOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 /// 「退出全屏自愈」进行中标记（防重复 spawn 治疗线程）。
 static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 潜入期冻结的「正常位」（进入覆盖时的窗口实际位置）。
+///
+/// E 方案（实测归因）：全屏期间原生时钟真实移位（3660→3618），缓存如实跟踪，
+/// 退出后布局恢复 3660 而覆盖层还在 3618——错位不是缓存过期，而是"消费了
+/// 全屏期布局值"。冻结后被盖期间不挪窗，退出恢复冻结位即正确。
+static COVERED_FROZEN_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
 impl super::CalendarWindowManager {
@@ -155,6 +161,10 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 
 /// 直接按缓存矩形重贴（不再触发 UIA，供 2 秒周期重探线程复用其刷新结果）。
 pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
+    // E 方案冻结：被盖期间不消费缓存矩形（那可能是全屏期布局），窗口保持冻结位。
+    if CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+        return;
+    }
     let rect = crate::windows_hook::CLOCK_AREA_RECT_CACHE
         .read()
         .ok()
@@ -373,16 +383,54 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     };
     // 状态三元组：(x, y, 插入到谁之后)。-1 = 常规 topmost。
     let (target_x, target_y, below) = match taskbar_cover_probe() {
-        TrayCover::Covered(cover) => (clock.left, clock.top, cover.0 as isize),
-        TrayCover::Visible => match read_tray_state() {
-            // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
-            // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
-            Some(state) if state.fully_hidden || !state.ready => {
-                (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK)
+        TrayCover::Covered(cover) => {
+            // E 方案冻结：首帧记录窗口当前实际位置（用户最后看到的正常位），
+            // 整个被盖期间保持不动——全屏期缓存矩形是全屏布局，不可消费。
+            let frozen = COVERED_FROZEN_POS.lock().ok().and_then(|g| *g);
+            let (x, y) = match frozen {
+                Some(p) => p,
+                None => {
+                    let mut wr = RECT::default();
+                    let p = unsafe {
+                        if GetWindowRect(hwnd, &mut wr).is_ok() && wr.right > wr.left {
+                            (wr.left, wr.top)
+                        } else {
+                            (clock.left, clock.top)
+                        }
+                    };
+                    if let Ok(mut g) = COVERED_FROZEN_POS.lock() {
+                        *g = Some(p);
+                    }
+                    crate::dbg_log(&format!(
+                        "clockrect: freeze at ({},{})",
+                        p.0, p.1
+                    ));
+                    p
+                }
+            };
+            (x, y, cover.0 as isize)
+        }
+        TrayCover::Visible => {
+            // 退出覆盖：优先恢复冻结的正常位（此刻缓存可能仍是全屏期布局值）
+            let frozen = COVERED_FROZEN_POS.lock().ok().and_then(|g| *g);
+            if let Some((fx, fy)) = frozen {
+                if let Ok(mut g) = COVERED_FROZEN_POS.lock() {
+                    *g = None;
+                }
+                crate::dbg_log(&format!("clockrect: unfreeze restore ({},{})", fx, fy));
+                (fx, fy, -1)
+            } else {
+                match read_tray_state() {
+                    // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
+                    // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
+                    Some(state) if state.fully_hidden || !state.ready => {
+                        (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK)
+                    }
+                    Some(state) => (clock.left + state.dx, clock.top + state.dy, -1),
+                    None => (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK),
+                }
             }
-            Some(state) => (clock.left + state.dx, clock.top + state.dy, -1),
-            None => (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK),
-        },
+        }
         // 探测失败：退回矩形全屏判定；全屏则移出屏幕，否则常规显示
         TrayCover::Unknown => {
             if crate::windows_hook::is_foreground_fullscreen() {
@@ -399,11 +447,19 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
         }
         *last = Some((target_x, target_y, below));
     }
+    // 诊断：z 序状态翻转时记录消费的缓存矩形（归因恢复瞬间错位的缓存来源）
+    let prev_below = CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst);
+    if prev_below > 0 && below == -1 {
+        crate::dbg_log(&format!(
+            "clockrect: reveal-consume cache=({},{},{},{})",
+            clock.left, clock.top, clock.right, clock.bottom
+        ));
+    }
     // 「退出潜入恢复常规」瞬间：时钟矩形缓存还是全屏期间/退出过渡期的旧值
     // （实测偏左 ~42px 右缘露出原生时钟，要等 ≤2s 的周期重探才自愈）。
     // 立即安排两针延迟重探重贴（150ms/600ms，避开退出动画未稳的瞬间），
     // 把自愈压到亚秒。UIA 在独立治疗线程执行，绝不进 WinEvent 回调线程。
-    let prev_below = CURRENT_BELOW.swap(below, std::sync::atomic::Ordering::SeqCst);
+    CURRENT_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
     if prev_below > 0 && below == -1 && !EXIT_HEALING.swap(true, std::sync::atomic::Ordering::SeqCst)
     {
         let heal_app = app_handle.clone();
