@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, SetWindowLongPtrW,
     SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE,
+    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE,
     WS_EX_TOOLWINDOW,
 };
 
@@ -28,6 +28,10 @@ use super::get_window_hwnd;
 
 /// 最近一次应用到覆盖层的时钟矩形（变化检测：矩形没变就不动窗口，避免周期重贴抖动）。
 static LAST_APPLIED_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+/// 任务栏「静止位」矩形（贴底/贴边时的位置）；跟随位移以此为基准计算偏移。
+static TRAY_HOME_RECT: Mutex<Option<RECT>> = Mutex::new(None);
+/// 最近一次跟随移动到的 y（相同则跳过 SetWindowPos，静止期零窗口操作）。
+static LAST_FOLLOW_Y: Mutex<Option<i32>> = Mutex::new(None);
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
 impl super::CalendarWindowManager {
@@ -162,40 +166,66 @@ pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
     }
 }
 
-/// 任务栏是否处于用户可见状态（自动隐藏滑出屏幕视为不可见）。
-fn taskbar_visible() -> bool {
+/// 任务栏当前状态：是否完全滑出屏幕 + 相对静止位的位移（滑入/滑出动画的实时偏移）。
+struct TrayState {
+    /// 整体滑出所在显示器边缘（自动隐藏收起完成态）
+    fully_hidden: bool,
+    /// 相对静止位的双轴位移（静止时 (0,0)；滑出动画中 y>0——底部任务栏）
+    dx: i32,
+    dy: i32,
+}
+
+/// 读取任务栏状态并顺带维护「静止位」基准：任务栏贴边（非滑动态）时记录其矩形。
+fn read_tray_state() -> Option<TrayState> {
     unsafe {
-        let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
-            return false;
-        };
+        let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         if !IsWindowVisible(tray).as_bool() {
-            return false;
+            return Some(TrayState { fully_hidden: true, dx: 0, dy: 0 });
         }
         let mut rect = RECT::default();
         if GetWindowRect(tray, &mut rect).is_err() {
-            return false;
+            return None;
         }
-        // 自动隐藏态：任务栏窗口仍"可见"但整体滑出所在显示器边缘（留 1~2px 唤出热区）
         let hmon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
         if hmon.is_invalid() {
-            return true;
+            return None;
         }
         let mut mi = MONITORINFO::default();
         mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
         if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
-            return true;
+            return None;
         }
         let m = mi.rcMonitor;
+        // 完全滑出判定：窗口整体在某边缘之外（留 ≤4px 唤出热区）
         const TOL: i32 = 4;
-        !(rect.top >= m.bottom - TOL
+        let fully_hidden = rect.top >= m.bottom - TOL
             || rect.bottom <= m.top + TOL
             || rect.left >= m.right - TOL
-            || rect.right <= m.left + TOL)
+            || rect.right <= m.left + TOL;
+        // 静止位维护：任务栏贴住某一边缘（与该边间隙 ≤4px）时刷新基准。
+        // 滑动动画中（离边缘远）不刷新，否则会把中间态当基准导致跟随错位。
+        let at_rest = (m.bottom - rect.bottom).abs() <= TOL
+            || (rect.top - m.top).abs() <= TOL
+            || (m.right - rect.right).abs() <= TOL
+            || (rect.left - m.left).abs() <= TOL;
+        let (dx, dy) = if let Ok(mut home) = TRAY_HOME_RECT.lock() {
+            if at_rest && home.as_ref() != Some(&rect) {
+                *home = Some(rect);
+            }
+            match *home {
+                Some(home) => (rect.left - home.left, rect.top - home.top),
+                None => (0, 0),
+            }
+        } else {
+            (0, 0)
+        };
+        Some(TrayState { fully_hidden, dx, dy })
     }
 }
 
-/// Phase 1 可见性管理：全屏前台（游戏/视频）或任务栏自动隐藏时隐藏覆盖层，
-/// 恢复后自动显示。由 2s 重探线程周期调用；显隐均走无激活路径，绝不抢焦点。
+/// Phase 1 可见性与跟随管理：全屏前台（游戏/视频）或任务栏完全滑出时隐藏；
+/// 任务栏滑入/滑出动画期间**跟随其位移移动**（不是瞬间显隐——任务栏滑到哪
+/// 覆盖层就在哪，视觉上像任务栏的一部分）。由 WinEvent 与 2s 兜底线程调用。
 pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
         return;
@@ -203,9 +233,55 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(hwnd) = get_window_hwnd(&window) else {
         return;
     };
-    let should_show = !crate::windows_hook::is_foreground_fullscreen() && taskbar_visible();
+    // 全屏前台：彻底隐藏（位置留给恢复时重算）
+    if crate::windows_hook::is_foreground_fullscreen() {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        if let Ok(mut last) = LAST_FOLLOW_Y.lock() {
+            *last = None;
+        }
+        return;
+    }
+    let Some(state) = read_tray_state() else {
+        return;
+    };
+    if state.fully_hidden {
+        unsafe {
+            let _ = ShowWindow(hwnd, SW_HIDE);
+        }
+        if let Ok(mut last) = LAST_FOLLOW_Y.lock() {
+            *last = None;
+        }
+        return;
+    }
+    // 跟随：覆盖层位置 = 缓存时钟矩形 + 任务栏当前位移（滑出动画中 dy 逐渐增大，
+    // 覆盖层同步滑出屏外；滑入时同步滑回。SWP_NOZORDER 保持 topmost 不被重排）
+    let Some(clock) = crate::windows_hook::CLOCK_AREA_RECT_CACHE
+        .read()
+        .ok()
+        .and_then(|guard| guard.as_ref().copied())
+    else {
+        return;
+    };
+    let x = clock.left + state.dx;
+    let y = clock.top + state.dy;
+    if let Ok(mut last) = LAST_FOLLOW_Y.lock() {
+        if *last == Some(y) {
+            return;
+        }
+        *last = Some(y);
+    }
     unsafe {
-        let _ = ShowWindow(hwnd, if should_show { SW_SHOWNOACTIVATE } else { SW_HIDE });
+        let _ = SetWindowPos(
+            hwnd,
+            None,
+            x,
+            y,
+            0,
+            0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+        );
     }
 }
 
