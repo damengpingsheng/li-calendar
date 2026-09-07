@@ -18,10 +18,10 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONEAREST,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, SetWindowLongPtrW,
-    SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE,
-    WS_EX_TOOLWINDOW,
+    FindWindowW, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
+    SetWindowLongPtrW, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
+    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use super::get_window_hwnd;
@@ -254,7 +254,46 @@ fn read_tray_state() -> Option<TrayState> {
     }
 }
 
-/// Phase 1 可见性与跟随管理：全屏前台（游戏/视频）或任务栏完全滑出时隐藏；
+/// 任务栏左段（避开右端覆盖层与托盘）的可见性判定点（横向 10%/25%/40%，中带）。
+const TASKBAR_PROBE_FRACIONS: [f64; 3] = [0.10, 0.25, 0.40];
+
+/// 任务栏是否被**其他窗口**盖住（全屏视频/游戏 topmost 压住任务栏）。
+///
+/// 语义替代「前台窗口矩形铺满=全屏」：PotPlayer 等播放器退出全屏的过渡期
+/// 窗口矩形仍铺满整屏长达 1~2s（矩形判定持续误判全屏，轮询再快也没用），
+/// 而此时任务栏已实际露出。本判定用 `WindowFromPoint` 命中测试直接问
+/// 「任务栏上这点此刻归谁」——像素级真实状态，不受窗口矩形动画时序干扰。
+/// 三点投票（避开单点被 tooltip 之类临时窗口局部覆盖的误判）。
+/// 返回 `None` 表示无法判定（找不到任务栏），调用方退回矩形判定。
+fn taskbar_covered_by_foreign() -> Option<bool> {
+    unsafe {
+        let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
+        let mut rect = RECT::default();
+        GetWindowRect(tray, &mut rect).ok()?;
+        let width = rect.right - rect.left;
+        let mid_y = (rect.top + rect.bottom) / 2;
+        let mut covered_count = 0;
+        for frac in TASKBAR_PROBE_FRACIONS {
+            let pt = windows::Win32::Foundation::POINT {
+                x: rect.left + (width as f64 * frac) as i32,
+                y: mid_y,
+            };
+            let hit = WindowFromPoint(pt);
+            if hit.0.is_null() {
+                continue;
+            }
+            // 命中窗口的根祖先是否任务栏自身（命中开始按钮/图标等子窗口也算任务栏可见）
+            let root = GetAncestor(hit, GA_ROOT);
+            if root == tray || hit == tray {
+                return Some(false);
+            }
+            covered_count += 1;
+        }
+        (covered_count > 0).then_some(true)
+    }
+}
+
+/// Phase 1 可见性与跟随管理：任务栏被盖（全屏视频/游戏）或完全滑出时隐藏；
 /// 任务栏滑入/滑出动画期间**跟随其位移移动**（不是瞬间显隐——任务栏滑到哪
 /// 覆盖层就在哪，视觉上像任务栏的一部分）。由 WinEvent 与 2s 兜底线程调用。
 pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
@@ -264,8 +303,11 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(hwnd) = get_window_hwnd(&window) else {
         return;
     };
-    // 全屏前台：彻底隐藏（位置留给恢复时重算）
-    if crate::windows_hook::is_foreground_fullscreen() {
+    // 全屏/被盖判定：优先像素级命中测试（任务栏被别的窗口盖住），
+    // 无法判定时退回「前台窗口矩形铺满」的旧判定兜底。
+    let covered = taskbar_covered_by_foreign()
+        .unwrap_or_else(crate::windows_hook::is_foreground_fullscreen);
+    if covered {
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
