@@ -164,6 +164,9 @@ pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
             );
         }
     }
+    // 可见性统一走跟随管理：覆盖层曾因矩形未就绪保持隐藏（如启动时任务栏正
+    // 收起、UIA 探测失败），矩形就绪后由这里恢复显示或按全屏/滑出态维持隐藏。
+    update_clock_overlay_visibility(app_handle);
 }
 
 /// 任务栏当前状态：是否完全滑出屏幕 + 相对静止位的位移（滑入/滑出动画的实时偏移）。
@@ -173,14 +176,16 @@ struct TrayState {
     /// 相对静止位的双轴位移（静止时 (0,0)；滑出动画中 y>0——底部任务栏）
     dx: i32,
     dy: i32,
+    /// 静止位基准是否已学习（未学习时不可跟随，覆盖层应保持隐藏）
+    ready: bool,
 }
 
-/// 读取任务栏状态并顺带维护「静止位」基准：任务栏贴边（非滑动态）时记录其矩形。
+/// 读取任务栏状态并顺带维护「静止位」基准。
 fn read_tray_state() -> Option<TrayState> {
     unsafe {
         let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         if !IsWindowVisible(tray).as_bool() {
-            return Some(TrayState { fully_hidden: true, dx: 0, dy: 0 });
+            return Some(TrayState { fully_hidden: true, dx: 0, dy: 0, ready: true });
         }
         let mut rect = RECT::default();
         if GetWindowRect(tray, &mut rect).is_err() {
@@ -202,24 +207,50 @@ fn read_tray_state() -> Option<TrayState> {
             || rect.bottom <= m.top + TOL
             || rect.left >= m.right - TOL
             || rect.right <= m.left + TOL;
-        // 静止位维护：任务栏贴住某一边缘（与该边间隙 ≤4px）时刷新基准。
-        // 滑动动画中（离边缘远）不刷新，否则会把中间态当基准导致跟随错位。
-        let at_rest = (m.bottom - rect.bottom).abs() <= TOL
-            || (rect.top - m.top).abs() <= TOL
-            || (m.right - rect.right).abs() <= TOL
-            || (rect.left - m.left).abs() <= TOL;
-        let (dx, dy) = if let Ok(mut home) = TRAY_HOME_RECT.lock() {
-            if at_rest && home.as_ref() != Some(&rect) {
-                *home = Some(rect);
-            }
+        // 静止位基准维护。两条铁律（皆有实测教训）：
+        // 1) 不能用"贴住任一显示器边缘"判定静止——任务栏左右恒贴满屏幕宽，
+        //    滑动全程都会误判静止、每帧刷新基准，dy 恒为 0，覆盖层不跟随。
+        // 2) 首次记录不能用"无条件接受"——自动隐藏用户启动应用时任务栏多为
+        //    收起态，收起位被记成静止位后，唤出时 dy=-82 覆盖层顶飞到屏幕中央。
+        // 正确判定：静止位 ⇔ 任务栏矩形**完全在显示器内**（收起态与滑动中间态
+        // 都必然跨出边缘）。基准记录后只在回到基准 ±TOL 时刷新；位移超过屏幕
+        // 尺寸视为基准过期（分辨率变更），丢弃重学。
+        let fully_inside = rect.left >= m.left
+            && rect.right <= m.right
+            && rect.top >= m.top
+            && rect.bottom <= m.bottom;
+        let screen_span = (m.right - m.left).abs().max((m.bottom - m.top).abs());
+        let (dx, dy, ready) = if let Ok(mut home) = TRAY_HOME_RECT.lock() {
             match *home {
-                Some(home) => (rect.left - home.left, rect.top - home.top),
-                None => (0, 0),
+                Some(h) => {
+                    let ddx = rect.left - h.left;
+                    let ddy = rect.top - h.top;
+                    if ddx.abs() > screen_span || ddy.abs() > screen_span {
+                        // 基准过期（分辨率/显示器变更）：丢弃，等完全入屏后重学
+                        *home = None;
+                        (0, 0, false)
+                    } else if ddx.abs() <= TOL && ddy.abs() <= TOL {
+                        // 回到静止位：刷新基准（吸收静止位的微小漂移）
+                        *home = Some(rect);
+                        (0, 0, true)
+                    } else {
+                        // 滑动中：保持基准，返回实时位移
+                        (ddx, ddy, true)
+                    }
+                }
+                None => {
+                    if fully_inside {
+                        *home = Some(rect);
+                        (0, 0, true)
+                    } else {
+                        (0, 0, false)
+                    }
+                }
             }
         } else {
-            (0, 0)
+            (0, 0, false)
         };
-        Some(TrayState { fully_hidden, dx, dy })
+        Some(TrayState { fully_hidden, dx, dy, ready })
     }
 }
 
@@ -246,7 +277,9 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(state) = read_tray_state() else {
         return;
     };
-    if state.fully_hidden {
+    // 基准未学习（如启动时任务栏收起，尚未见过静止位）：保持隐藏，
+    // 待任务栏完全入屏学到基准后再现身（避免无基准的"提前现身"）。
+    if state.fully_hidden || !state.ready {
         unsafe {
             let _ = ShowWindow(hwnd, SW_HIDE);
         }
