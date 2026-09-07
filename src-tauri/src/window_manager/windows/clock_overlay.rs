@@ -59,12 +59,16 @@ struct GeomState {
     candidate: Option<RECT>,
     /// 候选首次出现时刻
     candidate_since: Option<std::time::Instant>,
-    /// 被盖期间观测到的原生时钟真实位置（N1 掩盖预备数据）
+    /// 被盖期间观测到的原生时钟真实位置（N1 掩盖预备数据；跨轮保留作下轮预测）
     native_observed: Option<RECT>,
     /// 当前遮盖矩形（窗口被临时扩展为认可∪原生观测时的实际窗口矩形）
     mask: Option<RECT>,
     /// 退出后请求收缩回认可矩形（探测确认原生已归位时置位）
     shrink_requested: bool,
+    /// 覆盖探测去抖：离开被盖态（Visible）的连续出现起点
+    visible_since: Option<std::time::Instant>,
+    /// 最近一次盖住者的窗口句柄（去抖等待期保持潜入 z 序用）
+    last_cover: Option<isize>,
 }
 
 static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
@@ -75,6 +79,8 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     native_observed: None,
     mask: None,
     shrink_requested: false,
+    visible_since: None,
+    last_cover: None,
 });
 
 /// 采纳门：与认可位不同的候选需**持续存在 ≥8s** 才采纳——
@@ -83,6 +89,13 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
 /// 真实布局重排（图标增减/DPI 变更等持久变化）8s 后正常跟进，代价可忽略。
 /// 注意：这是防抖参数，不是"连续观测 8s"的强保证（中间探测失败会累计时长）。
 const PERSIST_ADOPT_MS: u128 = 8000;
+
+/// 覆盖探测去抖：被盖→常规要求 Visible 持续存在 ≥300ms 才切换。
+/// 实测：PotPlayer 退出全屏的窗口缩回动画使覆盖探测以 ~1.4s 周期在
+/// Covered/Visible 间抖动，状态机随之扩张/收缩循环（用户见时钟宽度反复变化、
+/// 喇叭图标反复被盖）。去抖后整个动画期保持被盖几何一次，动画结束一次性收缩。
+/// 进入被盖不去抖（盖住就该立即遮）。
+const COVER_DEBOUNCE_MS: u128 = 300;
 
 /// RECT 字段级比较（不依赖 derive）。
 fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
@@ -521,6 +534,8 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let (target_x, target_y, target_w, target_h, below) = match taskbar_cover_probe() {
         TrayCover::Covered(cover) => {
             if let Ok(mut g) = GEOM.lock() {
+                g.last_cover = Some(cover.0 as isize);
+                g.visible_since = None;
                 if g.phase != GeomPhase::Covered {
                     g.phase = GeomPhase::Covered;
                     g.candidate = None;
@@ -567,9 +582,19 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             (x, y, w, h, cover.0 as isize)
         }
         TrayCover::Visible => {
+            // 覆盖探测去抖：被盖→常规要求 Visible 持续 ≥300ms。实测 PotPlayer
+            // 退出全屏的窗口缩回动画使覆盖探测以 ~1.4s 周期在 Covered/Visible
+            // 间抖动，无去抖则状态机反复扩张/收缩（用户见时钟宽度反复变化、
+            // 喇叭图标反复被盖）。去抖等待期窗口保持被盖几何（遮盖已展开），
+            // 零操作；动画结束一次性切换并收缩。
             if let Ok(mut g) = GEOM.lock() {
                 if g.phase == GeomPhase::Covered {
+                    let since = *g.visible_since.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed().as_millis() < COVER_DEBOUNCE_MS {
+                        return;
+                    }
                     g.phase = GeomPhase::Normal;
+                    g.visible_since = None;
                     crate::dbg_log(&format!(
                         "clockrect: phase->normal (exit cover, endorsed ({},{},{},{}), mask held)",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
