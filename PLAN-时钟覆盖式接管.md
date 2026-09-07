@@ -163,4 +163,11 @@
 - 交互仍走钩子老路径（Phase 0 只接管显示与悬停）：左键切日历、右键菜单行为应与改动前一致，待用户真机点击验收。
 - 遗留优化（非阻塞）：采样点遇图标仍可能拉偏均值（可加纵向多点/去极值）；`clock_overlay.rs` 内部分函数与再导出有 unused 警告（Phase 2/4 清理时一并处理）。
 
-**下一阶段**：Phase 1（定位健壮化：阈值重贴已在、`TaskbarCreated` 监听与全屏/自动隐藏检测未做）→ Phase 2（输入接管，`OVERLAY_TAKEOVER` 开关化）→ Phase 3（退役注册表文本方案）→ Phase 4（清死代码 + 改写 AGENTS.md）。
+**下一阶段**：Phase 1（定位健壮化）→ Phase 2（输入接管，`OVERLAY_TAKEOVER` 开关化）→ Phase 3（退役注册表文本方案）→ Phase 4（清死代码 + 改写 AGENTS.md）。
+
+- [x] **Phase 1 完成**（2026-09-07 22:30，已部署验证）：
+  - 全屏前台隐藏：`is_foreground_fullscreen` 从 `windows_hook` 导出，2s 循环接入 `update_clock_overlay_visibility`（全屏/任务栏不可见 → `SW_HIDE`，恢复 → `SW_SHOWNOACTIVATE`，全程无激活）；
+  - 任务栏自动隐藏检测：`taskbar_visible()`——`Shell_TrayWnd` 可见性 + 相对所在显示器四边滑出判定（TOL=4px，自动隐藏态窗口仍"可见"但整体滑出屏幕）；
+  - 重贴阈值：Phase 0 的 `LAST_APPLIED_RECT` 精确匹配已覆盖（矩形未变零窗口操作，只重申 topmost）；
+  - **偏离记录**：PLAN 原定的 `TaskbarCreated` 监听**未实现**——explorer 重启后 2s 重探线程天然完成重探+重贴+topmost 重申（≤2s 自愈），专设消息窗口收广播的复杂度不值；若日后用户对重启恢复的 2s 延迟敏感再补。
+  - **部署中顺带实测**：重启后时钟矩形自发变化（207→158 宽，任务栏重排），重探线程 attempt 0 贴合新矩形，验证了变化跟踪链路。

@@ -9,15 +9,19 @@ use std::sync::Mutex;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
-use windows::Win32::Graphics::Gdi::{GetDC, GetPixel, ReleaseDC};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
 };
+use windows::Win32::Graphics::Gdi::{
+    GetDC, GetMonitorInfoW, GetPixel, MonitorFromWindow, ReleaseDC, MONITORINFO,
+    MONITOR_DEFAULTTONEAREST,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetWindowLongPtrW, GetWindowRect, SetWindowLongPtrW, SetWindowPos, ShowWindow,
-    GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
-    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    FindWindowW, GetWindowLongPtrW, GetWindowRect, IsWindowVisible, SetWindowLongPtrW,
+    SetWindowPos, ShowWindow, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
+    SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE,
+    WS_EX_TOOLWINDOW,
 };
 
 use super::get_window_hwnd;
@@ -155,6 +159,53 @@ pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
             );
         }
+    }
+}
+
+/// 任务栏是否处于用户可见状态（自动隐藏滑出屏幕视为不可见）。
+fn taskbar_visible() -> bool {
+    unsafe {
+        let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
+            return false;
+        };
+        if !IsWindowVisible(tray).as_bool() {
+            return false;
+        }
+        let mut rect = RECT::default();
+        if GetWindowRect(tray, &mut rect).is_err() {
+            return false;
+        }
+        // 自动隐藏态：任务栏窗口仍"可见"但整体滑出所在显示器边缘（留 1~2px 唤出热区）
+        let hmon = MonitorFromWindow(tray, MONITOR_DEFAULTTONEAREST);
+        if hmon.is_invalid() {
+            return true;
+        }
+        let mut mi = MONITORINFO::default();
+        mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+        if !GetMonitorInfoW(hmon, &mut mi).as_bool() {
+            return true;
+        }
+        let m = mi.rcMonitor;
+        const TOL: i32 = 4;
+        !(rect.top >= m.bottom - TOL
+            || rect.bottom <= m.top + TOL
+            || rect.left >= m.right - TOL
+            || rect.right <= m.left + TOL)
+    }
+}
+
+/// Phase 1 可见性管理：全屏前台（游戏/视频）或任务栏自动隐藏时隐藏覆盖层，
+/// 恢复后自动显示。由 2s 重探线程周期调用；显隐均走无激活路径，绝不抢焦点。
+pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
+    let Some(window) = app_handle.get_webview_window("clock_overlay") else {
+        return;
+    };
+    let Some(hwnd) = get_window_hwnd(&window) else {
+        return;
+    };
+    let should_show = !crate::windows_hook::is_foreground_fullscreen() && taskbar_visible();
+    unsafe {
+        let _ = ShowWindow(hwnd, if should_show { SW_SHOWNOACTIVATE } else { SW_HIDE });
     }
 }
 

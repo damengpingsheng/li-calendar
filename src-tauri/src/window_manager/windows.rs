@@ -25,6 +25,7 @@ pub use clock_overlay::clock_overlay_appearance_colors;
 pub use clock_overlay::ensure_clock_overlay_attached;
 pub use clock_overlay::relocate_clock_overlay;
 pub use clock_overlay::relocate_clock_overlay_from_cache;
+pub use clock_overlay::update_clock_overlay_visibility;
 pub use clock_overlay::window_hwnd_by_label;
 
 /// 管理任务栏日历弹窗、桌面日历与可选叠加说明窗口。

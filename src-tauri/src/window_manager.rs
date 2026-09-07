@@ -19,6 +19,8 @@ pub use windows::clock_overlay_appearance_colors;
 #[cfg(windows)]
 pub use windows::ensure_clock_overlay_attached;
 #[cfg(windows)]
+pub use windows::update_clock_overlay_visibility;
+#[cfg(windows)]
 pub use windows::{
     dismiss_native_menu_from_hook, hide_clock_context_menu, hide_from_hook, menu_rect_contains,
     native_menu_rect, native_menu_rect_contains, precreate_clock_context_menu,

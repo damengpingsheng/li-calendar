@@ -190,6 +190,8 @@ pub fn start_hook_message_thread() {
                                 // 覆盖层（内部带变化检测，矩形未变零开销，只重申 topmost）。
                                 if let Some(app) = super::app_handle() {
                                     crate::window_manager::relocate_clock_overlay_from_cache(&app);
+                                    // Phase 1：全屏前台/任务栏自动隐藏时隐藏覆盖层，恢复自动显示
+                                    crate::window_manager::update_clock_overlay_visibility(&app);
                                 }
                             }
                         });

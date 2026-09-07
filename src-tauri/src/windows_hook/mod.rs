@@ -40,6 +40,8 @@ pub use state::NATIVE_MENU_TRACKING;
 pub use types::{ClickEvent, MouseButton};
 /// 桌面前台检测（用于检测 WIN+D 后桌面显示状态）。
 pub use window_utils::is_desktop_in_foreground;
+/// 前台窗口是否铺满所在显示器（全屏游戏/视频；覆盖层据此隐藏）。
+pub use window_utils::is_foreground_fullscreen;
 
 /// 保存应用句柄（setup 时调用一次），供钩子回调内操作窗口使用。
 pub fn set_app_handle(handle: tauri::AppHandle) {
