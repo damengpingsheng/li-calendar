@@ -30,10 +30,10 @@ use super::get_window_hwnd;
 static LAST_APPLIED_RECT: Mutex<Option<RECT>> = Mutex::new(None);
 /// 任务栏「静止位」矩形（贴底/贴边时的位置）；跟随位移以此为基准计算偏移。
 static TRAY_HOME_RECT: Mutex<Option<RECT>> = Mutex::new(None);
-/// 最近一次应用到的位置与 z 序状态 (x, y, below_hwnd)：完全一致才跳过
-/// SetWindowPos。below_hwnd=-1 表示常规 topmost；z 序变化必须连同位置一起
-/// 比较（从「潜入盖住者下方」恢复 topmost 时位置可能完全相同）。
-static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, isize)>> = Mutex::new(None);
+/// 最近一次应用到的状态 (x, y, 宽, 高, below)：完全一致才跳过 SetWindowPos。
+/// below_hwnd=-1 表示常规 topmost；z 序/尺寸变化必须连同位置一起比较（从
+/// 「潜入盖住者下方」恢复 topmost 时位置可能完全相同；遮盖展开/收缩尺寸不同）。
+static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, i32, i32, isize)>> = Mutex::new(None);
 /// 当前生效的 z 序模式（-1=常规 topmost，OFFSCREEN_MARK=屏外，其他=潜入到该
 /// 窗口下方）。供 2s 重贴线程判断：常规模式才允许重申 topmost，潜入/屏外
 /// 模式下重申 topmost 会把覆盖层顶回全屏窗口之上（实测打架）。
@@ -44,21 +44,27 @@ static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// 覆盖层几何状态机阶段（P1+P2）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GeomPhase {
-    /// 常规：探测差异需经采纳门（连续两次一致且间隔足够）才更新认可矩形
+    /// 常规：探测差异需经采纳门（候选持续 ≥8s）才更新认可矩形
     Normal,
-    /// 被盖（全屏窗口压住任务栏）：几何冻结，探测样本忽略
+    /// 被盖（全屏窗口压住任务栏）：几何冻结，探测样本记录原生位置用于预备遮盖
     Covered,
 }
 
 struct GeomState {
     phase: GeomPhase,
-    /// 认可矩形：覆盖层位置/尺寸的唯一权威（与钩子点击路由缓存解耦——
-    /// 缓存如实跟踪全屏期布局 3660→3618，覆盖层绝不直接消费它）
+    /// 认可矩形：覆盖层内容文字的锚定位置（与钩子点击路由缓存解耦——
+    /// 缓存如实跟踪全屏期布局 3660→3618，覆盖层内容绝不直接消费它）
     endorsed: Option<RECT>,
     /// 待采纳候选（与认可位不同的探测样本）
     candidate: Option<RECT>,
     /// 候选首次出现时刻
     candidate_since: Option<std::time::Instant>,
+    /// 被盖期间观测到的原生时钟真实位置（N1 掩盖预备数据）
+    native_observed: Option<RECT>,
+    /// 当前遮盖矩形（窗口被临时扩展为认可∪原生观测时的实际窗口矩形）
+    mask: Option<RECT>,
+    /// 退出后请求收缩回认可矩形（探测确认原生已归位时置位）
+    shrink_requested: bool,
 }
 
 static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
@@ -66,12 +72,16 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     endorsed: None,
     candidate: None,
     candidate_since: None,
+    native_observed: None,
+    mask: None,
+    shrink_requested: false,
 });
 
 /// 采纳门：与认可位不同的候选需**持续存在 ≥8s** 才采纳——
 /// 退出全屏/进入全屏的过渡态布局（宽矩形、全屏期布局值）存活仅零点几到几秒，
 /// 永远达不到门槛，结构性无法被采纳（PotPlayer 慢退出实测可骗过 500ms 门）；
 /// 真实布局重排（图标增减/DPI 变更等持久变化）8s 后正常跟进，代价可忽略。
+/// 注意：这是防抖参数，不是"连续观测 8s"的强保证（中间探测失败会累计时长）。
 const PERSIST_ADOPT_MS: u128 = 8000;
 
 /// RECT 字段级比较（不依赖 derive）。
@@ -82,6 +92,16 @@ fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
         }
         (None, None) => true,
         _ => false,
+    }
+}
+
+/// 两个矩形的并集（N1 掩盖矩形 = 认可位 ∪ 原生观测位）。
+fn union_rect(a: RECT, b: RECT) -> RECT {
+    RECT {
+        left: a.left.min(b.left),
+        top: a.top.min(b.top),
+        right: a.right.max(b.right),
+        bottom: a.bottom.max(b.bottom),
     }
 }
 
@@ -102,10 +122,16 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         return;
     };
     if g.phase == GeomPhase::Covered {
-        return; // 全屏期布局样本：不更新认可矩形
+        // 被盖期间的真实原生位置：记录为遮盖预备数据（N1），不影响认可矩形
+        g.native_observed = Some(rect);
+        return;
     }
     if rect_eq(g.endorsed, Some(rect)) {
-        // 与认可位一致：清除悬而未决的候选（布局已回到认可位）
+        // 与认可位一致：清除悬而未决的候选；若遮盖仍展开且原生已归位，请求收缩
+        if g.mask.is_some() {
+            g.shrink_requested = true;
+            crate::dbg_log("clockrect: shrink requested (native back at endorsed)");
+        }
         if g.candidate.is_some() {
             g.candidate = None;
             g.candidate_since = None;
@@ -246,20 +272,27 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 }
 
 /// 直接按缓存矩形重贴（不再触发 UIA，供 2 秒周期重探线程复用其刷新结果）。
-/// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用——Covered 阶段
-/// 缓存可能携带全屏期布局值，一律冻结不消费；差异矩形须经采纳门才进 endorsed。
+/// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用；遮盖展开期间
+/// 保持遮盖（冻结），直到探测确认原生归位（shrink_requested）才收缩回认可矩形。
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
-    let (endorsed, phase_is_normal) = match GEOM.lock() {
-        Ok(g) => (g.endorsed, g.phase == GeomPhase::Normal),
+    let (endorsed, phase_is_normal, mask, shrink_requested) = match GEOM.lock() {
+        Ok(g) => (g.endorsed, g.phase == GeomPhase::Normal, g.mask, g.shrink_requested),
         Err(_) => return,
     };
     if !phase_is_normal {
         return;
     }
+    if mask.is_some() && !shrink_requested {
+        return; // 遮盖保持期：原生尚未确认归位，收缩会重新露出残块
+    }
     let Some(endorsed) = endorsed else { return };
     let Some(window) = app_handle.get_webview_window("clock_overlay") else { return };
     if !apply_overlay_geometry(&window, &endorsed) {
         return;
+    }
+    if let Ok(mut g) = GEOM.lock() {
+        g.mask = None;
+        g.shrink_requested = false;
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
     // 之上）；潜入模式改为重申"潜入盖住者下方"（外部 z 序扰动后 2s 内自愈）；
@@ -482,9 +515,10 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(endorsed) = endorsed else {
         return;
     };
-    // 状态三元组：(x, y, 插入到谁之后)。-1 = 常规 topmost，OFFSCREEN_MARK = 屏外。
-    // 位置一律从认可矩形取（+任务栏滑移偏移），缓存矩形只进状态机不进几何。
-    let (target_x, target_y, below) = match taskbar_cover_probe() {
+    // 状态五元组：(x, y, 宽, 高, 插入到谁之后)。宽高为 0 = 保持尺寸（NOSIZE），
+    // -1 = 常规 topmost，OFFSCREEN_MARK = 屏外。位置一律从认可矩形/遮盖矩形取，
+    // 缓存矩形只进状态机不进几何。
+    let (target_x, target_y, target_w, target_h, below) = match taskbar_cover_probe() {
         TrayCover::Covered(cover) => {
             if let Ok(mut g) = GEOM.lock() {
                 if g.phase != GeomPhase::Covered {
@@ -497,41 +531,86 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     ));
                 }
             }
-            // 被盖期间保持认可位不动（z 序潜入盖住者下方），探测样本由
-            // clock_overlay_note_probe 忽略
-            (endorsed.left, endorsed.top, cover.0 as isize)
+            // N1 掩盖预备：被盖期间观测到原生时钟真实位置偏离认可位时，把窗口
+            // 扩展为两者并集（不透明背景遮住原生残块；文字右对齐锚定，右缘不变
+            // 则视觉位置不变）。预备发生在仍被播放器遮住时，恢复瞬间即已就绪。
+            let native = GEOM.lock().ok().and_then(|g| g.native_observed);
+            let mut x = endorsed.left;
+            let mut y = endorsed.top;
+            let mut size: Option<(i32, i32)> = None;
+            if let Some(n) = native {
+                let union = union_rect(endorsed, n);
+                if !rect_eq(Some(union), Some(endorsed)) {
+                    x = union.left;
+                    y = union.top;
+                    size = Some((union.right - union.left, union.bottom - union.top));
+                    if let Ok(mut g) = GEOM.lock() {
+                        if !rect_eq(g.mask, Some(union)) {
+                            g.mask = Some(union);
+                            geom_log(&format!(
+                                "mask prepared union=({},{},{},{})",
+                                union.left, union.top, union.right, union.bottom
+                            ));
+                        }
+                    }
+                }
+            }
+            // 同步"最后应用矩形"：遮盖应用绕过了 relocate 的 apply_overlay_geometry，
+            // 不同步会让收缩时的变更检测误判"无变化"而跳过实际收缩
+            if size.is_some() {
+                if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
+                    let union = union_rect(endorsed, native.unwrap_or(endorsed));
+                    *last = Some(union);
+                }
+            }
+            let (w, h) = size.unwrap_or((0, 0));
+            (x, y, w, h, cover.0 as isize)
         }
         TrayCover::Visible => {
             if let Ok(mut g) = GEOM.lock() {
                 if g.phase == GeomPhase::Covered {
                     g.phase = GeomPhase::Normal;
                     crate::dbg_log(&format!(
-                        "clockrect: phase->normal (exit cover, hold endorsed ({},{},{},{}))",
+                        "clockrect: phase->normal (exit cover, endorsed ({},{},{},{}), mask held)",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
                 }
             }
-            match read_tray_state() {
-                // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
-                // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
-                Some(state) if state.fully_hidden || !state.ready => {
-                    (offscreen_x(endorsed.right), endorsed.top, OFFSCREEN_MARK)
+            // 遮盖保持期：窗口停在遮盖矩形（文字位置不变），收缩由 relocate 在
+            // 探测确认原生归位后执行
+            let mask_held = GEOM.lock().ok().and_then(|g| g.mask).is_some();
+            if mask_held {
+                let mask = GEOM.lock().ok().and_then(|g| g.mask);
+                if let Some(m) = mask {
+                    (m.left, m.top, 0, 0, -1)
+                } else {
+                    (endorsed.left, endorsed.top, 0, 0, -1)
                 }
-                Some(state) => (endorsed.left + state.dx, endorsed.top + state.dy, -1),
-                None => (offscreen_x(endorsed.right), endorsed.top, OFFSCREEN_MARK),
+            } else {
+                match read_tray_state() {
+                    // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
+                    // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
+                    Some(state) if state.fully_hidden || !state.ready => {
+                        (offscreen_x(endorsed.right), endorsed.top, 0, 0, OFFSCREEN_MARK)
+                    }
+                    Some(state) => {
+                        (endorsed.left + state.dx, endorsed.top + state.dy, 0, 0, -1)
+                    }
+                    None => (offscreen_x(endorsed.right), endorsed.top, 0, 0, OFFSCREEN_MARK),
+                }
             }
         }
         // 探测失败：退回矩形全屏判定；全屏则移出屏幕，否则常规显示
         TrayCover::Unknown => {
             if crate::windows_hook::is_foreground_fullscreen() {
-                (offscreen_x(endorsed.right), endorsed.top, OFFSCREEN_MARK)
+                (offscreen_x(endorsed.right), endorsed.top, 0, 0, OFFSCREEN_MARK)
             } else {
-                (endorsed.left, endorsed.top, -1)
+                (endorsed.left, endorsed.top, 0, 0, -1)
             }
         }
     };
     // 「退出潜入恢复常规」瞬间安排两针延迟重探（150ms/600ms）：探测经
-    // clock_overlay_note_probe 确认/采纳布局，relocate 仅在确认后应用，
+    // clock_overlay_note_probe 确认原生归位（请求收缩）或确认布局稳定，
     // UIA 在独立治疗线程执行，绝不进 WinEvent 回调线程。
     let prev_below = CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst);
     CURRENT_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
@@ -552,10 +631,10 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     }
     // 变化检测：状态与当前完全一致则零窗口操作
     if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
-        if *last == Some((target_x, target_y, below)) {
+        if *last == Some((target_x, target_y, target_w, target_h, below)) {
             return;
         }
-        *last = Some((target_x, target_y, below));
+        *last = Some((target_x, target_y, target_w, target_h, below));
     }
     unsafe {
         let insert_after = if below == OFFSCREEN_MARK || below == -1 {
@@ -569,20 +648,18 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             // 潜入盖住者正下方（同为 topmost 组内，直接指定插入位置）
             Some(HWND(below as *mut core::ffi::c_void))
         };
-        let _ = SetWindowPos(
-            hwnd,
-            insert_after,
-            target_x,
-            target_y,
-            0,
-            0,
-            SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
-        );
+        // 遮盖预备/保持需要带尺寸应用；常规跟随保持尺寸（NOSIZE）
+        let (cx, cy, flags) = if target_w > 0 && target_h > 0 {
+            (target_w, target_h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        } else {
+            (0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        };
+        let _ = SetWindowPos(hwnd, insert_after, target_x, target_y, cx, cy, flags);
         // 诊断：每次实际应用的几何变更（含操作后实际矩形，用于核对）
         let mut after = RECT::default();
         let applied = GetWindowRect(hwnd, &mut after).is_ok();
         geom_log(&format!(
-            "apply pos=({target_x},{target_y}) below={below} after=({},{},{},{}) ok={applied}",
+            "apply pos=({target_x},{target_y}) size=({cx},{cy}) below={below} after=({},{},{},{}) ok={applied}",
             after.left, after.top, after.right, after.bottom
         ));
     }
