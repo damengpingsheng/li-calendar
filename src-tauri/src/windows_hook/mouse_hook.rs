@@ -274,18 +274,27 @@ pub fn start_hook_message_thread() {
                         // 启动时探测发生在自定义时钟文本写入前后，任务栏重排会令矩形过期；
                         // 周期刷新保证任何重排后最多 ~2 秒自愈（表现为点时钟无反应/弹原生菜单）。
                         std::thread::spawn(|| {
+                            let mut tick: u32 = 0;
                             loop {
-                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                std::thread::sleep(std::time::Duration::from_millis(500));
                                 if !TASKBAR_WIDGET_ENABLED.load(Ordering::SeqCst) {
                                     continue;
                                 }
-                                update_clock_area_cache();
-                                // Phase 0：时钟矩形可能已变化（任务栏重排），同步重贴
-                                // 覆盖层（内部带变化检测，矩形未变零开销，只重申 topmost）。
+                                tick = tick.wrapping_add(1);
+                                // 每 500ms：轻量可见性兜底（全屏/滑出检测均为纯 Win32 微秒级）。
+                                // 教训：依赖事件驱动的显隐在事件缺失的路径上（部分应用退出全屏
+                                // 时无前台切换、无窗口位移）要等兜底轮询，2s 太慢肉眼可见。
                                 if let Some(app) = super::app_handle() {
-                                    crate::window_manager::relocate_clock_overlay_from_cache(&app);
-                                    // Phase 1：全屏前台/任务栏自动隐藏时隐藏覆盖层，恢复自动显示
                                     crate::window_manager::update_clock_overlay_visibility(&app);
+                                }
+                                // 每 2s：UIA 时钟矩形重探（重操作，维持 2s 节奏）+ 重贴。
+                                if tick % 4 == 0 {
+                                    update_clock_area_cache();
+                                    if let Some(app) = super::app_handle() {
+                                        crate::window_manager::relocate_clock_overlay_from_cache(
+                                            &app,
+                                        );
+                                    }
                                 }
                             }
                         });
