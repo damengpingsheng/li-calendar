@@ -77,15 +77,32 @@ static ALLOW_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(desktop)]
 /// 追加写入诊断日志（定位右键菜单「退出」无反应）。
+/// 行首带本地时间戳（几何归因依赖事件时序测量）。
 fn dbg_log(msg: &str) {
+    use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(r"D:\agents_tmp\menu_dbg.log")
     {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", msg);
+        let ts = timestamp_string();
+        let _ = writeln!(f, "[{ts}] {msg}");
     }
+}
+
+/// 本地时间戳 HH:MM:SS.mmm（Windows）；非 Windows 平台返回空串。
+#[cfg(all(desktop, windows))]
+fn timestamp_string() -> String {
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+    )
+}
+
+#[cfg(all(desktop, not(windows)))]
+fn timestamp_string() -> String {
+    String::new()
 }
 
 #[cfg(desktop)]
