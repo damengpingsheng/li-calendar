@@ -291,7 +291,7 @@ pub fn start_hook_message_thread() {
                                 if tick % 4 == 0 {
                                     update_clock_area_cache();
                                     if let Some(app) = super::app_handle() {
-                                        crate::window_manager::relocate_clock_overlay_from_cache(
+                                        crate::window_manager::relocate_clock_overlay_endorsed(
                                             &app,
                                         );
                                     }

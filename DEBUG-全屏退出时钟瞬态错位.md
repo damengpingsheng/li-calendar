@@ -1,6 +1,6 @@
 # 问题档案：全屏退出瞬间时钟位置偏移（瞬态错位）
 
-> 状态：**未根治**（E 方案自动化回归通过，但 PotPlayer 真机复验问题仍在，2026-09-08）· 真机日志证据与残余机制见 §0.5
+> 状态：**已根治**（P1+P2 几何权威状态机，2026-09-08/09；E 方案单独不足，见 §0.5）
 > 关联：`PLAN-时钟覆盖式接管.md` Phase 1 追加章节
 
 ---
@@ -15,7 +15,8 @@ uia rect=(3618,2076,3769,2160) ×4 ← 全屏期间：时钟真实移到左位�
 ```
 
 - **全屏期间原生时钟真实移位 3660→3618**（任务栏布局随全屏变化），HWND 探测如实报告，缓存如实跟踪——第一阶段错位 = 消费了全屏期布局值；
-- 本机 `find_clock_window` 能找到时钟窗口（26200 有经典类名 HWND），周期线程走 HWND 路径无需 COM——评审提出的"COM 缺陷→注册表回声"在本机未发生（代码层面成立，换机器可能触发，留作已知问题）。
+- ⚠️ 勘误（第二阶段评审后）：本机 `find_clock_window` **能**找到时钟窗口（26200 存在经典类名 HWND，周期线程每 2s 经 HWND 路径成功探测——日志中 4 条 3618 即其写入）。§2 中"本机永远走注册表回声"的前提已被日志证伪，COM 无初始化问题降级为**潜在可移植性问题**（换机器可能触发）；
+- 注册表 ClockRect 不是独立真值（是成功探测的持久化副本），不能作对照物。
 
 ## 0.5 真机复验失败 + 第二阶段归因（2026-09-08 深夜）
 
@@ -106,8 +107,21 @@ PotPlayer / Edge 退出视频全屏时：
 - `COVERED_FROZEN_POS`：进入覆盖首帧 `GetWindowRect` 记录窗口实际位置（用户最后看到的正常位）；
 - 被盖期间 `relocate_clock_overlay_from_cache` 直接跳过（不消费全屏期布局矩形）；
 - 退出覆盖时优先恢复冻结位（无视当时的缓存值），治疗针照旧刷新缓存；
-- 实测（诊断日志+截图）：`freeze at (3660)` → 全屏期 4 次 3618 探测被忽略 → `unfreeze restore (3660)` → **+100ms 截图位置对齐、内容完整，零残影**。
-- 诊断日志已加标记文件门控（`D:\agents_tmp\clockrect_debug` 存在才写），避免周期探测刷爆 menu_dbg.log。
+- ffplay 自动化实测 +100ms 对齐——**但 PotPlayer 真机复验失败**（见上），引出第二阶段归因。
+
+### E 方案缺陷的最终修复：P1+P2 几何权威状态机（2026-09-09 实施）
+
+评审指出的漏保护路径完全成立：E 的冻结在**第一次恢复调用时即被清空**，下一次 500ms 兜底/WinEvent 调用就走 `clock.left + dx` 消费缓存——若缓存仍是 3618，覆盖层被拉回错位。冻结只保护被盖瞬间，不保护整个退出过渡期。
+
+**实施**（三阶段几何权威）：
+- `GEOM` 状态机：`Normal / Covered / ExitPending` + **认可矩形 `endorsed`**（覆盖层位置/尺寸唯一权威，与钩子点击路由缓存彻底解耦）；
+- `clock_overlay_note_probe(rect)`：探测结果唯一入口。Covered 期样本忽略；ExitPending 期 `rect==endorsed` → 确认回 Normal；≥1s 且连续两次一致 → 采纳新稳定布局（应对全屏期间真实 DPI/布局变更）；≥5s 兜底采纳；Normal 期不同则即时采纳；
+- `relocate_clock_overlay_endorsed`：仅 Normal 阶段应用 endorsed（size+position 一起）；Covered/ExitPending 一律冻结；
+- `update_clock_overlay_visibility`：位置一律取 endorsed（+任务栏滑移 dx/dy），缓存矩形只进状态机、永不进几何；
+- 退出过渡期的错误值（3618）在 ExitPending 下**结构性不可消费**——确认（probe==3660）前覆盖层始终停在 endorsed 位；
+- 诊断：阶段翻转日志（ ungated）+ 应用日志（`clockrect_debug` 标记门控，含操作后实际矩形）。
+
+**ffplay 自动化回归**：`phase->covered (hold endorsed 3660)` → `phase->exit-pending (hold endorsed 3660)` → `exit confirmed (probe==endorsed)`；+100ms 截图对齐、内容完整。（ffplay 为自动化辅助，最终以 PotPlayer 真机为准。）
 
 ## 5. 验证工具（复现/回归用）
 

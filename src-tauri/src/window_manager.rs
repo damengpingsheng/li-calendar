@@ -13,9 +13,11 @@ pub use windows::main_window::show_or_create_main_window;
 #[cfg(windows)]
 pub use windows::relocate_clock_overlay;
 #[cfg(windows)]
-pub use windows::relocate_clock_overlay_from_cache;
+pub use windows::relocate_clock_overlay_endorsed;
 #[cfg(windows)]
 pub use windows::clock_overlay_appearance_colors;
+#[cfg(windows)]
+pub use windows::clock_overlay_note_probe;
 #[cfg(windows)]
 pub use windows::ensure_clock_overlay_attached;
 #[cfg(windows)]

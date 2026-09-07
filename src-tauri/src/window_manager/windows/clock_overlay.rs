@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE,
-    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
+    WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use super::get_window_hwnd;
@@ -40,12 +40,110 @@ static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, isize)>> = Mutex::new(None);
 static CURRENT_BELOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 /// 「退出全屏自愈」进行中标记（防重复 spawn 治疗线程）。
 static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// 潜入期冻结的「正常位」（进入覆盖时的窗口实际位置）。
+
+/// 覆盖层几何状态机阶段（P1+P2）。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GeomPhase {
+    /// 常规：探测确认后即时更新认可矩形
+    Normal,
+    /// 被盖（全屏窗口压住任务栏）：几何冻结，探测样本忽略
+    Covered,
+    /// 退出待确认：保持认可矩形，等探测确认布局恢复（或稳定为新布局）
+    ExitPending,
+}
+
+struct GeomState {
+    phase: GeomPhase,
+    /// 认可矩形：覆盖层位置/尺寸的唯一权威（与钩子点击路由缓存解耦——
+    /// 缓存如实跟踪全屏期布局 3660→3618，覆盖层绝不直接消费它）
+    endorsed: Option<RECT>,
+    /// 进入退出待确认的时刻
+    exit_since: Option<std::time::Instant>,
+    /// 退出待确认期间的上一个样本（连续两次一致才采纳新布局）
+    last_sample: Option<RECT>,
+}
+
+static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
+    phase: GeomPhase::Normal,
+    endorsed: None,
+    exit_since: None,
+    last_sample: None,
+});
+
+/// 退出待确认：采纳新稳定布局所需的最短退出时长（避开退出动画中间态）。
+const EXIT_ADOPT_MIN_MS: u128 = 1000;
+/// 退出待确认：无确认时的兜底采纳时长。
+const EXIT_ADOPT_MAX_MS: u128 = 5000;
+
+/// RECT 字段级比较（不依赖 derive）。
+fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.left == b.left && a.top == b.top && a.right == b.right && a.bottom == b.bottom
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// 几何应用诊断日志（标记文件门控，随动跟随动画期间会逐帧触发）。
+fn geom_log(msg: &str) {
+    if std::path::Path::new(r"D:\agents_tmp\clockrect_debug").exists() {
+        crate::dbg_log(&format!("clockrect: {msg}"));
+    }
+}
+
+/// 探测结果喂给几何状态机（P1 布局解耦入口）。
 ///
-/// E 方案（实测归因）：全屏期间原生时钟真实移位（3660→3618），缓存如实跟踪，
-/// 退出后布局恢复 3660 而覆盖层还在 3618——错位不是缓存过期，而是"消费了
-/// 全屏期布局值"。冻结后被盖期间不挪窗，退出恢复冻结位即正确。
-static COVERED_FROZEN_POS: Mutex<Option<(i32, i32)>> = Mutex::new(None);
+/// 缓存矩形属于钩子点击路由（需真实当前布局，含全屏期布局）；覆盖层只消费
+/// 认可矩形。注册表回退样本不是新观测，不得调用本函数。
+/// 钩子回调路径会调用本函数：只做 Mutex 操作与罕见日志，保持轻量。
+pub fn clock_overlay_note_probe(rect: RECT) {
+    let Ok(mut g) = GEOM.lock() else {
+        return;
+    };
+    match g.phase {
+        GeomPhase::Covered => {} // 全屏期布局样本：不更新认可矩形
+        GeomPhase::Normal => {
+            if !rect_eq(g.endorsed, Some(rect)) {
+                g.endorsed = Some(rect);
+                crate::dbg_log(&format!(
+                    "clockrect: endorsed adopt (normal) ({},{},{},{})",
+                    rect.left, rect.top, rect.right, rect.bottom
+                ));
+            }
+        }
+        GeomPhase::ExitPending => {
+            let elapsed = g
+                .exit_since
+                .map(|t| t.elapsed().as_millis())
+                .unwrap_or(u128::MAX);
+            if rect_eq(g.endorsed, Some(rect)) {
+                // 布局已恢复认可位：确认退出完成
+                g.phase = GeomPhase::Normal;
+                g.exit_since = None;
+                g.last_sample = None;
+                crate::dbg_log("clockrect: exit confirmed (probe==endorsed)");
+            } else if elapsed >= EXIT_ADOPT_MAX_MS {
+                // 长时间无确认：兜底采纳最新样本（失败保护）
+                g.endorsed = Some(rect);
+                g.phase = GeomPhase::Normal;
+                g.exit_since = None;
+                g.last_sample = None;
+                crate::dbg_log("clockrect: exit fail-safe adopt");
+            } else if elapsed >= EXIT_ADOPT_MIN_MS && g.last_sample == Some(rect) {
+                // 连续两次一致且已避开动画期：真实的新稳定布局，采纳
+                g.endorsed = Some(rect);
+                g.phase = GeomPhase::Normal;
+                g.exit_since = None;
+                g.last_sample = None;
+                crate::dbg_log("clockrect: exit adopt new stable layout");
+            } else {
+                g.last_sample = Some(rect);
+            }
+        }
+    }
+}
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
 impl super::CalendarWindowManager {
@@ -156,22 +254,23 @@ pub fn ensure_clock_overlay_attached(app_handle: &AppHandle) {
 /// 刷新时钟矩形缓存并重贴（前端命令 / 开关重开路径用）。
 pub fn relocate_clock_overlay(app_handle: &AppHandle) {
     crate::windows_hook::refresh_clock_area_cache();
-    relocate_clock_overlay_from_cache(app_handle);
+    relocate_clock_overlay_endorsed(app_handle);
 }
 
 /// 直接按缓存矩形重贴（不再触发 UIA，供 2 秒周期重探线程复用其刷新结果）。
-pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
-    // E 方案冻结：被盖期间不消费缓存矩形（那可能是全屏期布局），窗口保持冻结位。
-    if CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst) > 0 {
+/// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用——Covered/
+/// ExitPending 阶段缓存可能携带全屏期布局值，一律冻结不消费。
+pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
+    let (endorsed, phase_is_normal) = match GEOM.lock() {
+        Ok(g) => (g.endorsed, g.phase == GeomPhase::Normal),
+        Err(_) => return,
+    };
+    if !phase_is_normal {
         return;
     }
-    let rect = crate::windows_hook::CLOCK_AREA_RECT_CACHE
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().copied());
-    let Some(rect) = rect else { return };
+    let Some(endorsed) = endorsed else { return };
     let Some(window) = app_handle.get_webview_window("clock_overlay") else { return };
-    if !apply_overlay_geometry(&window, &rect) {
+    if !apply_overlay_geometry(&window, &endorsed) {
         return;
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
@@ -196,8 +295,8 @@ pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
                     let _ = SetWindowPos(
                         hwnd,
                         Some(HWND(mark as *mut core::ffi::c_void)),
-                        rect.left,
-                        rect.top,
+                        endorsed.left,
+                        endorsed.top,
                         0,
                         0,
                         SWP_NOSIZE | SWP_NOACTIVATE,
@@ -373,92 +472,82 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(hwnd) = get_window_hwnd(&window) else {
         return;
     };
-    // 时钟矩形还没就绪（启动探测期）：不动窗口（仍是构建时的隐藏态）
-    let Some(clock) = crate::windows_hook::CLOCK_AREA_RECT_CACHE
-        .read()
-        .ok()
-        .and_then(|guard| guard.as_ref().copied())
-    else {
+    // 认可矩形：覆盖层几何唯一权威（P1 布局解耦）。缓存矩形属于钩子点击路由，
+    // 会如实跟踪全屏期布局（实测 3660→3618），覆盖层绝不直接消费它。
+    // 首次 endorsed 为空时从缓存惰性播种（attach 首探已写入正常布局）。
+    let endorsed = {
+        let cache = crate::windows_hook::CLOCK_AREA_RECT_CACHE
+            .read()
+            .ok()
+            .and_then(|guard| guard.as_ref().copied());
+        let endorsed = match GEOM.lock() {
+            Ok(mut g) => {
+                if g.endorsed.is_none() {
+                    g.endorsed = cache;
+                }
+                g.endorsed
+            }
+            Err(_) => return,
+        };
+        endorsed
+    };
+    let Some(endorsed) = endorsed else {
         return;
     };
-    // 状态三元组：(x, y, 插入到谁之后)。-1 = 常规 topmost。
+    // 状态三元组：(x, y, 插入到谁之后)。-1 = 常规 topmost，OFFSCREEN_MARK = 屏外。
+    // 位置一律从认可矩形取（+任务栏滑移偏移），缓存矩形只进状态机不进几何。
     let (target_x, target_y, below) = match taskbar_cover_probe() {
         TrayCover::Covered(cover) => {
-            // E 方案冻结：首帧记录窗口当前实际位置（用户最后看到的正常位），
-            // 整个被盖期间保持不动——全屏期缓存矩形是全屏布局，不可消费。
-            let frozen = COVERED_FROZEN_POS.lock().ok().and_then(|g| *g);
-            let (x, y) = match frozen {
-                Some(p) => p,
-                None => {
-                    let mut wr = RECT::default();
-                    let p = unsafe {
-                        if GetWindowRect(hwnd, &mut wr).is_ok() && wr.right > wr.left {
-                            (wr.left, wr.top)
-                        } else {
-                            (clock.left, clock.top)
-                        }
-                    };
-                    if let Ok(mut g) = COVERED_FROZEN_POS.lock() {
-                        *g = Some(p);
-                    }
+            if let Ok(mut g) = GEOM.lock() {
+                if g.phase != GeomPhase::Covered {
+                    g.phase = GeomPhase::Covered;
+                    g.exit_since = None;
+                    g.last_sample = None;
                     crate::dbg_log(&format!(
-                        "clockrect: freeze at ({},{})",
-                        p.0, p.1
+                        "clockrect: phase->covered (hold endorsed ({},{},{},{}))",
+                        endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
-                    p
                 }
-            };
-            (x, y, cover.0 as isize)
+            }
+            // 被盖期间保持认可位不动（z 序潜入盖住者下方），探测样本由
+            // clock_overlay_note_probe 忽略
+            (endorsed.left, endorsed.top, cover.0 as isize)
         }
         TrayCover::Visible => {
-            // 退出覆盖：优先恢复冻结的正常位（此刻缓存可能仍是全屏期布局值）
-            let frozen = COVERED_FROZEN_POS.lock().ok().and_then(|g| *g);
-            if let Some((fx, fy)) = frozen {
-                if let Ok(mut g) = COVERED_FROZEN_POS.lock() {
-                    *g = None;
+            if let Ok(mut g) = GEOM.lock() {
+                if g.phase == GeomPhase::Covered {
+                    g.phase = GeomPhase::ExitPending;
+                    g.exit_since = Some(std::time::Instant::now());
+                    g.last_sample = None;
+                    crate::dbg_log(&format!(
+                        "clockrect: phase->exit-pending (hold endorsed ({},{},{},{}))",
+                        endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
+                    ));
                 }
-                crate::dbg_log(&format!("clockrect: unfreeze restore ({},{})", fx, fy));
-                (fx, fy, -1)
-            } else {
-                match read_tray_state() {
-                    // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
-                    // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
-                    Some(state) if state.fully_hidden || !state.ready => {
-                        (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK)
-                    }
-                    Some(state) => (clock.left + state.dx, clock.top + state.dy, -1),
-                    None => (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK),
+            }
+            match read_tray_state() {
+                // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
+                // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
+                Some(state) if state.fully_hidden || !state.ready => {
+                    (offscreen_x(endorsed.right), endorsed.top, OFFSCREEN_MARK)
                 }
+                Some(state) => (endorsed.left + state.dx, endorsed.top + state.dy, -1),
+                None => (offscreen_x(endorsed.right), endorsed.top, OFFSCREEN_MARK),
             }
         }
         // 探测失败：退回矩形全屏判定；全屏则移出屏幕，否则常规显示
         TrayCover::Unknown => {
             if crate::windows_hook::is_foreground_fullscreen() {
-                (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK)
+                (offscreen_x(endorsed.right), endorsed.top, OFFSCREEN_MARK)
             } else {
-                (clock.left, clock.top, -1)
+                (endorsed.left, endorsed.top, -1)
             }
         }
     };
-    // 变化检测：状态与当前完全一致则零窗口操作
-    if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
-        if *last == Some((target_x, target_y, below)) {
-            return;
-        }
-        *last = Some((target_x, target_y, below));
-    }
-    // 诊断：z 序状态翻转时记录消费的缓存矩形（归因恢复瞬间错位的缓存来源）
+    // 「退出潜入恢复常规」瞬间安排两针延迟重探（150ms/600ms）：探测经
+    // clock_overlay_note_probe 确认/采纳布局，relocate 仅在确认后应用，
+    // UIA 在独立治疗线程执行，绝不进 WinEvent 回调线程。
     let prev_below = CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst);
-    if prev_below > 0 && below == -1 {
-        crate::dbg_log(&format!(
-            "clockrect: reveal-consume cache=({},{},{},{})",
-            clock.left, clock.top, clock.right, clock.bottom
-        ));
-    }
-    // 「退出潜入恢复常规」瞬间：时钟矩形缓存还是全屏期间/退出过渡期的旧值
-    // （实测偏左 ~42px 右缘露出原生时钟，要等 ≤2s 的周期重探才自愈）。
-    // 立即安排两针延迟重探重贴（150ms/600ms，避开退出动画未稳的瞬间），
-    // 把自愈压到亚秒。UIA 在独立治疗线程执行，绝不进 WinEvent 回调线程。
     CURRENT_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
     if prev_below > 0 && below == -1 && !EXIT_HEALING.swap(true, std::sync::atomic::Ordering::SeqCst)
     {
@@ -469,11 +558,18 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 for delay in [150u64, 450] {
                     std::thread::sleep(std::time::Duration::from_millis(delay));
                     crate::windows_hook::refresh_clock_area_cache();
-                    crate::window_manager::relocate_clock_overlay_from_cache(&heal_app);
+                    crate::window_manager::relocate_clock_overlay_endorsed(&heal_app);
                 }
                 EXIT_HEALING.store(false, std::sync::atomic::Ordering::SeqCst);
             })
             .ok();
+    }
+    // 变化检测：状态与当前完全一致则零窗口操作
+    if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
+        if *last == Some((target_x, target_y, below)) {
+            return;
+        }
+        *last = Some((target_x, target_y, below));
     }
     unsafe {
         let insert_after = if below == OFFSCREEN_MARK || below == -1 {
@@ -496,6 +592,13 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             0,
             SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
+        // 诊断：每次实际应用的几何变更（含操作后实际矩形，用于核对）
+        let mut after = RECT::default();
+        let applied = GetWindowRect(hwnd, &mut after).is_ok();
+        geom_log(&format!(
+            "apply pos=({target_x},{target_y}) below={below} after=({},{},{},{}) ok={applied}",
+            after.left, after.top, after.right, after.bottom
+        ));
     }
 }
 

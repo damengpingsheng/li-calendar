@@ -139,6 +139,9 @@ pub fn update_clock_area_cache() {
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }
+        // 真实观测（UIA/HWND 成功）：喂给覆盖层几何状态机（认可矩形更新/
+        // 退出确认）。注册表回退样本不是新观测，不喂。
+        crate::window_manager::clock_overlay_note_probe(rect);
         return;
     }
     // 探测失败（Win11 XAML 任务栏可能无常驻经典时钟窗口）：
@@ -284,6 +287,8 @@ pub fn refresh_clock_rect_if_in_taskbar(x: i32, y: i32) {
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }
+        // 真实观测（钩子内 HWND 快速路径）：喂给覆盖层几何状态机
+        crate::window_manager::clock_overlay_note_probe(rect);
     }
 }
 

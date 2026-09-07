@@ -22,9 +22,10 @@ pub use clock_context_menu::{
     show_clock_context_menu, track_native_clock_menu,
 };
 pub use clock_overlay::clock_overlay_appearance_colors;
+pub use clock_overlay::clock_overlay_note_probe;
 pub use clock_overlay::ensure_clock_overlay_attached;
 pub use clock_overlay::relocate_clock_overlay;
-pub use clock_overlay::relocate_clock_overlay_from_cache;
+pub use clock_overlay::relocate_clock_overlay_endorsed;
 pub use clock_overlay::update_clock_overlay_visibility;
 pub use clock_overlay::window_hwnd_by_label;
 
