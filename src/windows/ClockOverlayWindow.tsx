@@ -52,6 +52,18 @@ function ClockOverlayWindow(): React.JSX.Element {
     };
   }, []);
 
+  // 合成保活：窗口被移出屏幕（全屏/任务栏收起）期间 DWM 会丢弃其表面，
+  // Chromium 只在有新绘制帧时产出缓冲——若只靠 1s 的时钟 tick，移回屏幕后要等
+  // 下一个 tick（实测 100~400ms 空窗透出原生时钟）。200ms 一次强制重绘保持
+  // 表面常新。注意：纯 React 状态更新若不改变绘制结果不会产生新帧（实测无效），
+  // 必须真的改动像素——1px 点在两个几乎相同的颜色间切换（不可感知）。
+  const [keepaliveTick, setKeepaliveTick] = useState(0);
+  useEffect(() => {
+    const keepalive = setInterval(() => setKeepaliveTick((t) => t + 1), 200);
+    return () => clearInterval(keepalive);
+  }, []);
+  const keepaliveColor = keepaliveTick % 2 === 0 ? 'rgba(0,0,0,0.004)' : 'rgba(0,0,0,0.008)';
+
   // 天气：初始拉取一次，之后每 30 分钟刷新
   useEffect(() => {
     let disposed = false;
@@ -101,6 +113,10 @@ function ClockOverlayWindow(): React.JSX.Element {
       <div style={{ fontSize: 12, lineHeight: '17px', color, fontFamily, whiteSpace: 'nowrap' }}>
         {lunarText}
         {weather ? `  ${weather}` : ''}
+        {/* 合成保活像素：颜色微变强制绘制失效（见上） */}
+        <span
+          style={{ display: 'inline-block', width: 1, height: 1, backgroundColor: keepaliveColor }}
+        />
       </div>
     </div>
   );

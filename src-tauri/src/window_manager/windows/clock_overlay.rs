@@ -30,8 +30,14 @@ use super::get_window_hwnd;
 static LAST_APPLIED_RECT: Mutex<Option<RECT>> = Mutex::new(None);
 /// 任务栏「静止位」矩形（贴底/贴边时的位置）；跟随位移以此为基准计算偏移。
 static TRAY_HOME_RECT: Mutex<Option<RECT>> = Mutex::new(None);
-/// 最近一次跟随移动到的 y（相同则跳过 SetWindowPos，静止期零窗口操作）。
-static LAST_FOLLOW_Y: Mutex<Option<i32>> = Mutex::new(None);
+/// 最近一次应用到的位置与 z 序状态 (x, y, below_hwnd)：完全一致才跳过
+/// SetWindowPos。below_hwnd=-1 表示常规 topmost；z 序变化必须连同位置一起
+/// 比较（从「潜入盖住者下方」恢复 topmost 时位置可能完全相同）。
+static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, isize)>> = Mutex::new(None);
+/// 当前生效的 z 序模式（-1=常规 topmost，OFFSCREEN_MARK=屏外，其他=潜入到该
+/// 窗口下方）。供 2s 重贴线程判断：常规模式才允许重申 topmost，潜入/屏外
+/// 模式下重申 topmost 会把覆盖层顶回全屏窗口之上（实测打架）。
+static CURRENT_BELOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
 impl super::CalendarWindowManager {
@@ -46,6 +52,13 @@ impl super::CalendarWindowManager {
         builder = builder.data_directory(std::path::PathBuf::from(
             r"D:\Program Files\li-calendar\webview-data\clock-overlay",
         ));
+        // 覆盖层会经历「移出屏幕/被全屏窗口盖住」的隐藏方式，Chromium 默认对
+        // 这类窗口做遮挡节流（暂停合成），恢复显示后内容要几百 ms~2s 才画出来
+        // （实测：移回 800ms 后仍是透明透出原生时钟）。显式禁用遮挡计算与
+        // 渲染器后台降级——窗口仅 158×84，常驻合成成本可忽略。
+        builder = builder.additional_browser_args(
+            "--disable-features=msWebOOUI,msPdfOOUI,msSmartScreenProtection,CalculateNativeWinOcclusion --disable-backgrounding-occluded-windows --disable-renderer-backgrounding",
+        );
         let window = builder
             .title("")
             .inner_size(170.0, 52.0)
@@ -149,19 +162,37 @@ pub fn relocate_clock_overlay_from_cache(app_handle: &AppHandle) {
     if !apply_overlay_geometry(&window, &rect) {
         return;
     }
+    // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
+    // 之上）；潜入模式改为重申"潜入盖住者下方"（外部 z 序扰动后 2s 内自愈）；
+    // 屏外模式不动 z 序。
+    let below = CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst);
     if let Some(hwnd) = get_window_hwnd(&window) {
-        // 重贴同时重申 topmost（不激活、不改可见性）：任务栏若重新声明过
-        // topmost 会排到覆盖层之上，周期性压一次保证覆盖层始终可见。
         unsafe {
-            let _ = SetWindowPos(
-                hwnd,
-                Some(HWND_TOPMOST),
-                0,
-                0,
-                0,
-                0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
-            );
+            match below {
+                -1 => {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+                mark if mark > 0 => {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND(mark as *mut core::ffi::c_void)),
+                        rect.left,
+                        rect.top,
+                        0,
+                        0,
+                        SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+                _ => {}
+            }
         }
     }
     // 可见性统一走跟随管理：覆盖层曾因矩形未就绪保持隐藏（如启动时任务栏正
@@ -257,22 +288,36 @@ fn read_tray_state() -> Option<TrayState> {
 /// 任务栏左段（避开右端覆盖层与托盘）的可见性判定点（横向 10%/25%/40%，中带）。
 const TASKBAR_PROBE_FRACIONS: [f64; 3] = [0.10, 0.25, 0.40];
 
+/// 任务栏覆盖探测结果。
+enum TrayCover {
+    /// 探测点命中任务栏（含其子窗口）：任务栏可见
+    Visible,
+    /// 被其他窗口盖住，携带盖住者的根窗口（全屏视频/游戏）
+    Covered(HWND),
+    /// 无法判定（找不到任务栏/探测点全部落空），调用方退回矩形判定
+    Unknown,
+}
+
 /// 任务栏是否被**其他窗口**盖住（全屏视频/游戏 topmost 压住任务栏）。
 ///
 /// 语义替代「前台窗口矩形铺满=全屏」：PotPlayer 等播放器退出全屏的过渡期
 /// 窗口矩形仍铺满整屏长达 1~2s（矩形判定持续误判全屏，轮询再快也没用），
 /// 而此时任务栏已实际露出。本判定用 `WindowFromPoint` 命中测试直接问
 /// 「任务栏上这点此刻归谁」——像素级真实状态，不受窗口矩形动画时序干扰。
-/// 三点投票（避开单点被 tooltip 之类临时窗口局部覆盖的误判）。
-/// 返回 `None` 表示无法判定（找不到任务栏），调用方退回矩形判定。
-fn taskbar_covered_by_foreign() -> Option<bool> {
+/// 三点投票（任一点命中任务栏即判可见；全部命中外部窗口取第一个根窗口）。
+fn taskbar_cover_probe() -> TrayCover {
     unsafe {
-        let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
+        let tray = match FindWindowW(w!("Shell_TrayWnd"), None) {
+            Ok(tray) => tray,
+            Err(_) => return TrayCover::Unknown,
+        };
         let mut rect = RECT::default();
-        GetWindowRect(tray, &mut rect).ok()?;
+        if GetWindowRect(tray, &mut rect).is_err() {
+            return TrayCover::Unknown;
+        }
         let width = rect.right - rect.left;
         let mid_y = (rect.top + rect.bottom) / 2;
-        let mut covered_count = 0;
+        let mut cover: Option<HWND> = None;
         for frac in TASKBAR_PROBE_FRACIONS {
             let pt = windows::Win32::Foundation::POINT {
                 x: rect.left + (width as f64 * frac) as i32,
@@ -282,20 +327,33 @@ fn taskbar_covered_by_foreign() -> Option<bool> {
             if hit.0.is_null() {
                 continue;
             }
-            // 命中窗口的根祖先是否任务栏自身（命中开始按钮/图标等子窗口也算任务栏可见）
             let root = GetAncestor(hit, GA_ROOT);
             if root == tray || hit == tray {
-                return Some(false);
+                return TrayCover::Visible;
             }
-            covered_count += 1;
+            if cover.is_none() {
+                cover = Some(root);
+            }
         }
-        (covered_count > 0).then_some(true)
+        match cover {
+            Some(hwnd) => TrayCover::Covered(hwnd),
+            None => TrayCover::Unknown,
+        }
     }
 }
 
-/// Phase 1 可见性与跟随管理：任务栏被盖（全屏视频/游戏）或完全滑出时隐藏；
-/// 任务栏滑入/滑出动画期间**跟随其位移移动**（不是瞬间显隐——任务栏滑到哪
-/// 覆盖层就在哪，视觉上像任务栏的一部分）。由 WinEvent 与 2s 兜底线程调用。
+/// Phase 1 可见性与跟随管理：任务栏被盖（全屏视频/游戏）时**z 序潜入盖住者
+/// 正下方**（窗口留在屏内），任务栏滑入/滑出动画期间跟随其位移移动。
+///
+/// 教训一：隐藏绝不能用 `SW_HIDE`——WebView2(Chromium) 对隐藏窗口触发后台
+/// 节流，重新显示后内容恢复渲染要几百 ms~2s，期间透出原生时钟（实测）。
+/// 教训二：移出屏幕同样不出帧——Chromium 对完全离屏窗口暂停合成（加
+/// `--disable-backgrounding-occluded-windows` 等参数、前端 200ms 强制重绘
+/// 均无效，实测），移回后仍有 100~400ms 空窗。
+/// 最终方案：被盖时把覆盖层 z 序插到盖住者正下方——窗口全程在屏内、渲染
+/// 管线存活，盖住者（全屏窗口必然 topmost，否则盖不住 topmost 任务栏）缩回
+/// 的瞬间覆盖层已在原位、内容已在，零空窗。
+/// 由 WinEvent 与 500ms 兜底线程调用。
 pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
         return;
@@ -303,35 +361,7 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(hwnd) = get_window_hwnd(&window) else {
         return;
     };
-    // 全屏/被盖判定：优先像素级命中测试（任务栏被别的窗口盖住），
-    // 无法判定时退回「前台窗口矩形铺满」的旧判定兜底。
-    let covered = taskbar_covered_by_foreign()
-        .unwrap_or_else(crate::windows_hook::is_foreground_fullscreen);
-    if covered {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-        if let Ok(mut last) = LAST_FOLLOW_Y.lock() {
-            *last = None;
-        }
-        return;
-    }
-    let Some(state) = read_tray_state() else {
-        return;
-    };
-    // 基准未学习（如启动时任务栏收起，尚未见过静止位）：保持隐藏，
-    // 待任务栏完全入屏学到基准后再现身（避免无基准的"提前现身"）。
-    if state.fully_hidden || !state.ready {
-        unsafe {
-            let _ = ShowWindow(hwnd, SW_HIDE);
-        }
-        if let Ok(mut last) = LAST_FOLLOW_Y.lock() {
-            *last = None;
-        }
-        return;
-    }
-    // 跟随：覆盖层位置 = 缓存时钟矩形 + 任务栏当前位移（滑出动画中 dy 逐渐增大，
-    // 覆盖层同步滑出屏外；滑入时同步滑回。SWP_NOZORDER 保持 topmost 不被重排）
+    // 时钟矩形还没就绪（启动探测期）：不动窗口（仍是构建时的隐藏态）
     let Some(clock) = crate::windows_hook::CLOCK_AREA_RECT_CACHE
         .read()
         .ok()
@@ -339,25 +369,66 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     else {
         return;
     };
-    let x = clock.left + state.dx;
-    let y = clock.top + state.dy;
-    if let Ok(mut last) = LAST_FOLLOW_Y.lock() {
-        if *last == Some(y) {
+    // 状态三元组：(x, y, 插入到谁之后)。-1 = 常规 topmost。
+    let (target_x, target_y, below) = match taskbar_cover_probe() {
+        TrayCover::Covered(cover) => (clock.left, clock.top, cover.0 as isize),
+        TrayCover::Visible => match read_tray_state() {
+            // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
+            // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
+            Some(state) if state.fully_hidden || !state.ready => {
+                (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK)
+            }
+            Some(state) => (clock.left + state.dx, clock.top + state.dy, -1),
+            None => (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK),
+        },
+        // 探测失败：退回矩形全屏判定；全屏则移出屏幕，否则常规显示
+        TrayCover::Unknown => {
+            if crate::windows_hook::is_foreground_fullscreen() {
+                (offscreen_x(clock.right), clock.top, OFFSCREEN_MARK)
+            } else {
+                (clock.left, clock.top, -1)
+            }
+        }
+    };
+    // 变化检测：状态与当前完全一致则零窗口操作
+    if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
+        if *last == Some((target_x, target_y, below)) {
             return;
         }
-        *last = Some(y);
+        *last = Some((target_x, target_y, below));
     }
+    CURRENT_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
     unsafe {
+        let insert_after = if below == OFFSCREEN_MARK || below == -1 {
+            // 屏外隐藏不需要 topmost 重排（出屏即不可见）；常规显示重申 topmost
+            if below == -1 {
+                Some(HWND_TOPMOST)
+            } else {
+                None
+            }
+        } else {
+            // 潜入盖住者正下方（同为 topmost 组内，直接指定插入位置）
+            Some(HWND(below as *mut core::ffi::c_void))
+        };
         let _ = SetWindowPos(
             hwnd,
-            None,
-            x,
-            y,
+            insert_after,
+            target_x,
+            target_y,
             0,
             0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW,
         );
     }
+}
+
+/// 「移出屏幕」隐藏态的 z 序标记（配合 offscreen_x 位置判断）。
+const OFFSCREEN_MARK: isize = -2;
+
+/// 屏外隐藏位的 x：任务栏右缘之外 320px（覆盖层宽 ~210，确保整体出屏；
+/// 用屏幕坐标而非显示器矩形，规避多屏负坐标环境下的"屏外"误判）。
+fn offscreen_x(tray_right: i32) -> i32 {
+    tray_right + 320
 }
 
 /// 按时钟矩形贴合覆盖层（尺寸 + 位置）；矩形与上次一致时跳过重设。

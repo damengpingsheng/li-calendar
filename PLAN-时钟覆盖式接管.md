@@ -173,3 +173,9 @@
   - **部署中顺带实测**：重启后时钟矩形自发变化（207→158 宽，任务栏重排），重探线程 attempt 0 贴合新矩形，验证了变化跟踪链路。
   - **Phase 1 追加（用户反馈驱动）**：初版可见性挂在 2s 轮询上，用户实测"隐藏/出现比任务栏慢"（最坏 2s 滞后）。改为 **WinEvent 事件驱动**：`SetWinEventHook` 监听 `EVENT_SYSTEM_FOREGROUND`（全屏进出）+ `EVENT_OBJECT_LOCATIONCHANGE`（过滤 `Shell_TrayWnd`，自动隐藏滑入/滑出），挂在与鼠标钩子同泵线程；回调只做轻量判定+ShowWindow，2s 轮询降级为兜底。卸载对称（`uninstall_global_mouse_hook` 与 `WindowsHookManager::uninstall_hook` 双路径 `UnhookWinEvent`）。
   - 事件路径验证：程序化弹铺满屏窗体 400ms 后截图——覆盖层已隐藏（纯轮询在此窗口内来不及，判定为事件驱动生效）；关闭后恢复。自动隐藏滑入/滑出路径待用户真机验。
+- [x] **Phase 1 追加：全屏退出空窗根治（2026-09-08，用户反馈驱动，四轮实测迭代）**：
+  - 现象：PotPlayer/Edge 退出全屏后覆盖层时钟延迟 1~2s 瞬间出现，期间透出原生时钟。
+  - 排障链（每步都有实测数据）：①`SW_HIDE` 方案 → WebView2(Chromium) 对隐藏窗口后台节流，恢复显示后渲染要 1~2s；②改移出屏幕 → **离屏同样不出帧**（加 `--disable-backgrounding-occluded-windows --disable-renderer-backgrounding --disable-features=CalculateNativeWinOcclusion` 参数、前端 200ms 强制重绘保活均无效，恢复后仍有 100~400ms 空窗）；③**最终方案：z 序潜入**——被盖时把覆盖层插到盖住者（必然 topmost，否则盖不住 topmost 任务栏）正下方，窗口全程在屏内渲染管线存活，盖住者缩回瞬间覆盖层已在原位且内容已在，**零空窗**（探测命中翻转 +100ms 截图内容完整）。
+  - 配套修复：2s 重贴线程的 `HWND_TOPMOST` 周期重申会把潜入态覆盖层顶回全屏窗口之上（实测 t=4.1s 提前冒头）——z 序管理权统一收归可见性管理（`CURRENT_BELOW` 状态机：常规模式重申 topmost / 潜入模式重申潜入 / 屏外模式不动）。
+  - 已知微瑕：全屏退出瞬间覆盖层可能与原生时钟错位 ~42px（探测缓存瞬态滞后），2s 重探自愈。
+  - 验证脚本：`D:\agents_tmp\zslip_test.ps1`（时钟中心点 WindowFromPoint 命中翻转 + 翻转后截图）。
