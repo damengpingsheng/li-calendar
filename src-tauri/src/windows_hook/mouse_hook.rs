@@ -15,6 +15,7 @@ use super::clock_window::{
     update_clock_area_cache,
 };
 use super::registry_clock::disable_custom_clock;
+use tauri::Manager;
 use super::state::{
     EVENT_SENDER, HOOK_HANDLE, IS_MENU_OPEN, NATIVE_MENU_TRACKING, TASKBAR_WIDGET_ENABLED,
 };
@@ -41,6 +42,24 @@ static NATIVE_DISMISS_PENDING: AtomicBool = AtomicBool::new(false);
 /// * `enabled` - 为真时安装钩子并允许拦截；为假时清空事件通道并恢复系统时钟。
 pub fn set_taskbar_widget_enabled(enabled: bool) {
     TASKBAR_WIDGET_ENABLED.store(enabled, Ordering::SeqCst);
+    // Phase 0：覆盖层随开关显隐——关闭后钩子放行，点击若落在无处理器的
+    // 覆盖层上会表现为"点时钟没反应"，必须同步隐藏；重新开启走完整贴合
+    // 流程（已建窗则重贴，未建窗则补建）。
+    let overlay_app = super::app_handle();
+    if enabled {
+        std::thread::Builder::new()
+            .name("clock-overlay-reenable".into())
+            .spawn(move || {
+                if let Some(app) = overlay_app {
+                    crate::window_manager::ensure_clock_overlay_attached(&app);
+                }
+            })
+            .ok();
+    } else if let Some(app) = overlay_app {
+        if let Some(window) = app.get_webview_window("clock_overlay") {
+            let _ = window.hide();
+        }
+    }
     if !enabled {
         if let Ok(mut global_sender) = EVENT_SENDER.lock() {
             *global_sender = None;
@@ -167,6 +186,11 @@ pub fn start_hook_message_thread() {
                                     continue;
                                 }
                                 update_clock_area_cache();
+                                // Phase 0：时钟矩形可能已变化（任务栏重排），同步重贴
+                                // 覆盖层（内部带变化检测，矩形未变零开销，只重申 topmost）。
+                                if let Some(app) = super::app_handle() {
+                                    crate::window_manager::relocate_clock_overlay_from_cache(&app);
+                                }
                             }
                         });
                     }
