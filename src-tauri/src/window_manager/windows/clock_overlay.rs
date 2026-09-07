@@ -38,6 +38,8 @@ static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, isize)>> = Mutex::new(None);
 /// 窗口下方）。供 2s 重贴线程判断：常规模式才允许重申 topmost，潜入/屏外
 /// 模式下重申 topmost 会把覆盖层顶回全屏窗口之上（实测打架）。
 static CURRENT_BELOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
+/// 「退出全屏自愈」进行中标记（防重复 spawn 治疗线程）。
+static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 构建任务栏时钟覆盖层窗口（独立、透明画布、置顶、无边框、隐藏待贴合）。
 impl super::CalendarWindowManager {
@@ -397,7 +399,26 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
         }
         *last = Some((target_x, target_y, below));
     }
-    CURRENT_BELOW.store(below, std::sync::atomic::Ordering::SeqCst);
+    // 「退出潜入恢复常规」瞬间：时钟矩形缓存还是全屏期间/退出过渡期的旧值
+    // （实测偏左 ~42px 右缘露出原生时钟，要等 ≤2s 的周期重探才自愈）。
+    // 立即安排两针延迟重探重贴（150ms/600ms，避开退出动画未稳的瞬间），
+    // 把自愈压到亚秒。UIA 在独立治疗线程执行，绝不进 WinEvent 回调线程。
+    let prev_below = CURRENT_BELOW.swap(below, std::sync::atomic::Ordering::SeqCst);
+    if prev_below > 0 && below == -1 && !EXIT_HEALING.swap(true, std::sync::atomic::Ordering::SeqCst)
+    {
+        let heal_app = app_handle.clone();
+        std::thread::Builder::new()
+            .name("clock-overlay-exit-heal".into())
+            .spawn(move || {
+                for delay in [150u64, 450] {
+                    std::thread::sleep(std::time::Duration::from_millis(delay));
+                    crate::windows_hook::refresh_clock_area_cache();
+                    crate::window_manager::relocate_clock_overlay_from_cache(&heal_app);
+                }
+                EXIT_HEALING.store(false, std::sync::atomic::Ordering::SeqCst);
+            })
+            .ok();
+    }
     unsafe {
         let insert_after = if below == OFFSCREEN_MARK || below == -1 {
             // 屏外隐藏不需要 topmost 重排（出屏即不可见）；常规显示重申 topmost
