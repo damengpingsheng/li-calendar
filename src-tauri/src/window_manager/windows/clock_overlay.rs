@@ -65,9 +65,6 @@ struct GeomState {
     mask: Option<RECT>,
     /// 退出后请求收缩回认可矩形（探测确认原生已归位时置位）
     shrink_requested: bool,
-    /// 收缩确认计数：连续两次 probe==endorsed 才允许收缩（评审 §3.4——
-    /// 单样本收缩会被过渡期的一次碰巧相等假触发）
-    shrink_confirm: u32,
     /// 覆盖探测去抖：离开被盖态（Visible）的连续出现起点
     visible_since: Option<std::time::Instant>,
     /// 最近一次盖住者的窗口句柄（去抖等待期保持潜入 z 序用）
@@ -82,7 +79,6 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     native_observed: None,
     mask: None,
     shrink_requested: false,
-    shrink_confirm: 0,
     visible_since: None,
     last_cover: None,
 });
@@ -129,6 +125,12 @@ fn geom_log(msg: &str) {
     }
 }
 
+/// 遮盖是否处于展开/保持状态（供重探线程加密轮询判断：遮盖保持期 UIA
+/// 按 150ms 节奏确认原生归位，稳态仍维持 2s——重操作只在瞬态窗口加密）。
+pub fn clock_overlay_mask_held() -> bool {
+    GEOM.lock().ok().map(|g| g.mask.is_some()).unwrap_or(false)
+}
+
 /// 探测结果喂给几何状态机（P1 布局解耦入口）。
 ///
 /// 缓存矩形属于钩子点击路由（需真实当前布局，含全屏期布局）；覆盖层只消费
@@ -141,19 +143,30 @@ pub fn clock_overlay_note_probe(rect: RECT) {
     if g.phase == GeomPhase::Covered {
         // 被盖期间的真实原生位置：记录为遮盖预备数据（N1），不影响认可矩形
         g.native_observed = Some(rect);
+        // 权威提前确认（归位即缩）：遮盖已展开且 UIA 全量读数回到认可位
+        // ⇒ 原生时钟已归位、退出过渡结束。覆盖探测（任务栏左段三点）此时
+        // 仍可能被退出动画窗口晃成 Covered，但 UIA 是定位原生时钟的同一
+        // 权威来源——直接完成去抖切 Normal 并请求收缩，遮盖保持期即
+        // "原生归位时间"本身，不附加保守等待。误确认的最坏代价是多余一次
+        // 扩展-收缩循环（设计内自愈）。mask 未展开时不触发（探测可能被
+        // 与时钟区无关的左侧窗口误判 Covered，此时维持原去抖路径防空翻）。
+        if g.mask.is_some() && rect_eq(g.endorsed, Some(rect)) {
+            g.phase = GeomPhase::Normal;
+            g.visible_since = None;
+            if g.mask.is_some() {
+                g.shrink_requested = true;
+            }
+            crate::dbg_log("clockrect: phase->normal (uia native-back fast-path)");
+        }
         return;
     }
     if rect_eq(g.endorsed, Some(rect)) {
-        // 与认可位一致：清除悬而未决的候选；遮盖展开时需连续两次相等
-        // 才请求收缩（单次相等可能是过渡期碰巧——评审 §3.4）
-        if g.mask.is_some() {
-            g.shrink_confirm += 1;
-            if g.shrink_confirm >= 2 && !g.shrink_requested {
-                g.shrink_requested = true;
-                crate::dbg_log("clockrect: shrink requested (2x confirmed)");
-            }
-        } else {
-            g.shrink_confirm = 0;
+        // 与认可位一致：清除悬而未决的候选；遮盖展开时 UIA 单次确认即请求
+        // 收缩（归位即缩）——UIA 读数即定位原生时钟的权威来源，误确认的
+        // 最坏代价是多余一次扩展-收缩循环，不再为小概率事件付双样本等待
+        if g.mask.is_some() && !g.shrink_requested {
+            g.shrink_requested = true;
+            crate::dbg_log("clockrect: shrink requested (uia confirmed)");
         }
         if g.candidate.is_some() {
             g.candidate = None;
@@ -554,7 +567,6 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     // 已展开的 mask 保留（连续快速切换时遮盖无缝衔接）。
                     g.native_observed = None;
                     g.shrink_requested = false;
-                    g.shrink_confirm = 0;
                     crate::dbg_log(&format!(
                         "clockrect: phase->covered (hold endorsed ({},{},{},{}))",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom

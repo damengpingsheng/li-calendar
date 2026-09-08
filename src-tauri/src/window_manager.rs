@@ -19,6 +19,8 @@ pub use windows::clock_overlay_appearance_colors;
 #[cfg(windows)]
 pub use windows::clock_overlay_note_probe;
 #[cfg(windows)]
+pub use windows::clock_overlay_mask_held;
+#[cfg(windows)]
 pub use windows::ensure_clock_overlay_attached;
 #[cfg(windows)]
 pub use windows::update_clock_overlay_visibility;

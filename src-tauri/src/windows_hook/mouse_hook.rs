@@ -276,7 +276,15 @@ pub fn start_hook_message_thread() {
                         std::thread::spawn(|| {
                             let mut tick: u32 = 0;
                             loop {
-                                std::thread::sleep(std::time::Duration::from_millis(500));
+                                // 遮盖保持期 150ms 加密轮询（归位即缩：UIA 确认原生
+                                // 归位后立即收缩，把遮盖保持期压到"原生归位时间+
+                                // 一次读数"）；稳态 500ms 照旧。加密只持续全屏退出的
+                                // 瞬态窗口（≤2s），UIA 重操作的开销可忽略。
+                                let mask_held =
+                                    crate::window_manager::clock_overlay_mask_held();
+                                std::thread::sleep(std::time::Duration::from_millis(
+                                    if mask_held { 150 } else { 500 },
+                                ));
                                 if !TASKBAR_WIDGET_ENABLED.load(Ordering::SeqCst) {
                                     continue;
                                 }
@@ -287,8 +295,10 @@ pub fn start_hook_message_thread() {
                                 if let Some(app) = super::app_handle() {
                                     crate::window_manager::update_clock_overlay_visibility(&app);
                                 }
-                                // 每 2s：UIA 时钟矩形重探（重操作，维持 2s 节奏）+ 重贴。
-                                if tick % 4 == 0 {
+                                // 每 2s：UIA 时钟矩形重探（重操作，维持 2s 节奏）+ 重贴；
+                                // 遮盖保持期加密到每针（150ms）——UIA 确认原生归位后
+                                // 同一针立刻重贴收缩，无需等下个 2s 周期。
+                                if mask_held || tick % 4 == 0 {
                                     update_clock_area_cache();
                                     if let Some(app) = super::app_handle() {
                                         crate::window_manager::relocate_clock_overlay_endorsed(
