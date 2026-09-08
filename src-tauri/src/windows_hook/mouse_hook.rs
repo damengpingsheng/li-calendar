@@ -276,15 +276,12 @@ pub fn start_hook_message_thread() {
                         std::thread::spawn(|| {
                             let mut tick: u32 = 0;
                             loop {
-                                // 遮盖保持期 150ms 加密轮询（归位即缩：UIA 确认原生
-                                // 归位后立即收缩，把遮盖保持期压到"原生归位时间+
-                                // 一次读数"）；稳态 500ms 照旧。加密只持续全屏退出的
-                                // 瞬态窗口（≤2s），UIA 重操作的开销可忽略。
-                                let mask_held =
-                                    crate::window_manager::clock_overlay_mask_held();
-                                std::thread::sleep(std::time::Duration::from_millis(
-                                    if mask_held { 150 } else { 500 },
-                                ));
+                                // R5：轮询间隔由状态机建议——退出 pending
+                                // （settle 计时/进全屏等首观测）150ms 加密，稳态
+                                // 500ms。加密只持续全屏进出瞬态，UIA 开销可忽略。
+                                let interval_ms =
+                                    crate::window_manager::clock_overlay_reprobe_interval_ms();
+                                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
                                 if !TASKBAR_WIDGET_ENABLED.load(Ordering::SeqCst) {
                                     continue;
                                 }
@@ -296,9 +293,9 @@ pub fn start_hook_message_thread() {
                                     crate::window_manager::update_clock_overlay_visibility(&app);
                                 }
                                 // 每 2s：UIA 时钟矩形重探（重操作，维持 2s 节奏）+ 重贴；
-                                // 遮盖保持期加密到每针（150ms）——UIA 确认原生归位后
-                                // 同一针立刻重贴收缩，无需等下个 2s 周期。
-                                if mask_held || tick % 4 == 0 {
+                                // 加密期每针都做——settle 确认与遮盖展开都吃 UIA 读数，
+                                // 2s 节奏会把瞬态拉长一个量级。
+                                if interval_ms == 150 || tick % 4 == 0 {
                                     update_clock_area_cache();
                                     if let Some(app) = super::app_handle() {
                                         crate::window_manager::relocate_clock_overlay_endorsed(

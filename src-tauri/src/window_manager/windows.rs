@@ -22,8 +22,8 @@ pub use clock_context_menu::{
     show_clock_context_menu, track_native_clock_menu,
 };
 pub use clock_overlay::clock_overlay_appearance_colors;
-pub use clock_overlay::clock_overlay_mask_held;
 pub use clock_overlay::clock_overlay_note_probe;
+pub use clock_overlay::clock_overlay_reprobe_interval_ms;
 pub use clock_overlay::ensure_clock_overlay_attached;
 pub use clock_overlay::relocate_clock_overlay;
 pub use clock_overlay::relocate_clock_overlay_endorsed;
