@@ -63,9 +63,12 @@ struct GeomState {
     native_observed: Option<RECT>,
     /// 当前遮盖矩形（窗口被临时扩展为认可∪原生观测时的实际窗口矩形）
     mask: Option<RECT>,
-    /// 退出轮 settle 计时起点：「探测 Visible 且 UIA==认可位」持续计时的起点，
-    /// 探测转 Covered 或 UIA 读到非认可位即清零（R5 单周期收缩门）
-    settled_since: Option<std::time::Instant>,
+    /// 收缩请求：UIA 读到原生==认可位即置位（R6 实时跟踪——扩展/收缩与
+    /// 原生时钟的真实位置逐读数对齐，归位即缩，不做额外稳定等待）
+    shrink_requested: bool,
+    /// 最近一次覆盖探测 Visible 的时刻（供轮询加密判断：退出动画期相位
+    /// 回摆时即使瞬时回到 Covered 也保持 150ms 节奏）
+    last_probe_visible: Option<std::time::Instant>,
     /// 覆盖探测去抖：离开被盖态（Visible）的连续出现起点
     visible_since: Option<std::time::Instant>,
     /// 最近一次盖住者的窗口句柄（去抖等待期保持潜入 z 序用）
@@ -79,7 +82,8 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     candidate_since: None,
     native_observed: None,
     mask: None,
-    settled_since: None,
+    shrink_requested: false,
+    last_probe_visible: None,
     visible_since: None,
     last_cover: None,
 });
@@ -97,15 +101,6 @@ const PERSIST_ADOPT_MS: u128 = 8000;
 /// 喇叭图标反复被盖）。去抖后整个动画期保持被盖几何一次，动画结束一次性收缩。
 /// 进入被盖不去抖（盖住就该立即遮）。
 const COVER_DEBOUNCE_MS: u128 = 300;
-
-/// 退出轮收缩 settle 门（R5 单周期）：遮盖展开后，要求「探测 Visible 且
-/// UIA==认可位」**持续稳定 ≥1.2s** 才收缩。实测 PotPlayer 退出动画 ~5s 内
-/// 使任务栏布局以 ~1.4s 周期在全屏位形/常规位形间回摆（原生时钟
-/// 3618↔3660 多次往返，menu_dbg.log 23:39 时间线），任何更短的稳定判据都会
-/// 在动画中途收缩、随即被下一次回摆打回扩展——左缘 42px 反复跳变、喇叭
-/// 图标反复隐现（用户可感知）。单方向「一次展开→稳住→一次收缩」把感知
-/// 压成一个事件。1.2s > 动画期任一可见窗长度（实测 ≤1s）。
-const SETTLE_STABLE_MS: u128 = 1200;
 
 /// RECT 字段级比较（不依赖 derive）。
 fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
@@ -135,19 +130,29 @@ fn geom_log(msg: &str) {
     }
 }
 
-/// 重探线程轮询间隔建议（毫秒）。加密（150ms）只在两个瞬态：
-/// ① 退出 pending（遮盖已展开、settle 计时中）——收缩时点与归位时点的
-///    量化差即一次轮询；
-/// ② 被盖但遮盖未展开（进全屏头一秒，等首个 UIA 观测）——残块暴露窗。
-/// 稳态（含整场全屏播放：遮盖已展开但相位仍 Covered，不等待收缩）维持
-/// 500ms/2s，避免 UIA 重操作整场加密。
+/// 重探线程轮询间隔建议（毫秒）。加密（150ms）只在瞬态：
+/// ① 退出 pending（遮盖在场、相位 Normal）——收缩/扩展时点与原生归位/离位
+///    时点的量化差即一次轮询（R6 实时跟踪的基础）；
+/// ② 被盖但遮盖未展开（进全屏头一秒，等首个 UIA 观测）——残块暴露窗；
+/// ③ 退出回摆期相位瞬时回到 Covered，但 3s 内见过 Visible——回摆仍在进行，
+///    掉回 2s 节奏会让下一次扩展/收缩晚一个量级（23:39 实测 42.5→44.1 的
+///    UIA 空窗正是 R4 掉回慢节奏所致）。
+/// 稳态全屏播放（遮盖在场、相位 Covered、3s 内无 Visible）维持 500ms/2s，
+/// 避免 UIA 重操作整场加密。
 pub fn clock_overlay_reprobe_interval_ms() -> u64 {
     match GEOM.lock() {
-        Ok(g) => match g.phase {
-            GeomPhase::Normal if g.mask.is_some() => 150,
-            GeomPhase::Covered if g.mask.is_none() => 150,
-            _ => 500,
-        },
+        Ok(g) => {
+            let recent_visible = g
+                .last_probe_visible
+                .map(|t| t.elapsed().as_millis() < 3000)
+                .unwrap_or(false);
+            match g.phase {
+                GeomPhase::Normal if g.mask.is_some() => 150,
+                GeomPhase::Covered if g.mask.is_none() => 150,
+                GeomPhase::Covered if g.mask.is_some() && recent_visible => 150,
+                _ => 500,
+            }
+        }
         Err(_) => 500,
     }
 }
@@ -166,24 +171,31 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         // 跨相位翻转保留（R5）：PotPlayer 退出动画使相位以 ~1.4s 周期
         // Covered↔Visible 回摆，逐轮清空会把回摆证据丢掉、遮盖展开延迟整轮。
         g.native_observed = Some(rect);
-        // z 序快路径：遮盖已展开且 UIA 读到认可位 ⇒ 盖住者已让位，提前切
-        // Normal 夺回 topmost（仅 z 与相位；几何不再据此收缩——退出动画会
-        // 回摆，收缩交给 settle 门）。
-        if g.mask.is_some() && rect_eq(g.endorsed, Some(rect)) {
-            g.phase = GeomPhase::Normal;
-            g.visible_since = None;
-            g.settled_since.get_or_insert_with(std::time::Instant::now);
-            crate::dbg_log("clockrect: phase->normal (uia native-back fast-path)");
+        // UIA 读到认可位：原生真实归位，立即请求收缩（R6 实时跟踪）。
+        // 退出动画期原生位置逐读数回摆（23:39 实测 3618↔3660 四个来回），
+        // 任何"稳定 N 次才缩"的守门都会让左缘在原生已归位后继续撑着——
+        // 扩展/收缩与原生位置逐读数对齐才是与系统自身布局跳动同步的最小
+        // 感知。fast-path 相位/z 兼职：盖住者已让位时提前夺回 topmost。
+        if rect_eq(g.endorsed, Some(rect)) {
+            if g.mask.is_some() && !g.shrink_requested {
+                g.shrink_requested = true;
+                crate::dbg_log("clockrect: shrink requested (native endorsed)");
+            }
+            if g.mask.is_some() {
+                g.phase = GeomPhase::Normal;
+                g.visible_since = None;
+                crate::dbg_log("clockrect: phase->normal (uia native-back fast-path)");
+            }
         } else {
-            g.settled_since = None;
+            g.shrink_requested = false;
         }
         return;
     }
     if rect_eq(g.endorsed, Some(rect)) {
-        // 与认可位一致：遮盖展开（退出轮中）只累计 settle 计时，不立即收缩——
-        // 动画期回摆会使单次确认即缩后再次扩展（实测左缘反复跳 42px）
-        if g.mask.is_some() {
-            g.settled_since.get_or_insert_with(std::time::Instant::now);
+        // 与认可位一致：遮盖在场即立即请求收缩（R6 实时跟踪）
+        if g.mask.is_some() && !g.shrink_requested {
+            g.shrink_requested = true;
+            crate::dbg_log("clockrect: shrink requested (native endorsed)");
         }
         if g.candidate.is_some() {
             g.candidate = None;
@@ -193,12 +205,12 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         return;
     }
     // 与认可位不同。退出轮中（遮盖或原生观测任一在场）：读数即原生回摆的
-    // 证据，喂遮盖数据并打断 settle——Normal 相位的回摆读数不再丢失到
+    // 证据，喂遮盖数据并撤销收缩请求——Normal 相位的回摆读数不再丢失到
     // 候选路径（23:39 实测：40.8s 的 3618 读数落在相位翻转间隙，遮盖晚了
     // 1.4s 才展开，期间原生残块露出）。
     if g.mask.is_some() || g.native_observed.is_some() {
         g.native_observed = Some(rect);
-        g.settled_since = None;
+        g.shrink_requested = false;
     }
     // 与认可位不同：走采纳门（候选需持续存在 ≥8s），绝不即时采纳——
     // 退出全屏的过渡期宽矩形/全屏期布局值就是这么混进去的（实测）；
@@ -334,31 +346,29 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 
 /// 直接按缓存矩形重贴（不再触发 UIA，供 2 秒周期重探线程复用其刷新结果）。
 /// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用；遮盖展开期间
-/// 保持遮盖（冻结），直到 settle 门满足（探测 Visible + UIA==认可位 持续
-/// ≥SETTLE_STABLE_MS）才收缩回认可矩形——退出动画期回摆会使任何更早的
-/// 收缩被再次扩展（R5 单周期）。
+/// 保持遮盖，直到 UIA 读到原生==认可位（shrink_requested，note_probe 置位）
+/// 才收缩——R6 实时跟踪：收缩时点=原生真实归位时点+一次读数量化（≤150ms），
+/// 与系统自身布局跳动同步，无任何附加稳定等待。
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
-    let (endorsed, phase_is_normal, mask, settled) = match GEOM.lock() {
+    let (endorsed, phase_is_normal, mask, shrink_requested) = match GEOM.lock() {
         Ok(g) => (
             g.endorsed,
             g.phase == GeomPhase::Normal,
             g.mask,
-            g.settled_since
-                .map(|t| t.elapsed().as_millis() >= SETTLE_STABLE_MS)
-                .unwrap_or(false),
+            g.shrink_requested,
         ),
         Err(_) => return,
     };
     if !phase_is_normal {
         return;
     }
-    if mask.is_some() && !settled {
-        return; // 遮盖保持期：退出动画仍在回摆，收缩会被打回扩展
+    if mask.is_some() && !shrink_requested {
+        return; // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
     }
     let Some(endorsed) = endorsed else { return };
     let Some(window) = app_handle.get_webview_window("clock_overlay") else { return };
     if mask.is_some() {
-        crate::dbg_log("clockrect: settle shrink (visible+endorsed stable >=1.2s)");
+        crate::dbg_log("clockrect: shrink (native endorsed)");
     }
     if !apply_overlay_geometry(&window, &endorsed) {
         return;
@@ -366,7 +376,7 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
     if let Ok(mut g) = GEOM.lock() {
         g.mask = None;
         g.native_observed = None;
-        g.settled_since = None;
+        g.shrink_requested = false;
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
     // 之上）；潜入模式改为重申"潜入盖住者下方"（外部 z 序扰动后 2s 内自愈）；
@@ -601,11 +611,10 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     g.phase = GeomPhase::Covered;
                     g.candidate = None;
                     g.candidate_since = None;
-                    // 原生观测/遮盖跨相位翻转保留（R5）：退出动画期相位以
-                    // ~1.4s 周期回摆，逐轮清空会反复丢失回摆证据（23:39 实测
-                    // 遮盖因此晚 1.4s 展开）、且收缩后被下一次回摆再次扩展。
-                    // 证据在 settle 收缩时统一清空；此处仅清 settle 计时。
-                    g.settled_since = None;
+                    // 原生观测/遮盖/收缩请求跨相位翻转保留（R5/R6）：退出动画
+                    // 期相位以 ~1.4s 周期回摆，逐轮清空会反复丢失回摆证据
+                    // （23:39 实测遮盖因此晚 1.4s 展开）。证据与请求由
+                    // note_probe 逐读数维护，此处不做清理。
                     crate::dbg_log(&format!(
                         "clockrect: phase->covered (hold endorsed ({},{},{},{}))",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
@@ -651,6 +660,11 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             }
         }
         TrayCover::Visible => {
+            // 记录最近 Visible 时刻（R6）：回摆期相位瞬时回到 Covered 时，
+            // 轮询加密按此时刻维持 3s，扩展/收缩不吃 2s 量化。
+            if let Ok(mut g) = GEOM.lock() {
+                g.last_probe_visible = Some(std::time::Instant::now());
+            }
             // 覆盖探测去抖：被盖→常规要求 Visible 持续 ≥300ms。实测 PotPlayer
             // 退出全屏的窗口缩回动画使覆盖探测以 ~1.4s 周期在 Covered/Visible
             // 间抖动，无去抖则状态机反复扩张/收缩（用户见时钟宽度反复变化、
@@ -705,10 +719,11 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     ));
                 }
             }
-            // 遮盖保持期（R5 单周期）：退出轮回摆期探测可能直接 Visible 而原生
+            // 遮盖保持期（R6 实时跟踪）：退出轮回摆期探测可能直接 Visible 而原生
             // 仍在全屏位形（探测只看任务栏左段，代表不了时钟区）——此时候盖
             // 未展开也必须立即展开，否则原生残块压在托盘区露出（23:39 实测
-            // 40.575/41.722 两个暴露窗）。收缩不在此处：settle 门在 relocate。
+            // 40.575/41.722 两个暴露窗）。收缩不在此处：由 relocate 在
+            // note_probe 置位收缩请求后执行。
             let mut mask_now = GEOM.lock().ok().and_then(|g| g.mask);
             if mask_now.is_none() {
                 let native = GEOM.lock().ok().and_then(|g| g.native_observed);
