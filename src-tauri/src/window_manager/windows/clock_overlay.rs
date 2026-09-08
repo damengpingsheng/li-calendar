@@ -65,6 +65,9 @@ struct GeomState {
     mask: Option<RECT>,
     /// 退出后请求收缩回认可矩形（探测确认原生已归位时置位）
     shrink_requested: bool,
+    /// 收缩确认计数：连续两次 probe==endorsed 才允许收缩（评审 §3.4——
+    /// 单样本收缩会被过渡期的一次碰巧相等假触发）
+    shrink_confirm: u32,
     /// 覆盖探测去抖：离开被盖态（Visible）的连续出现起点
     visible_since: Option<std::time::Instant>,
     /// 最近一次盖住者的窗口句柄（去抖等待期保持潜入 z 序用）
@@ -79,6 +82,7 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     native_observed: None,
     mask: None,
     shrink_requested: false,
+    shrink_confirm: 0,
     visible_since: None,
     last_cover: None,
 });
@@ -140,10 +144,16 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         return;
     }
     if rect_eq(g.endorsed, Some(rect)) {
-        // 与认可位一致：清除悬而未决的候选；若遮盖仍展开且原生已归位，请求收缩
+        // 与认可位一致：清除悬而未决的候选；遮盖展开时需连续两次相等
+        // 才请求收缩（单次相等可能是过渡期碰巧——评审 §3.4）
         if g.mask.is_some() {
-            g.shrink_requested = true;
-            crate::dbg_log("clockrect: shrink requested (native back at endorsed)");
+            g.shrink_confirm += 1;
+            if g.shrink_confirm >= 2 && !g.shrink_requested {
+                g.shrink_requested = true;
+                crate::dbg_log("clockrect: shrink requested (2x confirmed)");
+            }
+        } else {
+            g.shrink_confirm = 0;
         }
         if g.candidate.is_some() {
             g.candidate = None;
@@ -540,46 +550,54 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     g.phase = GeomPhase::Covered;
                     g.candidate = None;
                     g.candidate_since = None;
+                    // 新一轮被盖：旧轮原生观测/收缩请求作废（评审 §3.4 跨轮复用）。
+                    // 已展开的 mask 保留（连续快速切换时遮盖无缝衔接）。
+                    g.native_observed = None;
+                    g.shrink_requested = false;
+                    g.shrink_confirm = 0;
                     crate::dbg_log(&format!(
                         "clockrect: phase->covered (hold endorsed ({},{},{},{}))",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
                 }
             }
-            // N1 掩盖预备：被盖期间观测到原生时钟真实位置偏离认可位时，把窗口
-            // 扩展为两者并集（不透明背景遮住原生残块；文字右对齐锚定，右缘不变
-            // 则视觉位置不变）。预备发生在仍被播放器遮住时，恢复瞬间即已就绪。
+            // N1 掩盖预备（评审 §3.3 修正）：遮盖目标 = 已展开 mask 优先，
+            // 否则本轮新观测的原生位置与认可位取并集。保持遮盖必须位置+尺寸
+            // 成套应用——只回左缘不缩宽会让窗口变成"认可左缘+遮盖宽度"，
+            // 右缘冲进「显示桌面」区（盖住相邻图标，用户实测）。
+            let cur_mask = GEOM.lock().ok().and_then(|g| g.mask);
             let native = GEOM.lock().ok().and_then(|g| g.native_observed);
-            let mut x = endorsed.left;
-            let mut y = endorsed.top;
-            let mut size: Option<(i32, i32)> = None;
-            if let Some(n) = native {
-                let union = union_rect(endorsed, n);
-                if !rect_eq(Some(union), Some(endorsed)) {
-                    x = union.left;
-                    y = union.top;
-                    size = Some((union.right - union.left, union.bottom - union.top));
-                    if let Ok(mut g) = GEOM.lock() {
-                        if !rect_eq(g.mask, Some(union)) {
-                            g.mask = Some(union);
-                            geom_log(&format!(
-                                "mask prepared union=({},{},{},{})",
-                                union.left, union.top, union.right, union.bottom
-                            ));
-                        }
+            let mask_target = cur_mask.or_else(|| {
+                native.and_then(|n| {
+                    let u = union_rect(endorsed, n);
+                    (!rect_eq(Some(u), Some(endorsed))).then_some(u)
+                })
+            });
+            if let Some(m) = mask_target {
+                if let Ok(mut g) = GEOM.lock() {
+                    if !rect_eq(g.mask, Some(m)) {
+                        g.mask = Some(m);
+                        geom_log(&format!(
+                            "mask prepared union=({},{},{},{})",
+                            m.left, m.top, m.right, m.bottom
+                        ));
                     }
                 }
-            }
-            // 同步"最后应用矩形"：遮盖应用绕过了 relocate 的 apply_overlay_geometry，
-            // 不同步会让收缩时的变更检测误判"无变化"而跳过实际收缩
-            if size.is_some() {
+                // 同步"最后应用矩形"：遮盖应用绕过 apply_overlay_geometry 的
+                // 变更记录，不同步会让收缩被"无变化"跳过
                 if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
-                    let union = union_rect(endorsed, native.unwrap_or(endorsed));
-                    *last = Some(union);
+                    *last = Some(m);
                 }
+                (
+                    mask_target.unwrap().left,
+                    mask_target.unwrap().top,
+                    mask_target.unwrap().right - mask_target.unwrap().left,
+                    mask_target.unwrap().bottom - mask_target.unwrap().top,
+                    cover.0 as isize,
+                )
+            } else {
+                (endorsed.left, endorsed.top, 0, 0, cover.0 as isize)
             }
-            let (w, h) = size.unwrap_or((0, 0));
-            (x, y, w, h, cover.0 as isize)
         }
         TrayCover::Visible => {
             // 覆盖探测去抖：被盖→常规要求 Visible 持续 ≥300ms。实测 PotPlayer
@@ -591,6 +609,41 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 if g.phase == GeomPhase::Covered {
                     let since = *g.visible_since.get_or_insert_with(std::time::Instant::now);
                     if since.elapsed().as_millis() < COVER_DEBOUNCE_MS {
+                        // F1（评审完善版）：等待期内探测时钟中心实际归属——
+                        // 命中任务栏或本覆盖层 ⇒ 盖住者已让位，立即夺回 topmost
+                        // （仅 z 序，几何保持遮盖位），把"原生时钟可见期"从整个
+                        // 去抖期压缩到 WinEvent 延迟级；命中其他窗口（含仍在
+                        // 显示的播放器画面）不动作，避免浮到视频上。
+                        // 夺 z 后清除应用缓存，使随后的真·Covered 能重新潜入。
+                        drop(g);
+                        unsafe {
+                            if let Ok(tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+                                let center = windows::Win32::Foundation::POINT {
+                                    x: (endorsed.left + endorsed.right) / 2,
+                                    y: (endorsed.top + endorsed.bottom) / 2,
+                                };
+                                let hit = WindowFromPoint(center);
+                                if !hit.0.is_null() {
+                                    let root = GetAncestor(hit, GA_ROOT);
+                                    let own_root = GetAncestor(hwnd, GA_ROOT);
+                                    if root == tray || root == own_root {
+                                        let _ = SetWindowPos(
+                                            hwnd,
+                                            Some(HWND_TOPMOST),
+                                            0,
+                                            0,
+                                            0,
+                                            0,
+                                            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                                        );
+                                        geom_log("z-reclaim early (clock center hit tray/self)");
+                                        if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
+                                            *last = None;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         return;
                     }
                     g.phase = GeomPhase::Normal;
