@@ -20,8 +20,8 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::UI::WindowsAndMessaging::{
     FindWindowW, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
     SetWindowLongPtrW, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW, SW_SHOWNOACTIVATE,
-    WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
+    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 
 use super::get_window_hwnd;
@@ -66,6 +66,12 @@ struct GeomState {
     /// 收缩请求：UIA 读到原生==认可位即置位（R6 实时跟踪——扩展/收缩与
     /// 原生时钟的真实位置逐读数对齐，归位即缩，不做额外稳定等待）
     shrink_requested: bool,
+    /// 退出观测窗截止时刻（R7）：收缩执行后 EXIT_WATCH_MS 内——轮询维持
+    /// 150ms、Normal 相位的偏离读数继续喂遮盖数据。修 R6 的洞：首次收缩
+    /// 清空 mask/native_observed 后轮询掉回 500ms/每 4 针才 UIA，偏离读数
+    /// 只进 8s 候选路径（23:39 实测首个收缩后回摆仍持续 ~2.4s，遮盖再扩展
+    /// 最坏要等 ~2.5s）。观测窗只延长跟踪，绝不重新变成延迟收缩的门槛。
+    exit_watch_until: Option<std::time::Instant>,
     /// 最近一次覆盖探测 Visible 的时刻（供轮询加密判断：退出动画期相位
     /// 回摆时即使瞬时回到 Covered 也保持 150ms 节奏）
     last_probe_visible: Option<std::time::Instant>,
@@ -83,6 +89,7 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     native_observed: None,
     mask: None,
     shrink_requested: false,
+    exit_watch_until: None,
     last_probe_visible: None,
     visible_since: None,
     last_cover: None,
@@ -101,6 +108,11 @@ const PERSIST_ADOPT_MS: u128 = 8000;
 /// 喇叭图标反复被盖）。去抖后整个动画期保持被盖几何一次，动画结束一次性收缩。
 /// 进入被盖不去抖（盖住就该立即遮）。
 const COVER_DEBOUNCE_MS: u128 = 300;
+
+/// 退出观测窗时长（R7）：收缩执行后维持快节奏跟踪的时长。23:39 实测退出
+/// 回摆全程 ~5s、首个收缩后仍持续 ~2.4s；6s 覆盖「最后一个收缩之后仍可能
+/// 出现的回摆尾巴」。窗口到期自然回落稳态节奏，无需显式清理。
+const EXIT_WATCH_MS: u64 = 6000;
 
 /// RECT 字段级比较（不依赖 derive）。
 fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
@@ -136,20 +148,24 @@ fn geom_log(msg: &str) {
 /// ② 被盖但遮盖未展开（进全屏头一秒，等首个 UIA 观测）——残块暴露窗；
 /// ③ 退出回摆期相位瞬时回到 Covered，但 3s 内见过 Visible——回摆仍在进行，
 ///    掉回 2s 节奏会让下一次扩展/收缩晚一个量级（23:39 实测 42.5→44.1 的
-///    UIA 空窗正是 R4 掉回慢节奏所致）。
+///    UIA 空窗正是 R4 掉回慢节奏所致）；
+/// ④ 退出观测窗内（R7，收缩后 EXIT_WATCH_MS）：首次收缩清空遮盖数据后
+///    回摆可能仍在进行，此窗内维持 150ms 保证后续回摆读数逐针可见。
 /// 稳态全屏播放（遮盖在场、相位 Covered、3s 内无 Visible）维持 500ms/2s，
 /// 避免 UIA 重操作整场加密。
 pub fn clock_overlay_reprobe_interval_ms() -> u64 {
     match GEOM.lock() {
         Ok(g) => {
+            let now = std::time::Instant::now();
             let recent_visible = g
                 .last_probe_visible
                 .map(|t| t.elapsed().as_millis() < 3000)
                 .unwrap_or(false);
+            let in_exit_watch = g.exit_watch_until.map(|t| t > now).unwrap_or(false);
             match g.phase {
-                GeomPhase::Normal if g.mask.is_some() => 150,
+                GeomPhase::Normal if g.mask.is_some() || in_exit_watch => 150,
                 GeomPhase::Covered if g.mask.is_none() => 150,
-                GeomPhase::Covered if g.mask.is_some() && recent_visible => 150,
+                GeomPhase::Covered if g.mask.is_some() && (recent_visible || in_exit_watch) => 150,
                 _ => 500,
             }
         }
@@ -204,11 +220,16 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         }
         return;
     }
-    // 与认可位不同。退出轮中（遮盖或原生观测任一在场）：读数即原生回摆的
-    // 证据，喂遮盖数据并撤销收缩请求——Normal 相位的回摆读数不再丢失到
-    // 候选路径（23:39 实测：40.8s 的 3618 读数落在相位翻转间隙，遮盖晚了
-    // 1.4s 才展开，期间原生残块露出）。
-    if g.mask.is_some() || g.native_observed.is_some() {
+    // 与认可位不同。退出轮中（遮盖或原生观测任一在场，或处于退出观测窗）：
+    // 读数即原生回摆的证据，喂遮盖数据并撤销收缩请求——Normal 相位的回摆
+    // 读数不再丢失到候选路径（23:39 实测：40.8s 的 3618 读数落在相位翻转
+    // 间隙，遮盖晚了 1.4s 才展开，期间原生残块露出）。R7 补观测窗条件：
+    // 首次收缩清空 mask/native 后回摆读数仍能立即重建遮盖依据。
+    let in_exit_watch = g
+        .exit_watch_until
+        .map(|t| t > std::time::Instant::now())
+        .unwrap_or(false);
+    if g.mask.is_some() || g.native_observed.is_some() || in_exit_watch {
         g.native_observed = Some(rect);
         g.shrink_requested = false;
     }
@@ -347,20 +368,47 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 /// 直接按缓存矩形重贴（不再触发 UIA，供 2 秒周期重探线程复用其刷新结果）。
 /// 按认可矩形重贴（P1：几何唯一权威）。仅在 Normal 阶段应用；遮盖展开期间
 /// 保持遮盖，直到 UIA 读到原生==认可位（shrink_requested，note_probe 置位）
-/// 才收缩——R6 实时跟踪：收缩时点=原生真实归位时点+一次读数量化（≤150ms），
+/// 才收缩——R6 实时跟踪：收缩时点=原生真实归位时点+一次读数量化，
 /// 与系统自身布局跳动同步，无任何附加稳定等待。
+/// R7 扩展即时化（与收缩对称）：不收缩的场合若原生观测偏离认可位且现有
+/// 遮盖盖不住它，立即把遮盖更新为新并集——原实现此分支直接 return，新
+/// 偏离要等下一轮 update 才生效，扩展比收缩慢一个轮询周期。
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
-    let (endorsed, phase_is_normal, mask, shrink_requested) = match GEOM.lock() {
+    let (endorsed, phase_is_normal, mask, shrink_requested, native) = match GEOM.lock() {
         Ok(g) => (
             g.endorsed,
             g.phase == GeomPhase::Normal,
             g.mask,
             g.shrink_requested,
+            g.native_observed,
         ),
         Err(_) => return,
     };
     if !phase_is_normal {
         return;
+    }
+    if !shrink_requested {
+        if let (Some(endorsed), Some(native)) = (endorsed, native) {
+            if !rect_eq(Some(native), Some(endorsed)) {
+                let u = union_rect(endorsed, native);
+                if !rect_eq(mask, Some(u)) {
+                    let Some(window) = app_handle.get_webview_window("clock_overlay") else {
+                        return;
+                    };
+                    if apply_mask_geometry(&window, u) {
+                        crate::dbg_log(&format!(
+                            "clockrect: mask expand (native diverged) union=({},{},{},{})",
+                            u.left, u.top, u.right, u.bottom
+                        ));
+                    }
+                    return;
+                }
+                if mask.is_some() {
+                    // 并集未变（旧遮盖已盖住新观测）：维持现状
+                    return;
+                }
+            }
+        }
     }
     if mask.is_some() && !shrink_requested {
         return; // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
@@ -377,6 +425,12 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
         g.mask = None;
         g.native_observed = None;
         g.shrink_requested = false;
+        // 真实收缩（遮盖→无）才开启退出观测窗：常规无变化重贴不开窗
+        if mask.is_some() {
+            g.exit_watch_until = Some(
+                std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WATCH_MS),
+            );
+        }
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
     // 之上）；潜入模式改为重申"潜入盖住者下方"（外部 z 序扰动后 2s 内自愈）；
@@ -837,10 +891,14 @@ fn offscreen_x(tray_right: i32) -> i32 {
 }
 
 /// 按时钟矩形贴合覆盖层（尺寸 + 位置）；矩形与上次一致时跳过重设。
+/// R7：位置+尺寸改单次 SetWindowPos 原子应用——原 set_size/set_position
+/// 两连调用会呈现中间态：收缩时先缩宽、左缘未动，右缘短暂停在旧左缘+新宽
+/// （3618+158=3776，冲进托盘图标区），随后才跳到 3818（评审 E）。窗口是
+/// 每监视器 DPI 感知的，物理坐标直传与 Tauri Physical 语义一致。
 fn apply_overlay_geometry(window: &WebviewWindow, rect: &RECT) -> bool {
-    let w = (rect.right - rect.left) as u32;
-    let h = (rect.bottom - rect.top) as u32;
-    if w == 0 || h == 0 {
+    let w = (rect.right - rect.left) as i32;
+    let h = (rect.bottom - rect.top) as i32;
+    if w <= 0 || h <= 0 {
         return false;
     }
     if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
@@ -855,11 +913,70 @@ fn apply_overlay_geometry(window: &WebviewWindow, rect: &RECT) -> bool {
         }
         *last = Some(*rect);
     }
-    let _ = window.set_size(tauri::PhysicalSize { width: w, height: h });
-    let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
-        x: rect.left,
-        y: rect.top,
-    }));
+    match get_window_hwnd(window) {
+        Some(hwnd) => unsafe {
+            SetWindowPos(
+                hwnd,
+                None,
+                rect.left,
+                rect.top,
+                w,
+                h,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .is_ok()
+        },
+        None => {
+            // HWND 不可得时的兜底（正常路径不会走到）
+            let _ = window.set_size(tauri::PhysicalSize { width: w as u32, height: h as u32 });
+            let _ = window.set_position(tauri::Position::Physical(tauri::PhysicalPosition {
+                x: rect.left,
+                y: rect.top,
+            }));
+            true
+        }
+    }
+}
+
+/// 遮盖几何应用（R7 扩展/更新用）：单次 SetWindowPos 成套应用位置+尺寸，
+/// z 序按当前模式分流（与 update_clock_overlay_visibility 的应用路径同语义）。
+/// 同步 GEOM.mask、LAST_APPLIED_RECT 与 LAST_FOLLOW_POS——不同步会让收缩被
+/// 「无变化」跳过、下一轮 update 重复应用。
+fn apply_mask_geometry(window: &WebviewWindow, m: RECT) -> bool {
+    let w = m.right - m.left;
+    let h = m.bottom - m.top;
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let Some(hwnd) = get_window_hwnd(window) else {
+        return false;
+    };
+    if let Ok(mut g) = GEOM.lock() {
+        g.mask = Some(m);
+    }
+    if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
+        *last = Some(m);
+    }
+    let below = CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let insert_after = if below == OFFSCREEN_MARK {
+            None
+        } else if below == -1 {
+            Some(HWND_TOPMOST)
+        } else {
+            Some(HWND(below as *mut core::ffi::c_void))
+        };
+        let _ = SetWindowPos(hwnd, insert_after, m.left, m.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        let mut after = RECT::default();
+        let ok = GetWindowRect(hwnd, &mut after).is_ok();
+        geom_log(&format!(
+            "apply pos=({},{}) size=({w},{h}) below={below} after=({},{},{},{}) ok={ok}",
+            m.left, m.top, after.left, after.top, after.right, after.bottom
+        ));
+    }
+    if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
+        *last = Some((m.left, m.top, w, h, below));
+    }
     true
 }
 

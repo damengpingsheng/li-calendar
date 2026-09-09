@@ -69,7 +69,9 @@ unsafe fn validate_or_scale_clock_rect(rect: RECT) -> Option<RECT> {
 }
 
 /// 通过 UI Automation 在 Shell 托盘树上查找时钟控件屏幕矩形。
-pub fn get_clock_rect_via_uia() -> Option<RECT> {
+/// 返回 (矩形, 来源标签)——来源供诊断日志区分 HWND 快速路径（微秒级）与
+/// UIA 树遍历（重操作，可能数十 ms），端到端时延分析需要（评审 §3.B）。
+pub fn get_clock_rect_via_uia() -> (Option<RECT>, &'static str) {
     unsafe {
         // 优先：按时钟窗口 HWND + GetWindowRect 获取【物理像素】矩形。
         // 低级鼠标钩子 lParam 传的是【物理屏幕坐标】，而 UIA BoundingRectangle 在 DPI 缩放下
@@ -82,16 +84,23 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
                 && rect.bottom > rect.top
             {
                 if let Some(valid) = validate_or_scale_clock_rect(rect) {
-                    return Some(valid);
+                    return (Some(valid), "hwnd");
                 }
             }
         }
 
         // 原 UIA 兜底（返回值经 validate_or_scale_clock_rect 校验/DPI 修正）。
         let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
-        let hwnd_tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
-        let tray_element = automation.ElementFromHandle(hwnd_tray).ok()?;
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(a) => a,
+                Err(_) => return (None, "none"),
+            };
+        let Ok(hwnd_tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
+            return (None, "none");
+        };
+        let Ok(tray_element) = automation.ElementFromHandle(hwnd_tray) else {
+            return (None, "none");
+        };
 
         // 优先按 AutomationId「ClockButton」（Win10/11 常见）
         let automation_id_condition = automation
@@ -101,7 +110,7 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
             if let Ok(clock_element) = tray_element.FindFirst(TreeScope_Descendants, &condition) {
                 if let Ok(rect) = clock_element.CurrentBoundingRectangle() {
                     if let Some(valid) = validate_or_scale_clock_rect(rect) {
-                        return Some(valid);
+                        return (Some(valid), "uia-autoid");
                     }
                 }
             }
@@ -118,22 +127,28 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
             if let Ok(clock_element) = tray_element.FindFirst(TreeScope_Descendants, &condition) {
                 if let Ok(rect) = clock_element.CurrentBoundingRectangle() {
                     if let Some(valid) = validate_or_scale_clock_rect(rect) {
-                        return Some(valid);
+                        return (Some(valid), "uia-class");
                     }
                 }
             }
         }
 
-        None
+        (None, "none")
     }
 }
 
 /// 将 UIA 得到的时钟矩形写入 [`super::state::CLOCK_AREA_RECT_CACHE`]。
 pub fn update_clock_area_cache() {
-    if let Some(rect) = get_clock_rect_via_uia() {
+    let started = std::time::Instant::now();
+    let (probed, src) = get_clock_rect_via_uia();
+    if let Some(rect) = probed {
         clockrect_log(&format!(
-            "uia rect=({},{},{},{})",
-            rect.left, rect.top, rect.right, rect.bottom
+            "uia rect=({},{},{},{}) src={src} ms={:.1}",
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            started.elapsed().as_secs_f32() * 1000.0
         ));
         persist_clock_rect(&rect);
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
