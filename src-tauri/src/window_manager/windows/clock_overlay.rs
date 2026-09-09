@@ -373,18 +373,27 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 /// R7 扩展即时化（与收缩对称）：不收缩的场合若原生观测偏离认可位且现有
 /// 遮盖盖不住它，立即把遮盖更新为新并集——原实现此分支直接 return，新
 /// 偏离要等下一轮 update 才生效，扩展比收缩慢一个轮询周期。
+/// R7.1 Covered 相位即时展开：重探线程的调用序是 update_visibility（tick N
+/// 探测）→ UIA 读数 → relocate——读数若显示原生已偏离而遮盖未展开，本函数
+/// 原先直接 return，展开要等下一轮 tick（≤150ms），期间原生时钟左段残块
+/// （3618..3660）暴露在认可位覆盖层左侧（23:50 真机实测每趟摆动都有
+/// ~150-300ms 暴露窗）。读数到达即唤起可见性管理完成展开，暴露窗压到
+/// 探测耗时级（~70ms，UIA 查询延迟为下限）。
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
-    let (endorsed, phase_is_normal, mask, shrink_requested, native) = match GEOM.lock() {
-        Ok(g) => (
-            g.endorsed,
-            g.phase == GeomPhase::Normal,
-            g.mask,
-            g.shrink_requested,
-            g.native_observed,
-        ),
+    let (endorsed, phase, mask, shrink_requested, native) = match GEOM.lock() {
+        Ok(g) => (g.endorsed, g.phase, g.mask, g.shrink_requested, g.native_observed),
         Err(_) => return,
     };
-    if !phase_is_normal {
+    if phase == GeomPhase::Covered {
+        if mask.is_none() {
+            if let (Some(e), Some(n)) = (endorsed, native) {
+                if !rect_eq(Some(n), Some(e)) {
+                    // 原生偏离证据已到手而遮盖未展开：立即展开（内含探测、
+                    // 遮盖构建与成套应用；若无盖住者则走 Visible 分支路径）
+                    update_clock_overlay_visibility(app_handle);
+                }
+            }
+        }
         return;
     }
     if !shrink_requested {
