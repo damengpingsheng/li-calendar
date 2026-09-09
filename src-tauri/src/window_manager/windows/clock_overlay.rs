@@ -40,6 +40,12 @@ static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, i32, i32, isize)>> = Mutex::new(
 static CURRENT_BELOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 /// 「退出全屏自愈」进行中标记（防重复 spawn 治疗线程）。
 static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 覆盖层已完成首次贴合（attach）标记（R7.3）：attach 前窗口仍是 builder
+/// 逻辑尺寸（170×52 逻辑 = 298×91 物理 @175%），visibility 兜底/WinEvent
+/// 若在 attach 的 500ms 重试间隙应用几何（NOSIZE+SHOWWINDOW），窗口会以
+/// 过宽尺寸闪现、右缘伸进「显示桌面」区（02:03:19 实测）。attach 前只
+/// 维护状态机，不做窗口操作。
+static ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// 覆盖层几何状态机阶段（P1+P2）。
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -79,6 +85,13 @@ struct GeomState {
     visible_since: Option<std::time::Instant>,
     /// 最近一次盖住者的窗口句柄（去抖等待期保持潜入 z 序用）
     last_cover: Option<isize>,
+    /// 全屏位形记忆（R7.2）：跨退出轮保留的最后一次**非认可位**原生观测。
+    /// 收缩时 native_observed 立即清空，但此字段保留——下一轮 Covered 探测
+    /// 当轮即可按它展开遮盖，不等首针 UIA（帧取证 01:57 实测：暴露窗
+    /// 191~323ms 期间原生时钟文字残块/托盘气泡可见，是真机残余感知主体；
+    /// 全屏位形逐轮稳定 (3607,2076,3770,2160)，预测可靠）。endorsed 采纳后
+    /// 若与记忆同值，union 会等于 endorsed 自然失效，无需专门清理。
+    last_native_layout: Option<RECT>,
 }
 
 static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
@@ -93,6 +106,7 @@ static GEOM: Mutex<GeomState> = Mutex::new(GeomState {
     last_probe_visible: None,
     visible_since: None,
     last_cover: None,
+    last_native_layout: None,
 });
 
 /// 采纳门：与认可位不同的候选需**持续存在 ≥8s** 才采纳——
@@ -187,6 +201,11 @@ pub fn clock_overlay_note_probe(rect: RECT) {
         // 跨相位翻转保留（R5）：PotPlayer 退出动画使相位以 ~1.4s 周期
         // Covered↔Visible 回摆，逐轮清空会把回摆证据丢掉、遮盖展开延迟整轮。
         g.native_observed = Some(rect);
+        // R7.2 全屏位形记忆：非认可位读数即位形证据，跨轮保留供下轮
+        // Covered 预测展开（收缩清 native_observed 不清此字段）。
+        if !rect_eq(g.endorsed, Some(rect)) {
+            g.last_native_layout = Some(rect);
+        }
         // UIA 读到认可位：原生真实归位，立即请求收缩（R6 实时跟踪）。
         // 退出动画期原生位置逐读数回摆（23:39 实测 3618↔3660 四个来回），
         // 任何"稳定 N 次才缩"的守门都会让左缘在原生已归位后继续撑着——
@@ -232,6 +251,9 @@ pub fn clock_overlay_note_probe(rect: RECT) {
     if g.mask.is_some() || g.native_observed.is_some() || in_exit_watch {
         g.native_observed = Some(rect);
         g.shrink_requested = false;
+        if !rect_eq(g.endorsed, Some(rect)) {
+            g.last_native_layout = Some(rect);
+        }
     }
     // 与认可位不同：走采纳门（候选需持续存在 ≥8s），绝不即时采纳——
     // 退出全屏的过渡期宽矩形/全屏期布局值就是这么混进去的（实测）；
@@ -340,6 +362,7 @@ pub fn ensure_clock_overlay_attached(app_handle: &AppHandle) {
             if apply_overlay_geometry(&window, &rect) {
                 if let Some(hwnd) = get_window_hwnd(&window) {
                     show_overlay_above_taskbar(hwnd);
+                    ATTACHED.store(true, std::sync::atomic::Ordering::SeqCst);
                     crate::dbg_log(&format!(
                         "clock overlay: attached at attempt {attempt} rect=({},{})-({},{})",
                         rect.left, rect.top, rect.right, rect.bottom
@@ -634,6 +657,12 @@ fn taskbar_cover_probe() -> TrayCover {
 /// 的瞬间覆盖层已在原位、内容已在，零空窗。
 /// 由 WinEvent 与 500ms 兜底线程调用。
 pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
+    // R7.3：attach 前窗口尺寸未按认可矩形设置，任何几何应用都会以
+    // builder 逻辑尺寸（298×91 物理）呈现——直接跳过，只让状态机等
+    // attach 后的首次 relocate 收敛。
+    if !ATTACHED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
         return;
     };
@@ -685,17 +714,27 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 }
             }
             // N1 掩盖预备（评审 §3.3 修正）：遮盖目标 = 已展开 mask 优先，
-            // 否则本轮新观测的原生位置与认可位取并集。保持遮盖必须位置+尺寸
-            // 成套应用——只回左缘不缩宽会让窗口变成"认可左缘+遮盖宽度"，
-            // 右缘冲进「显示桌面」区（盖住相邻图标，用户实测）。
+            // 否则本轮新观测的原生位置与认可位取并集；R7.2 补全屏位形记忆
+            // （跨轮保留的最后非认可位观测）作最终回退——进全屏头一秒
+            // 首针 UIA 未到时即可展开，消除 191~323ms 残块暴露窗。保持遮盖
+            // 必须位置+尺寸成套应用——只回左缘不缩宽会让窗口变成"认可左缘
+            // +遮盖宽度"，右缘冲进「显示桌面」区（盖住相邻图标，用户实测）。
             let cur_mask = GEOM.lock().ok().and_then(|g| g.mask);
-            let native = GEOM.lock().ok().and_then(|g| g.native_observed);
+            let native = GEOM
+                .lock()
+                .ok()
+                .and_then(|g| g.native_observed.or(g.last_native_layout));
             let mask_target = cur_mask.or_else(|| {
                 native.and_then(|n| {
                     let u = union_rect(endorsed, n);
                     (!rect_eq(Some(u), Some(endorsed))).then_some(u)
                 })
             });
+            if cur_mask.is_none() {
+                geom_log(&format!(
+                    "covered-fallback: native={native:?} target={mask_target:?}"
+                ));
+            }
             if let Some(m) = mask_target {
                 if let Ok(mut g) = GEOM.lock() {
                     if !rect_eq(g.mask, Some(m)) {
@@ -789,6 +828,12 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             // note_probe 置位收缩请求后执行。
             let mut mask_now = GEOM.lock().ok().and_then(|g| g.mask);
             if mask_now.is_none() {
+                // 只信当轮真实观测（R7.1 语义，R7.4 恢复）：全屏位形记忆
+                // （last_native_layout）绝不能在这里做 fallback——退出稳态/
+                // 观测窗内收缩刚清空观测，用记忆重建会与下一针收缩形成
+                // 「收缩→重建」死循环（02:17:31 诊断行实测同毫秒发生）。
+                // 预测展开是 Covered 分支的职责（那边有盖住者压着，多盖
+                // 42px 底色在安全侧且色差 <2 不可见）。
                 let native = GEOM.lock().ok().and_then(|g| g.native_observed);
                 if let Some(n) = native {
                     if !rect_eq(Some(n), Some(endorsed)) {
