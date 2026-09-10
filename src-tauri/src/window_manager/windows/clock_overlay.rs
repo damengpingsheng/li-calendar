@@ -40,6 +40,15 @@ static LAST_FOLLOW_POS: Mutex<Option<(i32, i32, i32, i32, isize)>> = Mutex::new(
 static CURRENT_BELOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(-1);
 /// 「退出全屏自愈」进行中标记（防重复 spawn 治疗线程）。
 static EXIT_HEALING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// 几何应用串行锁（R8.1）：relocate 收缩路径与 update 可见性路径在不同线程
+/// 并发应用几何时，可能以各自**刚读取的状态**交错 SetWindowPos——00:56:49.120
+/// 实测竞态序列：WinEvent 线程按读取时仍在场的遮盖贴 212 宽，收缩线程尾随的
+/// 常规跟随带 SWP_NOSIZE 落在 endorsed 左缘 → 窗口=「endorsed 左缘+遮盖宽度」
+/// (3649..3861)，右缘冲出屏幕 21px（用户截图「时钟跑到任务栏最右侧」）；
+/// 且变化检测元组记的是 NOSIZE 标志而非窗口实际尺寸，错误尺寸被判「无变化」
+/// 无限驻留（实测卡 16.6s 直到下轮全屏才被遮盖全尺寸应用治愈）。锁序恒为
+/// 本锁→GEOM（note_probe/轮询节奏只取 GEOM，无反向依赖，无死循环风险）。
+static GEOM_APPLY_LOCK: Mutex<()> = Mutex::new(());
 /// 覆盖层已完成首次贴合（attach）标记（R7.3）：attach 前窗口仍是 builder
 /// 逻辑尺寸（170×52 逻辑 = 298×91 物理 @175%），visibility 兜底/WinEvent
 /// 若在 attach 的 500ms 重试间隙应用几何（NOSIZE+SHOWWINDOW），窗口会以
@@ -407,9 +416,19 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 /// ~150-300ms 暴露窗）。读数到达即唤起可见性管理完成展开，暴露窗压到
 /// 探测耗时级（~70ms，UIA 查询延迟为下限）。
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
+    // R8.1：几何应用持串行锁执行；可见性管理自取同一把锁，必须锁外调用
+    if relocate_geometry_locked(app_handle) {
+        update_clock_overlay_visibility(app_handle);
+    }
+}
+
+/// relocate 几何本体（持 [`GEOM_APPLY_LOCK`]）。返回是否需要随后调用可见性
+/// 管理——锁内不可重入调用 update（std Mutex 不可重入，会自锁死）。
+fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
+    let _apply_guard = GEOM_APPLY_LOCK.lock();
     let (endorsed, phase, mask, shrink_requested, native) = match GEOM.lock() {
         Ok(g) => (g.endorsed, g.phase, g.mask, g.shrink_requested, g.native_observed),
-        Err(_) => return,
+        Err(_) => return false,
     };
     if phase == GeomPhase::Covered {
         if mask.is_none() {
@@ -417,11 +436,11 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
                 if !rect_eq(Some(n), Some(e)) {
                     // 原生偏离证据已到手而遮盖未展开：立即展开（内含探测、
                     // 遮盖构建与成套应用；若无盖住者则走 Visible 分支路径）
-                    update_clock_overlay_visibility(app_handle);
+                    return true;
                 }
             }
         }
-        return;
+        return false;
     }
     if !shrink_requested {
         if let (Some(endorsed), Some(native)) = (endorsed, native) {
@@ -429,7 +448,7 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
                 let u = union_rect(endorsed, native);
                 if !rect_eq(mask, Some(u)) {
                     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
-                        return;
+                        return false;
                     };
                     if apply_mask_geometry(&window, u) {
                         crate::dbg_log(&format!(
@@ -437,25 +456,25 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
                             u.left, u.top, u.right, u.bottom
                         ));
                     }
-                    return;
+                    return false;
                 }
                 if mask.is_some() {
                     // 并集未变（旧遮盖已盖住新观测）：维持现状
-                    return;
+                    return false;
                 }
             }
         }
     }
     if mask.is_some() && !shrink_requested {
-        return; // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
+        return false; // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
     }
-    let Some(endorsed) = endorsed else { return };
-    let Some(window) = app_handle.get_webview_window("clock_overlay") else { return };
+    let Some(endorsed) = endorsed else { return false };
+    let Some(window) = app_handle.get_webview_window("clock_overlay") else { return false };
     if mask.is_some() {
         crate::dbg_log("clockrect: shrink (native endorsed)");
     }
     if !apply_overlay_geometry(&window, &endorsed) {
-        return;
+        return false;
     }
     if let Ok(mut g) = GEOM.lock() {
         g.mask = None;
@@ -467,12 +486,15 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
                 std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WATCH_MS),
             );
             // R8：收缩执行点即时采样——UIA 已读到原生归位，采样条大概率已
-            // 露出，成功则色差窗从「400ms 兜底」缩到一次采样+一帧渲染级；
-            // 归属校验挡住残影竞态（被拒则靠下面的兜底）。
+            // 露出，成功则色差窗从「兜底」缩到一次采样+一帧渲染级；归属校验
+            // 挡住残影竞态（被拒则靠下面的兜底）。退出窗口期只保留这三个
+            // 事后时机（R8.1 撤掉 z-reclaim/visible-switch/mask-held-tick
+            // 活跃采样：00:56 实测过渡态亚克力被视频透出污染，采样在
+            // #F1E4DB↔#E7D8CD 间翻转推送=用户残余色差；稳态色由 15s 保鲜
+            // 维持，退出期信任它即可）；+1500ms 补采慢收敛亚克力。
             refresh_clock_overlay_appearance(app_handle, 0, "post-shrink-now");
-            // R7.6 兜底：收缩后等合成稳定再采一次（即时那次可能被残影/归属
-            // 校验拒绝）
             refresh_clock_overlay_appearance(app_handle, 400, "post-shrink-400");
+            refresh_clock_overlay_appearance(app_handle, 1500, "post-shrink-1500");
         }
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
@@ -510,7 +532,8 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
     }
     // 可见性统一走跟随管理：覆盖层曾因矩形未就绪保持隐藏（如启动时任务栏正
     // 收起、UIA 探测失败），矩形就绪后由这里恢复显示或按全屏/滑出态维持隐藏。
-    update_clock_overlay_visibility(app_handle);
+    // （由持锁外层 relocate_clock_overlay_endorsed 调用，此处只报告需求）
+    true
 }
 
 /// 任务栏当前状态：是否完全滑出屏幕 + 相对静止位的位移（滑入/滑出动画的实时偏移）。
@@ -674,6 +697,10 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     if !ATTACHED.load(std::sync::atomic::Ordering::SeqCst) {
         return;
     }
+    // R8.1：与 relocate 收缩路径串行化（锁序：本锁→GEOM）。WinEvent 线程/
+    // 500ms 轮询线程/重探线程三方并发应用几何的交叉竞态曾把窗口落成
+    // 「endorsed 左缘+遮盖宽度」（右缘 3861 出屏，见 GEOM_APPLY_LOCK 注释）。
+    let _apply_guard = GEOM_APPLY_LOCK.lock();
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
         return;
     };
@@ -702,7 +729,9 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     let Some(endorsed) = endorsed else {
         return;
     };
-    // 状态五元组：(x, y, 宽, 高, 插入到谁之后)。宽高为 0 = 保持尺寸（NOSIZE），
+    // 状态五元组：(x, y, 宽, 高, 插入到谁之后)。R8.1 起宽高恒传全尺寸
+    // （弃 NOSIZE：交叉竞态留下的错误尺寸会因变化检测命中「无变化」而永久
+    // 驻留；显式尺寸让任何后写者自愈），
     // -1 = 常规 topmost，OFFSCREEN_MARK = 屏外。位置一律从认可矩形/遮盖矩形取，
     // 缓存矩形只进状态机不进几何。
     let (target_x, target_y, target_w, target_h, below) = match taskbar_cover_probe() {
@@ -769,7 +798,14 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     cover.0 as isize,
                 )
             } else {
-                (endorsed.left, endorsed.top, 0, 0, cover.0 as isize)
+                // R8.1：全尺寸（弃 NOSIZE，理由见 Visible 分支注释）
+                (
+                    endorsed.left,
+                    endorsed.top,
+                    endorsed.right - endorsed.left,
+                    endorsed.bottom - endorsed.top,
+                    cover.0 as isize,
+                )
             }
         }
         TrayCover::Visible => {
@@ -818,13 +854,12 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                                         if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
                                             *last = None;
                                         }
-                                        // R8：盖住者让位的最早信号（时钟中心已命中
-                                        // 任务栏/自己）——不等 UIA、不等去抖，立即
-                                        // 请求换色。此去抖等待期最长 300ms，早于
-                                        // Visible 切换点；此刻采样条若已被回缩中的
-                                        // 盖住者放开，归属校验放行，色差窗再前移
-                                        // 一个去抖量。
-                                        refresh_clock_overlay_appearance(app_handle, 0, "z-reclaim");
+                                        // R8.1 撤销此处的即时采样（R8 引入）：退出
+                                        // 过渡期亚克力透出内容正从视频切回壁纸，
+                                        // 活跃采样采到过渡色并推送，与随后的稳态
+                                        // 色来回翻转（00:56 实测 seq=2~11 全部
+                                        // src=z-reclaim）=用户残余色差来源。退出
+                                        // 期信任 15s 保鲜的稳态色，收缩后再采。
                                     }
                                 }
                             }
@@ -837,11 +872,9 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                         "clockrect: phase->normal (exit cover, endorsed ({},{},{},{}), mask held)",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
-                    // R7.6：退出确认 Visible 的瞬间换色——遮盖还在场（等 UIA
-                    // 认可位才收缩），先把底色换成当前任务栏本色，收缩过程
-                    // 全程无色差条；采样点在遮盖右缘外 3px，此刻露出的是真
-                    // 任务栏区域
-                    refresh_clock_overlay_appearance(app_handle, 0, "visible-switch");
+                    // R8.1 撤销 R7.6 的「退出确认 Visible 瞬间换色」：同上，
+                    // 此刻亚克力仍在过渡态，采样推送的是过渡色；稳态色已由
+                    // 15s 保鲜维持（且收缩后有 0/400/1500ms 三连采兜底）。
                 }
             }
             // 遮盖保持期（R6 实时跟踪）：退出轮回摆期探测可能直接 Visible 而原生
@@ -876,35 +909,39 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 }
             }
             if let Some(m) = mask_now {
-                // R7.6：遮盖在场（等收缩/回摆保持）的每一针都尝试换色——
-                // 收缩可能走 fast-path（UIA 读到认可位直接缩，绕过去抖切换
-                // 点），这里兜住所有路径：遮盖撑着时段底色始终新鲜，收缩
-                // 过程无色差条。变化检测（≥3 RGB）自带节流，采样点归属
-                // 校验挡播放器残影竞态。
-                refresh_clock_overlay_appearance(app_handle, 0, "mask-held-tick");
+                // R8.1 撤销 R7.6 的「遮盖在场每针换色」：回摆撑盖期的亚克力
+                // 同样处于过渡态（盖住者残影/回缩动画），逐针采样只会推送
+                // 翻转色。稳态色由 15s 保鲜跨全屏维持，收缩后三连采兜底。
                 // 全尺寸成套应用（含首次展开针），不做 NOSIZE——首次展开若只
                 // 移位，158 宽窗口盖不全 3618-3769 残块
                 (m.left, m.top, m.right - m.left, m.bottom - m.top, -1)
             } else {
+                // R8.1：常规/屏外分支一律传全尺寸——SWP_NOSIZE 会把「窗口实际
+                // 尺寸」从应用链路里豁免，交叉竞态留下的错误尺寸（3649..3861）
+                // 因变化检测命中「无变化」而永久驻留；显式传尺寸让任何后写者
+                // 都自愈为正确几何。
+                let (ew, eh) = (endorsed.right - endorsed.left, endorsed.bottom - endorsed.top);
                 match read_tray_state() {
                     // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
                     // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
                     Some(state) if state.fully_hidden || !state.ready => {
-                        (offscreen_x(endorsed.right), endorsed.top, 0, 0, OFFSCREEN_MARK)
+                        (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK)
                     }
                     Some(state) => {
-                        (endorsed.left + state.dx, endorsed.top + state.dy, 0, 0, -1)
+                        (endorsed.left + state.dx, endorsed.top + state.dy, ew, eh, -1)
                     }
-                    None => (offscreen_x(endorsed.right), endorsed.top, 0, 0, OFFSCREEN_MARK),
+                    None => (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK),
                 }
             }
         }
         // 探测失败：退回矩形全屏判定；全屏则移出屏幕，否则常规显示
+        // （R8.1：全尺寸，弃 NOSIZE）
         TrayCover::Unknown => {
+            let (ew, eh) = (endorsed.right - endorsed.left, endorsed.bottom - endorsed.top);
             if crate::windows_hook::is_foreground_fullscreen() {
-                (offscreen_x(endorsed.right), endorsed.top, 0, 0, OFFSCREEN_MARK)
+                (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK)
             } else {
-                (endorsed.left, endorsed.top, 0, 0, -1)
+                (endorsed.left, endorsed.top, ew, eh, -1)
             }
         }
     };
@@ -1295,17 +1332,19 @@ static APPEARANCE_WORKERS_STARTED: std::sync::atomic::AtomicBool =
 /// 底色动态跟随请求入口（R7.5 建立，R8 改为合并调度）。`delay_ms` 为 0 表示
 /// 立即，`src` 仅供诊断日志区分调用方。
 ///
-/// 时机全景（R7.6 三层 + R8 两个提前点 + 正常态保鲜）：
-/// - **z-reclaim 早信号（R8）**：去抖等待期时钟中心已命中任务栏/自己 = 盖住者
-///   让位的最早信号，不等 UIA、不等去抖即请求换色（评审：颜色恢复独立于
-///   几何探测；归属校验挡住「条还没露出」的无效采样）；
-/// - **退出确认 Visible 切换点（delay=0）**：去抖已确认任务栏持续可见；
-/// - **遮盖在场每针尝试（delay=0）**：覆盖回摆撑盖主时段，逐针保持底色新鲜；
-/// - **收缩执行点即时（R8）+ 收缩后 400ms 兜底**：原生已归位先采一次，
-///   合成稳定后再校一次（即时那次可能被残影/归属校验拒绝）；
-/// - **正常态 15s 可信色保鲜（R8，评审 §4.1.1）**：任务栏可见的稳态下轻采，
-///   亚克力/壁纸缓变时覆盖层色不再渐旧，会话首轮退出时的底色也不再陈旧
-///   （复验⑤「偶发色差」的主候选）。
+/// 时机全景（R8.1 收敛后）：
+/// - **attach 即刻**：前端过渡色（主题近似值）换真色，并点火 worker/保鲜线程；
+/// - **收缩执行点三连采（0 / 400 / 1500ms）**：原生归位即采、合成稳定再校、
+///   慢收敛亚克力最后兜底——这是退出期**唯一**的采样时机；
+/// - **正常态 15s 可信色保鲜**：任务栏可见的稳态下轻采，亚克力/壁纸缓变时
+///   覆盖层色不再渐旧，会话首轮退出时的底色也不再陈旧。
+///
+/// R8.1 重要教训（撤销 R8/R7.6 的退出窗口期活跃采样 z-reclaim /
+/// visible-switch / mask-held-tick）：退出过渡期任务栏亚克力的透出内容正从
+/// 视频切回壁纸，**真实任务栏本色本身在变**，活跃采样采到的是过渡色且与
+/// 稳态色来回翻转推送（00:56 真机实测 seq=2~11 连续翻转）——这本身就是
+/// 用户可见的残余色差。退出期信任保鲜维持的稳态色（=进全屏前的本色，通常
+/// 与收敛后的稳态一致），只在世界稳定后采样采纳。
 pub fn refresh_clock_overlay_appearance(app_handle: &AppHandle, delay_ms: u64, src: &'static str) {
     let due = std::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
     let spawn = {
