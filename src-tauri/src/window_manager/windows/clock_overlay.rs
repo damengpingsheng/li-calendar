@@ -462,8 +462,9 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
             g.exit_watch_until = Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WATCH_MS),
             );
-            // R7.5：收缩后任务栏本色重新露出，此刻采样即下轮遮盖的真实底色
-            refresh_clock_overlay_appearance(app_handle);
+            // R7.6 兜底：收缩后等合成稳定再采一次（退出切换时那次可能被
+            // 残影/归属校验拒绝）
+            refresh_clock_overlay_appearance(app_handle, 400);
         }
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
@@ -821,6 +822,11 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                         "clockrect: phase->normal (exit cover, endorsed ({},{},{},{}), mask held)",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
+                    // R7.6：退出确认 Visible 的瞬间换色——遮盖还在场（等 UIA
+                    // 认可位才收缩），先把底色换成当前任务栏本色，收缩过程
+                    // 全程无色差条；采样点在遮盖右缘外 3px，此刻露出的是真
+                    // 任务栏区域
+                    refresh_clock_overlay_appearance(app_handle, 0);
                 }
             }
             // 遮盖保持期（R6 实时跟踪）：退出轮回摆期探测可能直接 Visible 而原生
@@ -855,6 +861,12 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 }
             }
             if let Some(m) = mask_now {
+                // R7.6：遮盖在场（等收缩/回摆保持）的每一针都尝试换色——
+                // 收缩可能走 fast-path（UIA 读到认可位直接缩，绕过去抖切换
+                // 点），这里兜住所有路径：遮盖撑着时段底色始终新鲜，收缩
+                // 过程无色差条。变化检测（≥3 RGB）自带节流，采样点归属
+                // 校验挡播放器残影竞态。
+                refresh_clock_overlay_appearance(app_handle, 0);
                 // 全尺寸成套应用（含首次展开针），不做 NOSIZE——首次展开若只
                 // 移位，158 宽窗口盖不全 3618-3769 残块
                 (m.left, m.top, m.right - m.left, m.bottom - m.top, -1)
@@ -1198,15 +1210,22 @@ static LAST_PUSHED_BG: Mutex<Option<(u8, u8, u8)>> = Mutex::new(None);
 ///
 /// 时机收敛（三处竞态实测教训）：①盖住者在场采样必被视频污染（22:11:02
 /// 采出 #00FFFD）②探测 Visible 到采样之间视频盖上（22:18:01 采出 #67EDE8）
-/// ③退出后合成残影（22:18:10 收缩后 39ms 采出 #C8F2EF）。因此只在**收缩
-/// 完成后**调用（此时任务栏确认露出），且延迟 400ms 等桌面合成稳定、采样
-/// 前再验一次 CURRENT_BELOW。
-pub fn refresh_clock_overlay_appearance(app_handle: &AppHandle) {
+/// ③退出后合成残影（22:18:10 收缩后 39ms 采出 #C8F2EF）。
+/// R7.6 两个采样时机：
+/// - **退出确认 Visible 瞬间（delay=0）**：去抖已确认任务栏持续可见，采样点
+///   （遮盖右缘之外 3px）露出的是真任务栏色——此刻遮盖还在场，先换色再
+///   收缩，消除「遮盖撑着时段的旧色 vs 任务栏本色」色差条（用户复验④
+///   报告：色差在收缩完成后才消失，从有到无的过程可见——即旧色遮盖
+///   撑到了收缩）；
+/// - **收缩完成后（delay=400）**：等桌面合成稳定的兜底。
+pub fn refresh_clock_overlay_appearance(app_handle: &AppHandle, delay_ms: u64) {
     let app = app_handle.clone();
     std::thread::Builder::new()
         .name("clock-appearance-refresh".into())
         .spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(400));
+            if delay_ms > 0 {
+                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+            }
             // 延迟期间若再次进全屏（潜入/屏外），放弃本次采样
             if CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst) != -1 {
                 return;
