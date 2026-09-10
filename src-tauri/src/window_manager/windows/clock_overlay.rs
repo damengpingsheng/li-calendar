@@ -6,7 +6,7 @@
 //! 点击仍由低级钩子整体吞掉（Phase 2 才交接输入），交互行为零变化。
 //! 几何贴合复用 UIA 时钟矩形缓存；探测失败时保持隐藏——原生时钟兜底。
 use std::sync::Mutex;
-use tauri::{AppHandle, Manager, WebviewWindow};
+use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows::core::w;
 use windows::Win32::Foundation::{HWND, RECT};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
@@ -462,6 +462,8 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
             g.exit_watch_until = Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WATCH_MS),
             );
+            // R7.5：收缩后任务栏本色重新露出，此刻采样即下轮遮盖的真实底色
+            refresh_clock_overlay_appearance(app_handle);
         }
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
@@ -1112,6 +1114,24 @@ fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
         let y_mid = (tray_rect.top + tray_rect.bottom) / 2;
         let y_top = tray_rect.top + (tray_rect.bottom - tray_rect.top) / 4;
         let y_bot = tray_rect.bottom - (tray_rect.bottom - tray_rect.top) / 4;
+        // R7.5 采样点归属校验：每个采样列的命中窗口必须是任务栏自身——
+        // 探测 Visible 到执行采样之间盖住者可能恰好出现（22:13:45.562 实测
+        // 竞态采出视频青色 #67EDE8），像素归属是唯一可信的真值判定。
+        for dx in [3i32, 8, 13] {
+            let sx = clock.right + dx;
+            if sx >= screen_right - 1 {
+                break;
+            }
+            let hit = WindowFromPoint(windows::Win32::Foundation::POINT { x: sx, y: y_mid });
+            let root = if hit.0.is_null() {
+                HWND::default()
+            } else {
+                GetAncestor(hit, GA_ROOT)
+            };
+            if hit != tray && root != tray {
+                return None; // 采样点被盖住者/其他窗口占据，宁可不采
+            }
+        }
         let dc = GetDC(None);
         let mut sum = (0u32, 0u32, 0u32);
         let mut count = 0u32;
@@ -1166,4 +1186,61 @@ pub fn clock_overlay_appearance_colors() -> (String, String) {
         bg.0, bg.1, bg.2
     ));
     (format!("#{:02X}{:02X}{:02X}", bg.0, bg.1, bg.2), fg.to_string())
+}
+
+/// 最近一次推送给前端的底色（RGB）——变化检测，未变不重复推送。
+static LAST_PUSHED_BG: Mutex<Option<(u8, u8, u8)>> = Mutex::new(None);
+
+/// 底色动态跟随（R7.5）：任务栏底色随亚克力/壁纸/系统状态动态变化（实测
+/// 00:06 采出 #F3F3F3、02:03 采出 #E7D8CD——同一台机器两个时段差 30+RGB），
+/// 而覆盖层此前只在启动/主题切换时采样，色差期间遮盖边界全程可见（用户
+/// 报告情况2）、色差小则剩 1px 边缘抗锯齿与文字重栅格化（情况1）。
+///
+/// 时机收敛（三处竞态实测教训）：①盖住者在场采样必被视频污染（22:11:02
+/// 采出 #00FFFD）②探测 Visible 到采样之间视频盖上（22:18:01 采出 #67EDE8）
+/// ③退出后合成残影（22:18:10 收缩后 39ms 采出 #C8F2EF）。因此只在**收缩
+/// 完成后**调用（此时任务栏确认露出），且延迟 400ms 等桌面合成稳定、采样
+/// 前再验一次 CURRENT_BELOW。
+pub fn refresh_clock_overlay_appearance(app_handle: &AppHandle) {
+    let app = app_handle.clone();
+    std::thread::Builder::new()
+        .name("clock-appearance-refresh".into())
+        .spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(400));
+            // 延迟期间若再次进全屏（潜入/屏外），放弃本次采样
+            if CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst) != -1 {
+                return;
+            }
+            let Some(sampled) = sample_taskbar_pixel() else {
+                return;
+            };
+            if let Ok(mut last) = LAST_PUSHED_BG.lock() {
+                if let Some(prev) = *last {
+                    let d = (prev.0 as i32 - sampled.0 as i32).abs().max(
+                        (prev.1 as i32 - sampled.1 as i32)
+                            .abs()
+                            .max((prev.2 as i32 - sampled.2 as i32).abs()),
+                    );
+                    if d < 3 {
+                        return; // 低于可感知阈值不推送，避免反复重绘
+                    }
+                }
+                *last = Some(sampled);
+            }
+            let luminance =
+                0.2126 * sampled.0 as f64 + 0.7152 * sampled.1 as f64 + 0.0722 * sampled.2 as f64;
+            let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
+            crate::dbg_log(&format!(
+                "clockrect: appearance refresh bg=#{:02X}{:02X}{:02X}",
+                sampled.0, sampled.1, sampled.2
+            ));
+            let _ = app.emit(
+                "clock-appearance",
+                serde_json::json!({
+                    "bg": format!("#{:02X}{:02X}{:02X}", sampled.0, sampled.1, sampled.2),
+                    "fg": fg,
+                }),
+            );
+        })
+        .ok();
 }

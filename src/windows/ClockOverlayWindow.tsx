@@ -3,6 +3,7 @@ import dayjs from 'dayjs';
 import 'dayjs/locale/zh-cn';
 import { Solar } from 'lunar-typescript';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { fetchWeatherText } from '../http/weather';
 
 dayjs.locale('zh-cn');
@@ -46,9 +47,15 @@ function ClockOverlayWindow(): React.JSX.Element {
     };
     loadAppearance();
     media.addEventListener('change', onChange);
+    // R7.5：后端在遮盖展开/收缩后重采样，色变时推送（任务栏底色随亚克力
+    // /壁纸动态变化，静态采样会留色差——遮盖边界全程可见）
+    const unlisten = listen<ClockOverlayAppearance>('clock-appearance', (event) => {
+      setAppearance(event.payload);
+    });
     return () => {
       clearInterval(timer);
       media.removeEventListener('change', onChange);
+      void unlisten.then((fn) => fn());
     };
   }, []);
 
