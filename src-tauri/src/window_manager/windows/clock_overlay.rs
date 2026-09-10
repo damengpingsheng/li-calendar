@@ -56,6 +56,11 @@ static GEOM_APPLY_LOCK: Mutex<()> = Mutex::new(());
 /// 维护状态机，不做窗口操作。
 static ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// 覆盖层自身 HWND 缓存（R8.2 闭环校准用）：内部点（覆盖层右缘内 2px）的
+/// 归属校验必须命中本窗口根——保证读到的「我们实际显示色」确实出自覆盖层，
+/// 而不是同位置的其他内容。
+static OVERLAY_HWND: Mutex<Option<isize>> = Mutex::new(None);
+
 /// 覆盖层几何状态机阶段（P1+P2）。
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GeomPhase {
@@ -372,6 +377,9 @@ pub fn ensure_clock_overlay_attached(app_handle: &AppHandle) {
                 if let Some(hwnd) = get_window_hwnd(&window) {
                     show_overlay_above_taskbar(hwnd);
                     ATTACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    if let Ok(mut h) = OVERLAY_HWND.lock() {
+                        *h = Some(hwnd.0 as isize);
+                    }
                     crate::dbg_log(&format!(
                         "clock overlay: attached at attempt {attempt} rect=({},{})-({},{})",
                         rect.left, rect.top, rect.right, rect.bottom
@@ -1176,7 +1184,14 @@ unsafe fn sample_point_owned(pt: (i32, i32), tray: HWND) -> bool {
 /// 半覆盖的气泡/残影会拉高散度——宁可不采保留旧色，不推送污染值）。
 /// 失败原因经 geom_log 记入诊断。三道闸都不代表像素真值的充分证明，
 /// 但把已知竞态（#00FFFD/#67EDE8/#C8F2EF 三采样污染实测）全部挡住。
-fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
+/// R8.2 闭环校准（修「细微色差持续不恢复」）：返回 `(外部色, 内部色)`。
+/// 内部色 = 覆盖层右缘内 2px 的屏幕像素（三点中位）——即**我们推送色的实际
+/// 显示效果**。开环链路（外部采样 vs 推送值）自洽时日志全是 unchanged，但
+/// 用户仍见持续色差（复验⑦）——偏差位于「推送色→屏幕呈现」之间（WebView2
+/// /DWM 色彩管理、采样条与时钟区的横向底色差等），开环结构性观测不到。
+/// 内外部之差就是用户肉眼所见色差，由 run_appearance_sample 反馈到推送值。
+/// 内部点归属必须命中覆盖层自身（滑动跟随中/被盖时拒绝→None→退化纯开环）。
+fn sample_taskbar_pixel() -> Option<((u8, u8, u8), Option<(u8, u8, u8)>)> {
     unsafe {
         // 采样锚点：当前实际应用矩形右缘（恒在覆盖层窗口之外）
         let anchor_right = LAST_APPLIED_RECT
@@ -1208,7 +1223,7 @@ fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
         let y_mid = (tray_rect.top + tray_rect.bottom) / 2;
         let y_top = tray_rect.top + (tray_rect.bottom - tray_rect.top) / 4;
         let y_bot = tray_rect.bottom - (tray_rect.bottom - tray_rect.top) / 4;
-        let mut pts: Vec<(i32, i32)> = Vec::with_capacity(9);
+        let mut pts: Vec<(i32, i32)> = Vec::with_capacity(12);
         for dx in [3i32, 8, 13] {
             let sx = anchor_right + dx;
             if sx >= screen_right - 1 {
@@ -1239,6 +1254,48 @@ fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
                 ((color >> 8) & 0xFF) as u8,
                 ((color >> 16) & 0xFF) as u8,
             ));
+        }
+        // R8.2 内部点：覆盖层右缘内 2px（padding 纯背景区，避开文字/keepalive
+        // 像素），三点中位抗单点噪声。归属必须命中覆盖层自身——滑动跟随中/
+        // 被其他窗口压住时拒绝，闭环退化为纯开环（安全侧）。
+        let mut inside: Option<(u8, u8, u8)> = None;
+        let own_hwnd = OVERLAY_HWND.lock().ok().and_then(|h| *h);
+        let inside_owned = |p: (i32, i32)| -> bool {
+            let hit = WindowFromPoint(windows::Win32::Foundation::POINT { x: p.0, y: p.1 });
+            !hit.0.is_null()
+                && own_hwnd
+                    .map(|h| hit.0 as isize == h || GetAncestor(hit, GA_ROOT).0 as isize == h)
+                    .unwrap_or(false)
+        };
+        let inside_pts = [
+            (anchor_right - 2, y_top),
+            (anchor_right - 2, y_mid),
+            (anchor_right - 2, y_bot),
+        ];
+        if inside_pts.iter().all(|p| inside_owned(*p)) {
+            let mut rows: Vec<(u8, u8, u8)> = Vec::with_capacity(3);
+            for p in inside_pts {
+                let color = GetPixel(dc, p.0, p.1).0;
+                if color != 0xFFFF_FFFF {
+                    rows.push((
+                        (color & 0xFF) as u8,
+                        ((color >> 8) & 0xFF) as u8,
+                        ((color >> 16) & 0xFF) as u8,
+                    ));
+                }
+            }
+            if rows.len() == 3 {
+                // 逐通道中位（三点排序取中，滤单点噪声）
+                let mut r = [rows[0].0, rows[1].0, rows[2].0];
+                let mut g = [rows[0].1, rows[1].1, rows[2].1];
+                let mut b = [rows[0].2, rows[1].2, rows[2].2];
+                r.sort_unstable();
+                g.sort_unstable();
+                b.sort_unstable();
+                inside = Some((r[1], g[1], b[1]));
+            }
+        } else if own_hwnd.is_some() {
+            geom_log("appearance sample: inside points not owned, closed-loop off this round");
         }
         // 闸②：读后复验三列中线（归属检查与像素采集不是同一时刻，收窄竞态窗）
         let post_ok = [3i32, 8, 13]
@@ -1274,9 +1331,12 @@ fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
             (a.0 + c.0 as u32, a.1 + c.1 as u32, a.2 + c.2 as u32)
         });
         Some((
-            (sum.0 / n) as u8,
-            (sum.1 / n) as u8,
-            (sum.2 / n) as u8,
+            (
+                (sum.0 / n) as u8,
+                (sum.1 / n) as u8,
+                (sum.2 / n) as u8,
+            ),
+            inside,
         ))
     }
 }
@@ -1285,7 +1345,15 @@ fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
 /// 返回 `(背景 hex, 前景 hex)`。绝不返回透明——透底叠字是覆盖式方案的头号风险。
 pub fn clock_overlay_appearance_colors() -> (String, String) {
     let (bg, source) = match sample_taskbar_pixel() {
-        Some(sampled) => (sampled, "sampled"),
+        // 命令路径（前端初始加载）只取外部采样色；闭环校准仅在 worker 推送路径
+        Some((sampled, _)) => {
+            // R8.2：同步推送基准——前端将显示此色，闭环以 LAST_PUSHED_BG 为
+            // 「当前显示色」参照，不同步会把命令设置的色误算成偏差
+            if let Ok(mut last) = LAST_PUSHED_BG.lock() {
+                *last = Some(sampled);
+            }
+            (sampled, "sampled")
+        }
         None => {
             let light = system_uses_light_theme();
             crate::dbg_log(&format!(
@@ -1418,39 +1486,89 @@ fn spawn_appearance_workers(app: AppHandle) {
 
 /// 执行一次采样与推送（worker 串行调用，无并发）。失败保持最近可信色，
 /// 原因已在 sample_taskbar_pixel 内记诊断日志。
-/// 旧实现 here 的 CURRENT_BELOW abort 已删除：盖住者若在场必同时盖住采样条，
-/// 归属校验自然拒绝；若采样条露出，采到的本来就是真任务栏色——正是想要的。
+///
+/// R8.2 闭环校准：`新推送 = 旧推送 + (外部色 - 内部色)`。外部色=任务栏本色
+/// （显示桌面条实采），内部色=覆盖层当前显示色的屏幕读数——两者之差就是
+/// 用户肉眼所见色差，无论其源自 WebView 色彩管理偏差还是采样条与时钟区的
+/// 横向底色差，闭环都把它收敛到死区以下（复验⑦「细微色差持续不恢复」：
+/// 开环链路采样自洽、永远看不见这类偏差）。内部色不可得时退化纯开环
+/// （|采样-旧推送|≥3 才推采样值）。收敛后 |差|<2 不推送，避免反复重绘。
 fn run_appearance_sample(app: &AppHandle, src: &'static str) {
-    let Some(sampled) = sample_taskbar_pixel() else {
+    let Some((sampled, inside)) = sample_taskbar_pixel() else {
         geom_log(&format!("appearance run src={src}: no sample (kept trusted color)"));
         return;
     };
-    if let Ok(mut last) = LAST_PUSHED_BG.lock() {
-        if let Some(prev) = *last {
-            let d = (prev.0 as i32 - sampled.0 as i32).abs().max(
-                (prev.1 as i32 - sampled.1 as i32)
-                    .abs()
-                    .max((prev.2 as i32 - sampled.2 as i32).abs()),
-            );
-            if d < 3 {
-                geom_log(&format!("appearance run src={src}: unchanged (d<3)"));
-                return; // 低于可感知阈值不推送，避免反复重绘
-            }
-        }
+    let Ok(mut last) = LAST_PUSHED_BG.lock() else {
+        return;
+    };
+    let Some(prev) = *last else {
+        // 首次推送（无参照显示色）：直接推任务栏本色
         *last = Some(sampled);
+        drop(last);
+        push_appearance(app, src, sampled, sampled, None);
+        return;
+    };
+    // 闭环候选：旧推送 + 观测色差（内部色在才可算）
+    let candidate = match inside {
+        Some(ins) => (
+            (prev.0 as i32 + sampled.0 as i32 - ins.0 as i32).clamp(0, 255) as u8,
+            (prev.1 as i32 + sampled.1 as i32 - ins.1 as i32).clamp(0, 255) as u8,
+            (prev.2 as i32 + sampled.2 as i32 - ins.2 as i32).clamp(0, 255) as u8,
+        ),
+        // 内部色不可得：退化开环，候选=采样本色
+        None => sampled,
+    };
+    let d = (candidate.0 as i32 - prev.0 as i32)
+        .abs()
+        .max((candidate.1 as i32 - prev.1 as i32).abs())
+        .max((candidate.2 as i32 - prev.2 as i32).abs());
+    if d < 2 {
+        geom_log(&format!(
+            "appearance run src={src}: converged sampled=#{:02X}{:02X}{:02X} inside={} pushed=#{:02X}{:02X}{:02X} d={d}",
+            sampled.0,
+            sampled.1,
+            sampled.2,
+            inside
+                .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
+                .unwrap_or_else(|| "none".into()),
+            prev.0,
+            prev.1,
+            prev.2
+        ));
+        return;
     }
-    let luminance =
-        0.2126 * sampled.0 as f64 + 0.7152 * sampled.1 as f64 + 0.0722 * sampled.2 as f64;
+    *last = Some(candidate);
+    drop(last);
+    push_appearance(app, src, candidate, sampled, inside);
+}
+
+/// 推送外观到前端（seq 自增 + 事件 emit）。
+fn push_appearance(
+    app: &AppHandle,
+    src: &'static str,
+    bg: (u8, u8, u8),
+    sampled: (u8, u8, u8),
+    inside: Option<(u8, u8, u8)>,
+) {
+    let luminance = 0.2126 * bg.0 as f64 + 0.7152 * bg.1 as f64 + 0.0722 * bg.2 as f64;
     let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
     let seq = APPEARANCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     crate::dbg_log(&format!(
-        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X}",
-        sampled.0, sampled.1, sampled.2
+        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X} sampled=#{:02X}{:02X}{:02X} inside={} (closed-loop)",
+        bg.0,
+        bg.1,
+        bg.2,
+        sampled.0,
+        sampled.1,
+        sampled.2,
+        inside
+            .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
+            .unwrap_or_else(|| "none".into())
     ));
     let _ = app.emit(
         "clock-appearance",
         serde_json::json!({
-            "bg": format!("#{:02X}{:02X}{:02X}", sampled.0, sampled.1, sampled.2),
+            "bg": format!("#{:02X}{:02X}{:02X}", bg.0, bg.1, bg.2),
             "fg": fg,
             "seq": seq,
         }),
