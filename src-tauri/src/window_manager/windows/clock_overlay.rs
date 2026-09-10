@@ -367,6 +367,10 @@ pub fn ensure_clock_overlay_attached(app_handle: &AppHandle) {
                         "clock overlay: attached at attempt {attempt} rect=({},{})-({},{})",
                         rect.left, rect.top, rect.right, rect.bottom
                     ));
+                    // R8：attach 即刻实采一次（前端此时的过渡色只是主题近似值），
+                    // 同时惰性启动外观 worker 与 15s 可信色保鲜线程——保鲜必须
+                    // 从会话开始就积累，否则首轮退出全屏时的底色仍是陈旧的
+                    refresh_clock_overlay_appearance(app_handle, 0, "attach");
                     return;
                 }
             }
@@ -462,9 +466,13 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
             g.exit_watch_until = Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WATCH_MS),
             );
-            // R7.6 兜底：收缩后等合成稳定再采一次（退出切换时那次可能被
-            // 残影/归属校验拒绝）
-            refresh_clock_overlay_appearance(app_handle, 400);
+            // R8：收缩执行点即时采样——UIA 已读到原生归位，采样条大概率已
+            // 露出，成功则色差窗从「400ms 兜底」缩到一次采样+一帧渲染级；
+            // 归属校验挡住残影竞态（被拒则靠下面的兜底）。
+            refresh_clock_overlay_appearance(app_handle, 0, "post-shrink-now");
+            // R7.6 兜底：收缩后等合成稳定再采一次（即时那次可能被残影/归属
+            // 校验拒绝）
+            refresh_clock_overlay_appearance(app_handle, 400, "post-shrink-400");
         }
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
@@ -810,6 +818,13 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                                         if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
                                             *last = None;
                                         }
+                                        // R8：盖住者让位的最早信号（时钟中心已命中
+                                        // 任务栏/自己）——不等 UIA、不等去抖，立即
+                                        // 请求换色。此去抖等待期最长 300ms，早于
+                                        // Visible 切换点；此刻采样条若已被回缩中的
+                                        // 盖住者放开，归属校验放行，色差窗再前移
+                                        // 一个去抖量。
+                                        refresh_clock_overlay_appearance(app_handle, 0, "z-reclaim");
                                     }
                                 }
                             }
@@ -826,7 +841,7 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     // 认可位才收缩），先把底色换成当前任务栏本色，收缩过程
                     // 全程无色差条；采样点在遮盖右缘外 3px，此刻露出的是真
                     // 任务栏区域
-                    refresh_clock_overlay_appearance(app_handle, 0);
+                    refresh_clock_overlay_appearance(app_handle, 0, "visible-switch");
                 }
             }
             // 遮盖保持期（R6 实时跟踪）：退出轮回摆期探测可能直接 Visible 而原生
@@ -866,7 +881,7 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 // 点），这里兜住所有路径：遮盖撑着时段底色始终新鲜，收缩
                 // 过程无色差条。变化检测（≥3 RGB）自带节流，采样点归属
                 // 校验挡播放器残影竞态。
-                refresh_clock_overlay_appearance(app_handle, 0);
+                refresh_clock_overlay_appearance(app_handle, 0, "mask-held-tick");
                 // 全尺寸成套应用（含首次展开针），不做 NOSIZE——首次展开若只
                 // 移位，158 宽窗口盖不全 3618-3769 残块
                 (m.left, m.top, m.right - m.left, m.bottom - m.top, -1)
@@ -1096,18 +1111,48 @@ fn system_uses_light_theme() -> bool {
     }
 }
 
-/// 从任务栏实采底色：采样**时钟矩形右侧、屏幕右缘之前的细条**（「显示桌面」区）。
+/// 采样点归属判定：命中任务栏自身（或其子窗口根）才算任务栏。
+unsafe fn sample_point_owned(pt: (i32, i32), tray: HWND) -> bool {
+    let hit = WindowFromPoint(windows::Win32::Foundation::POINT { x: pt.0, y: pt.1 });
+    if hit.0.is_null() {
+        return false;
+    }
+    hit == tray || GetAncestor(hit, GA_ROOT) == tray
+}
+
+/// 从任务栏实采底色：采样**「显示桌面」细条**（当前实际应用矩形右缘之外）。
 ///
 /// 该区域没有任何图标/按钮像素，且紧邻时钟——底色与时钟局部最贴近。
 /// 旧版采任务栏横向全宽中带，点位大量落在开始按钮/图标上，均值被污染产生色差。
 /// 时钟矩形本身被覆盖层盖住（采到的是自己），也必须避开。
+///
+/// R8 采样锚点稳定化（评审 §3.1）：旧锚点用钩子缓存 CLOCK_AREA_RECT_CACHE，
+/// 它会如实跟踪全屏期布局（3618..3769）——退出期采样列 3772..3782 落进遮盖
+/// (3618..3818) **内部**，被自己的窗口归属校验拒绝：退出最需要换色的时刻采样
+/// 结构性不可用、一直用旧色。新锚点 = 当前实际应用矩形（遮盖在场=遮盖矩形，
+/// 常规=认可矩形）右缘，采样点恒在覆盖层窗口右侧之外；endorsed/cache 仅作
+/// 首次应用前的回退。
+///
+/// R8 采样完整性（评审 §3.2）：归属校验扩为读前**逐点**验证全部采样位（旧版
+/// 只查每列中线，气泡可只盖上/下行）→ 读后复验三列中线（检查与读取之间
+/// 盖住者再现的 TOCTOU 收窄）→ 块内离散度守卫（纯色任务栏区散度近 0，
+/// 半覆盖的气泡/残影会拉高散度——宁可不采保留旧色，不推送污染值）。
+/// 失败原因经 geom_log 记入诊断。三道闸都不代表像素真值的充分证明，
+/// 但把已知竞态（#00FFFD/#67EDE8/#C8F2EF 三采样污染实测）全部挡住。
 fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
     unsafe {
-        // 覆盖层贴合的时钟矩形：右缘之右即「显示桌面」细条
-        let clock = crate::windows_hook::CLOCK_AREA_RECT_CACHE
-            .read()
+        // 采样锚点：当前实际应用矩形右缘（恒在覆盖层窗口之外）
+        let anchor_right = LAST_APPLIED_RECT
+            .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().copied())?;
+            .and_then(|g| g.as_ref().map(|r| r.right))
+            .or_else(|| GEOM.lock().ok().and_then(|g| g.endorsed.map(|r| r.right)))
+            .or_else(|| {
+                crate::windows_hook::CLOCK_AREA_RECT_CACHE
+                    .read()
+                    .ok()
+                    .and_then(|guard| guard.as_ref().map(|r| r.right))
+            })?;
         let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         let mut tray_rect = RECT::default();
         GetWindowRect(tray, &mut tray_rect).ok()?;
@@ -1122,55 +1167,79 @@ fn sample_taskbar_pixel() -> Option<(u8, u8, u8)> {
             return None;
         }
         let screen_right = mi.rcMonitor.right;
-        // 条内取 3 个纵向位置、每列 3 点（上/中/下错开，抗单点噪点）
+        // 条内取 3 个纵向位置、3 列（右缘外 3/8/13px，上/中/下错开抗单点噪点）
         let y_mid = (tray_rect.top + tray_rect.bottom) / 2;
         let y_top = tray_rect.top + (tray_rect.bottom - tray_rect.top) / 4;
         let y_bot = tray_rect.bottom - (tray_rect.bottom - tray_rect.top) / 4;
-        // R7.5 采样点归属校验：每个采样列的命中窗口必须是任务栏自身——
-        // 探测 Visible 到执行采样之间盖住者可能恰好出现（22:13:45.562 实测
-        // 竞态采出视频青色 #67EDE8），像素归属是唯一可信的真值判定。
+        let mut pts: Vec<(i32, i32)> = Vec::with_capacity(9);
         for dx in [3i32, 8, 13] {
-            let sx = clock.right + dx;
+            let sx = anchor_right + dx;
             if sx >= screen_right - 1 {
                 break;
             }
-            let hit = WindowFromPoint(windows::Win32::Foundation::POINT { x: sx, y: y_mid });
-            let root = if hit.0.is_null() {
-                HWND::default()
-            } else {
-                GetAncestor(hit, GA_ROOT)
-            };
-            if hit != tray && root != tray {
-                return None; // 采样点被盖住者/其他窗口占据，宁可不采
-            }
-        }
-        let dc = GetDC(None);
-        let mut sum = (0u32, 0u32, 0u32);
-        let mut count = 0u32;
-        for dx in [3i32, 8, 13] {
-            let x = clock.right + dx;
-            if x >= screen_right - 1 {
-                break;
-            }
             for y in [y_top, y_mid, y_bot] {
-                let color = GetPixel(dc, x, y).0;
-                if color == 0xFFFF_FFFF {
-                    continue;
-                }
-                sum.0 += (color & 0xFF) as u32;
-                sum.1 += ((color >> 8) & 0xFF) as u32;
-                sum.2 += ((color >> 16) & 0xFF) as u32;
-                count += 1;
+                pts.push((sx, y));
             }
         }
-        ReleaseDC(None, dc);
-        if count < 3 {
+        if pts.len() < 3 {
+            geom_log("appearance sample: no room right of anchor, skip");
             return None;
         }
+        // 闸①：读前逐点归属校验——被盖住者/其他窗口占据，宁可不采
+        if let Some(bad) = pts.iter().find(|p| !sample_point_owned(**p, tray)) {
+            geom_log(&format!("appearance sample: pre-check owned=false at ({},{}), skip", bad.0, bad.1));
+            return None;
+        }
+        let dc = GetDC(None);
+        let mut colors: Vec<(u8, u8, u8)> = Vec::with_capacity(pts.len());
+        for p in &pts {
+            let color = GetPixel(dc, p.0, p.1).0;
+            if color == 0xFFFF_FFFF {
+                continue;
+            }
+            colors.push((
+                (color & 0xFF) as u8,
+                ((color >> 8) & 0xFF) as u8,
+                ((color >> 16) & 0xFF) as u8,
+            ));
+        }
+        // 闸②：读后复验三列中线（归属检查与像素采集不是同一时刻，收窄竞态窗）
+        let post_ok = [3i32, 8, 13]
+            .iter()
+            .all(|dx| sample_point_owned((anchor_right + dx, y_mid), tray));
+        ReleaseDC(None, dc);
+        if !post_ok {
+            geom_log("appearance sample: post-check owned=false, discard");
+            return None;
+        }
+        if colors.len() < 3 {
+            geom_log("appearance sample: GetPixel all failed, skip");
+            return None;
+        }
+        // 闸③：块内离散度守卫——半覆盖的气泡/残影/悬停高亮会拉高散度
+        let mut mn = (255u8, 255u8, 255u8);
+        let mut mx = (0u8, 0u8, 0u8);
+        for c in &colors {
+            mn.0 = mn.0.min(c.0);
+            mn.1 = mn.1.min(c.1);
+            mn.2 = mn.2.min(c.2);
+            mx.0 = mx.0.max(c.0);
+            mx.1 = mx.1.max(c.1);
+            mx.2 = mx.2.max(c.2);
+        }
+        let spread = (mx.0 - mn.0).max(mx.1 - mn.1).max(mx.2 - mn.2) as i32;
+        if spread > 48 {
+            geom_log(&format!("appearance sample: dispersion {spread} > 48, discard"));
+            return None;
+        }
+        let n = colors.len() as u32;
+        let sum = colors.iter().fold((0u32, 0u32, 0u32), |a, c| {
+            (a.0 + c.0 as u32, a.1 + c.1 as u32, a.2 + c.2 as u32)
+        });
         Some((
-            (sum.0 / count) as u8,
-            (sum.1 / count) as u8,
-            (sum.2 / count) as u8,
+            (sum.0 / n) as u8,
+            (sum.1 / n) as u8,
+            (sum.2 / n) as u8,
         ))
     }
 }
@@ -1203,63 +1272,148 @@ pub fn clock_overlay_appearance_colors() -> (String, String) {
 /// 最近一次推送给前端的底色（RGB）——变化检测，未变不重复推送。
 static LAST_PUSHED_BG: Mutex<Option<(u8, u8, u8)>> = Mutex::new(None);
 
-/// 底色动态跟随（R7.5）：任务栏底色随亚克力/壁纸/系统状态动态变化（实测
-/// 00:06 采出 #F3F3F3、02:03 采出 #E7D8CD——同一台机器两个时段差 30+RGB），
-/// 而覆盖层此前只在启动/主题切换时采样，色差期间遮盖边界全程可见（用户
-/// 报告情况2）、色差小则剩 1px 边缘抗锯齿与文字重栅格化（情况1）。
+/// 外观推送序号（R8，评审 §3.4）：每次推送前自增，事件 payload 与命令响应
+/// 都携带——前端按 seq 单调守卫应用，晚到的旧值（初始 invoke 响应 vs 事件
+/// 竞态）不再覆盖新色。
+static APPEARANCE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 当前推送序号（供命令响应携带，前端单调守卫用）。
+pub fn clock_overlay_appearance_seq() -> u64 {
+    APPEARANCE_SEQ.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// 待采样请求槽（R8 单工作线程，评审 §3.3）：请求只往里塞 `(到期时刻, 来源)`，
+/// 永久 worker 串行消费——多请求合并、采样与推送天然有序。旧实现每次调用
+/// spawn 一个线程，旧线程可在新线程之后 emit 旧色而前端无版本照单全收；
+/// 延迟请求（400ms 兜底）也不再被后到的即时请求吞掉（多入口并存，各自到期）。
+static APPEARANCE_DUE: Mutex<Vec<(std::time::Instant, &'static str)>> = Mutex::new(Vec::new());
+
+/// worker / 可信色保鲜线程的懒启动标记。
+static APPEARANCE_WORKERS_STARTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// 底色动态跟随请求入口（R7.5 建立，R8 改为合并调度）。`delay_ms` 为 0 表示
+/// 立即，`src` 仅供诊断日志区分调用方。
 ///
-/// 时机收敛（三处竞态实测教训）：①盖住者在场采样必被视频污染（22:11:02
-/// 采出 #00FFFD）②探测 Visible 到采样之间视频盖上（22:18:01 采出 #67EDE8）
-/// ③退出后合成残影（22:18:10 收缩后 39ms 采出 #C8F2EF）。
-/// R7.6 两个采样时机：
-/// - **退出确认 Visible 瞬间（delay=0）**：去抖已确认任务栏持续可见，采样点
-///   （遮盖右缘之外 3px）露出的是真任务栏色——此刻遮盖还在场，先换色再
-///   收缩，消除「遮盖撑着时段的旧色 vs 任务栏本色」色差条（用户复验④
-///   报告：色差在收缩完成后才消失，从有到无的过程可见——即旧色遮盖
-///   撑到了收缩）；
-/// - **收缩完成后（delay=400）**：等桌面合成稳定的兜底。
-pub fn refresh_clock_overlay_appearance(app_handle: &AppHandle, delay_ms: u64) {
-    let app = app_handle.clone();
-    std::thread::Builder::new()
-        .name("clock-appearance-refresh".into())
-        .spawn(move || {
-            if delay_ms > 0 {
-                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
-            }
-            // 延迟期间若再次进全屏（潜入/屏外），放弃本次采样
-            if CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst) != -1 {
-                return;
-            }
-            let Some(sampled) = sample_taskbar_pixel() else {
-                return;
+/// 时机全景（R7.6 三层 + R8 两个提前点 + 正常态保鲜）：
+/// - **z-reclaim 早信号（R8）**：去抖等待期时钟中心已命中任务栏/自己 = 盖住者
+///   让位的最早信号，不等 UIA、不等去抖即请求换色（评审：颜色恢复独立于
+///   几何探测；归属校验挡住「条还没露出」的无效采样）；
+/// - **退出确认 Visible 切换点（delay=0）**：去抖已确认任务栏持续可见；
+/// - **遮盖在场每针尝试（delay=0）**：覆盖回摆撑盖主时段，逐针保持底色新鲜；
+/// - **收缩执行点即时（R8）+ 收缩后 400ms 兜底**：原生已归位先采一次，
+///   合成稳定后再校一次（即时那次可能被残影/归属校验拒绝）；
+/// - **正常态 15s 可信色保鲜（R8，评审 §4.1.1）**：任务栏可见的稳态下轻采，
+///   亚克力/壁纸缓变时覆盖层色不再渐旧，会话首轮退出时的底色也不再陈旧
+///   （复验⑤「偶发色差」的主候选）。
+pub fn refresh_clock_overlay_appearance(app_handle: &AppHandle, delay_ms: u64, src: &'static str) {
+    let due = std::time::Instant::now() + std::time::Duration::from_millis(delay_ms);
+    let spawn = {
+        let Ok(mut queue) = APPEARANCE_DUE.lock() else {
+            return;
+        };
+        let first = !APPEARANCE_WORKERS_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst);
+        // 队列极小（常态 0~1 条，退出窗峰值 ~4 条），满了丢新请求保旧——
+        // 丢的只是多的一次重试，下个时机层会再来
+        if queue.len() < 8 {
+            queue.push((due, src));
+        }
+        first
+    };
+    if spawn {
+        spawn_appearance_workers(app_handle.clone());
+    }
+}
+
+fn spawn_appearance_workers(app: AppHandle) {
+    // 采样/推送 worker：串行消费 APPEARANCE_DUE（最早到期者先采）。
+    // 30ms 粒度轮询换来零锁争用与实现简单；采样本身是微秒级 hit-test+GetPixel。
+    let worker_app = app.clone();
+    let _ = std::thread::Builder::new()
+        .name("clock-appearance-worker".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let claimed = {
+                let Ok(mut queue) = APPEARANCE_DUE.lock() else {
+                    continue;
+                };
+                let now = std::time::Instant::now();
+                let idx = queue
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, t)| t.0 <= now)
+                    .min_by_key(|(_, t)| t.0)
+                    .map(|(i, _)| i);
+                idx.map(|i| queue.remove(i))
             };
-            if let Ok(mut last) = LAST_PUSHED_BG.lock() {
-                if let Some(prev) = *last {
-                    let d = (prev.0 as i32 - sampled.0 as i32).abs().max(
-                        (prev.1 as i32 - sampled.1 as i32)
-                            .abs()
-                            .max((prev.2 as i32 - sampled.2 as i32).abs()),
-                    );
-                    if d < 3 {
-                        return; // 低于可感知阈值不推送，避免反复重绘
-                    }
-                }
-                *last = Some(sampled);
+            if let Some((_, src)) = claimed {
+                run_appearance_sample(&worker_app, src);
             }
-            let luminance =
-                0.2126 * sampled.0 as f64 + 0.7152 * sampled.1 as f64 + 0.0722 * sampled.2 as f64;
-            let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
-            crate::dbg_log(&format!(
-                "clockrect: appearance refresh bg=#{:02X}{:02X}{:02X}",
-                sampled.0, sampled.1, sampled.2
-            ));
-            let _ = app.emit(
-                "clock-appearance",
-                serde_json::json!({
-                    "bg": format!("#{:02X}{:02X}{:02X}", sampled.0, sampled.1, sampled.2),
-                    "fg": fg,
-                }),
-            );
         })
         .ok();
+    // 正常态可信色保鲜（R8）：稳态可见期每 15s 轻采一次。全屏期/回摆期跳过
+    // （那边由时机层覆盖，且盖住者会顶掉归属校验）；这里的收益在正常态——
+    // 旧实现只在退出轮采样，正常态底色缓变时覆盖层色渐旧无人纠正。
+    let _ = std::thread::Builder::new()
+        .name("clock-appearance-trusted".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(15));
+            if !ATTACHED.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            if CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst) != -1 {
+                continue;
+            }
+            let steady = GEOM
+                .lock()
+                .ok()
+                .map(|g| g.phase == GeomPhase::Normal && g.mask.is_none())
+                .unwrap_or(false);
+            if !steady {
+                continue;
+            }
+            refresh_clock_overlay_appearance(&app, 0, "trusted-15s");
+        })
+        .ok();
+}
+
+/// 执行一次采样与推送（worker 串行调用，无并发）。失败保持最近可信色，
+/// 原因已在 sample_taskbar_pixel 内记诊断日志。
+/// 旧实现 here 的 CURRENT_BELOW abort 已删除：盖住者若在场必同时盖住采样条，
+/// 归属校验自然拒绝；若采样条露出，采到的本来就是真任务栏色——正是想要的。
+fn run_appearance_sample(app: &AppHandle, src: &'static str) {
+    let Some(sampled) = sample_taskbar_pixel() else {
+        geom_log(&format!("appearance run src={src}: no sample (kept trusted color)"));
+        return;
+    };
+    if let Ok(mut last) = LAST_PUSHED_BG.lock() {
+        if let Some(prev) = *last {
+            let d = (prev.0 as i32 - sampled.0 as i32).abs().max(
+                (prev.1 as i32 - sampled.1 as i32)
+                    .abs()
+                    .max((prev.2 as i32 - sampled.2 as i32).abs()),
+            );
+            if d < 3 {
+                geom_log(&format!("appearance run src={src}: unchanged (d<3)"));
+                return; // 低于可感知阈值不推送，避免反复重绘
+            }
+        }
+        *last = Some(sampled);
+    }
+    let luminance =
+        0.2126 * sampled.0 as f64 + 0.7152 * sampled.1 as f64 + 0.0722 * sampled.2 as f64;
+    let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
+    let seq = APPEARANCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    crate::dbg_log(&format!(
+        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X}",
+        sampled.0, sampled.1, sampled.2
+    ));
+    let _ = app.emit(
+        "clock-appearance",
+        serde_json::json!({
+            "bg": format!("#{:02X}{:02X}{:02X}", sampled.0, sampled.1, sampled.2),
+            "fg": fg,
+            "seq": seq,
+        }),
+    );
 }

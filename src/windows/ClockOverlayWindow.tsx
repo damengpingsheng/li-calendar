@@ -8,10 +8,11 @@ import { fetchWeatherText } from '../http/weather';
 
 dayjs.locale('zh-cn');
 
-/** 覆盖层外观（后端实采任务栏底色 + 对比前景色，hex）。 */
+/** 覆盖层外观（后端实采任务栏底色 + 对比前景色，hex）。seq 为后端推送序号。 */
 interface ClockOverlayAppearance {
   bg: string;
   fg: string;
+  seq?: number;
 }
 
 /**
@@ -36,9 +37,18 @@ function ClockOverlayWindow(): React.JSX.Element {
   useEffect(() => {
     const timer = setInterval(() => setNow(dayjs()), 1000);
     const media = window.matchMedia('(prefers-color-scheme: dark)');
+    // R8 seq 单调守卫：后端事件与初始 invoke 响应可能乱序到达（响应晚于事件），
+    // 序号低于已应用的值时丢弃，避免新色被旧值覆盖
+    let appliedSeq = 0;
+    const applyAppearance = (next: ClockOverlayAppearance) => {
+      const s = next.seq ?? 0;
+      if (s < appliedSeq) return;
+      appliedSeq = s;
+      setAppearance(next);
+    };
     const loadAppearance = () => {
       invoke<ClockOverlayAppearance>('clock_overlay_appearance')
-        .then(setAppearance)
+        .then(applyAppearance)
         .catch(() => {});
     };
     const onChange = (event: MediaQueryListEvent) => {
@@ -50,7 +60,7 @@ function ClockOverlayWindow(): React.JSX.Element {
     // R7.5：后端在遮盖展开/收缩后重采样，色变时推送（任务栏底色随亚克力
     // /壁纸动态变化，静态采样会留色差——遮盖边界全程可见）
     const unlisten = listen<ClockOverlayAppearance>('clock-appearance', (event) => {
-      setAppearance(event.payload);
+      applyAppearance(event.payload);
     });
     return () => {
       clearInterval(timer);

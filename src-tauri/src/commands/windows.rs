@@ -306,12 +306,19 @@ pub struct ClockOverlayAppearance {
     pub bg: String,
     /// 前景文字色（hex，按背景亮度取对比色）
     pub fg: String,
+    /// 推送序号（R8）：与 `clock-appearance` 事件同一计数器——前端按 seq 单调
+    /// 守卫应用，晚到的旧响应不再覆盖事件已应用的新色
+    pub seq: u64,
 }
 
 #[tauri::command]
 pub async fn clock_overlay_appearance() -> Result<ClockOverlayAppearance, String> {
     let (bg, fg) = crate::window_manager::clock_overlay_appearance_colors();
-    Ok(ClockOverlayAppearance { bg, fg })
+    Ok(ClockOverlayAppearance {
+        bg,
+        fg,
+        seq: crate::window_manager::clock_overlay_appearance_seq(),
+    })
 }
 
 /// 时钟右键菜单动作：设置 / 退出（由 clock_context_menu 窗口前端调用）。

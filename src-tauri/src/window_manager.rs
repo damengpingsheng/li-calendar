@@ -17,6 +17,8 @@ pub use windows::relocate_clock_overlay_endorsed;
 #[cfg(windows)]
 pub use windows::clock_overlay_appearance_colors;
 #[cfg(windows)]
+pub use windows::clock_overlay_appearance_seq;
+#[cfg(windows)]
 pub use windows::clock_overlay_note_probe;
 #[cfg(windows)]
 pub use windows::clock_overlay_reprobe_interval_ms;
