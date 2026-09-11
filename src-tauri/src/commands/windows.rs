@@ -301,23 +301,28 @@ pub async fn relocate_clock_overlay_command(app_handle: AppHandle) -> Result<(),
 
 /// 时钟覆盖层外观（任务栏实采底色 + 前景对比色）；前端挂载与主题变化时调用。
 #[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ClockOverlayAppearance {
-    /// 不透明背景色（hex，如 `#202020`）——覆盖式方案绝不允许透明（透底会叠出原生时钟）
+    /// 不透明背景色（hex）——渐变**右端**（覆盖层右邻「显示桌面」条实采）；
+    /// 覆盖式方案绝不允许透明（透底会叠出原生时钟）
     pub bg: String,
     /// 前景文字色（hex，按背景亮度取对比色）
     pub fg: String,
     /// 推送序号（R8）：与 `clock-appearance` 事件同一计数器——前端按 seq 单调
     /// 守卫应用，晚到的旧响应不再覆盖事件已应用的新色
     pub seq: u64,
+    /// 渐变**左端**背景色（hex，R8.5）：左侧净列实采；缺省时与 bg 同值（平涂）
+    pub bg_left: String,
 }
 
 #[tauri::command]
 pub async fn clock_overlay_appearance() -> Result<ClockOverlayAppearance, String> {
-    let (bg, fg) = crate::window_manager::clock_overlay_appearance_colors();
+    let (bg, fg, bg_left) = crate::window_manager::clock_overlay_appearance_colors();
     Ok(ClockOverlayAppearance {
         bg,
         fg,
         seq: crate::window_manager::clock_overlay_appearance_seq(),
+        bg_left,
     })
 }
 

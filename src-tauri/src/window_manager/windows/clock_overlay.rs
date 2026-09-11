@@ -1420,41 +1420,47 @@ fn sample_taskbar_pixel() -> Option<TaskbarSample> {
 }
 
 /// 覆盖层外观：任务栏底色（实采优先，主题注册表兜底）+ 按亮度选择的对比前景色。
-/// 返回 `(背景 hex, 前景 hex)`。绝不返回透明——透底叠字是覆盖式方案的头号风险。
-pub fn clock_overlay_appearance_colors() -> (String, String) {
-    let (bg, source) = match sample_taskbar_pixel() {
-        // 命令路径（前端初始加载）取主参考色；闭环校准仅在 worker 推送路径
+/// 返回 `(右端背景 hex, 前景 hex, 左端背景 hex)`。绝不返回透明——透底叠字是
+/// 覆盖式方案的头号风险。R8.5：左端=左侧净列（无净列时=右端，等价平涂）。
+pub fn clock_overlay_appearance_colors() -> (String, String, String) {
+    let (bg, bg_left, source) = match sample_taskbar_pixel() {
+        // 命令路径（前端初始加载）取双端参考色；闭环校准仅在 worker 推送路径
         Some(s) => {
-            let sampled = s.primary;
+            let right = s.strip.unwrap_or(s.primary);
+            let left = s.left.unwrap_or(right);
             // R8.2：同步推送基准——前端将显示此色，闭环以 LAST_PUSHED_BG 为
             // 「当前显示色」参照，不同步会把命令设置的色误算成偏差
             if let Ok(mut last) = LAST_PUSHED_BG.lock() {
-                *last = Some(sampled);
+                *last = Some((left, right));
             }
-            (sampled, "sampled")
+            (right, left, "sampled")
         }
         None => {
             let light = system_uses_light_theme();
             crate::dbg_log(&format!(
                 "clock overlay appearance: pixel sampling failed, fallback theme light={light}"
             ));
-            (
-                if light { (0xF3, 0xF3, 0xF3) } else { (0x20, 0x20, 0x20) },
-                "theme",
-            )
+            let c = if light { (0xF3, 0xF3, 0xF3) } else { (0x20, 0x20, 0x20) };
+            (c, c, "theme")
         }
     };
     let luminance = 0.2126 * bg.0 as f64 + 0.7152 * bg.1 as f64 + 0.0722 * bg.2 as f64;
     let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
     crate::dbg_log(&format!(
-        "clock overlay appearance bg=#{:02X}{:02X}{:02X} ({source}) fg={fg}",
-        bg.0, bg.1, bg.2
+        "clock overlay appearance bg=#{:02X}{:02X}{:02X} bgLeft=#{:02X}{:02X}{:02X} ({source}) fg={fg}",
+        bg.0, bg.1, bg.2, bg_left.0, bg_left.1, bg_left.2
     ));
-    (format!("#{:02X}{:02X}{:02X}", bg.0, bg.1, bg.2), fg.to_string())
+    (
+        format!("#{:02X}{:02X}{:02X}", bg.0, bg.1, bg.2),
+        fg.to_string(),
+        format!("#{:02X}{:02X}{:02X}", bg_left.0, bg_left.1, bg_left.2),
+    )
 }
 
 /// 最近一次推送给前端的底色（RGB）——变化检测，未变不重复推送。
-static LAST_PUSHED_BG: Mutex<Option<(u8, u8, u8)>> = Mutex::new(None);
+/// 最近一次推送给前端的底色 `(左端, 右端)`（R8.5 渐变双端点）——变化检测，
+/// 任一端变化 ≥2 才推送。左端缺净列时与右端同值（等价平涂）。
+static LAST_PUSHED_BG: Mutex<Option<((u8, u8, u8), (u8, u8, u8))>> = Mutex::new(None);
 
 /// 外观推送序号（R8，评审 §3.4）：每次推送前自增，事件 payload 与命令响应
 /// 都携带——前端按 seq 单调守卫应用，晚到的旧值（初始 invoke 响应 vs 事件
@@ -1575,18 +1581,22 @@ fn spawn_appearance_workers(app: AppHandle) {
 /// 执行一次采样与推送（worker 串行调用，无并发）。失败保持最近可信色，
 /// 原因已在 sample_taskbar_pixel 内记诊断日志。
 ///
-/// R8.2 闭环校准：`新推送 = 旧推送 + (外部色 - 内部色)`。外部色=任务栏本色
-/// （显示桌面条实采），内部色=覆盖层当前显示色的屏幕读数——两者之差就是
-/// 用户肉眼所见色差，无论其源自 WebView 色彩管理偏差还是采样条与时钟区的
-/// 横向底色差，闭环都把它收敛到死区以下（复验⑦「细微色差持续不恢复」：
-/// 开环链路采样自洽、永远看不见这类偏差）。内部色不可得时退化纯开环
-/// （|采样-旧推送|≥3 才推采样值）。收敛后 |差|<2 不推送，避免反复重绘。
+/// R8.5 渐变双端点：覆盖层下方的任务栏表面是**横向渐变**（壁纸透出，实测
+/// 左端 E9D9CC → 右端 E7D8CD，亮态下更陡），平涂单色必然与某一侧边缘差
+/// 1~4 RGB——复验⑩「还是有」的细微持续色差。改为推送双端点 (left,right)，
+/// 前端 `linear-gradient(90deg, left, right)` 复现渐变，理论上任意 x 处
+/// 与真实表面差 ≤1。
+/// R8.2 闭环校准保留：内部点在覆盖层右缘（与右端条带配对），修正量
+/// `采样右端 - 内部色` 同步应用到双端（渲染偏差实测为 0，均匀假设成立）。
 fn run_appearance_sample(app: &AppHandle, src: &'static str) {
     let Some(s) = sample_taskbar_pixel() else {
         geom_log(&format!("appearance run src={src}: no sample (kept trusted color)"));
         return;
     };
-    let sampled = s.primary;
+    // 双端点：右端=条带（覆盖层右邻），左端=左侧净列（覆盖层左邻）；
+    // 任一缺失时取另一端（等价平涂）
+    let right = s.strip.unwrap_or(s.primary);
+    let left = s.left.unwrap_or(right);
     let src_note = match (s.left, s.strip) {
         (Some(l), Some(st)) => {
             let d_ls = (l.0 as i32 - st.0 as i32)
@@ -1601,71 +1611,83 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
     let Ok(mut last) = LAST_PUSHED_BG.lock() else {
         return;
     };
-    let Some(prev) = *last else {
-        // 首次推送（无参照显示色）：直接推主参考色
-        *last = Some(sampled);
+    let Some((prev_left, prev_right)) = *last else {
+        // 首次推送（无参照显示色）：直接推双端采样值
+        *last = Some((left, right));
         drop(last);
-        push_appearance(app, src, sampled, &src_note, s.inside);
+        push_appearance(app, src, left, right, &src_note);
         return;
     };
-    // 闭环候选：旧推送 + 观测色差（内部色在才可算）
-    let candidate = match s.inside {
+    // 闭环候选：旧推送 + 观测色差（内部色在覆盖层右缘，与右端配对；
+    // 同一修正量应用到左端——渲染偏差实测为 0，均匀假设成立）
+    let corr = match s.inside {
         Some(ins) => (
-            (prev.0 as i32 + sampled.0 as i32 - ins.0 as i32).clamp(0, 255) as u8,
-            (prev.1 as i32 + sampled.1 as i32 - ins.1 as i32).clamp(0, 255) as u8,
-            (prev.2 as i32 + sampled.2 as i32 - ins.2 as i32).clamp(0, 255) as u8,
+            right.0 as i32 - ins.0 as i32,
+            right.1 as i32 - ins.1 as i32,
+            right.2 as i32 - ins.2 as i32,
         ),
-        // 内部色不可得：退化开环，候选=主参考色
-        None => sampled,
+        None => (0, 0, 0),
     };
-    let d = (candidate.0 as i32 - prev.0 as i32)
+    let cand_right = (
+        (prev_right.0 as i32 + corr.0).clamp(0, 255) as u8,
+        (prev_right.1 as i32 + corr.1).clamp(0, 255) as u8,
+        (prev_right.2 as i32 + corr.2).clamp(0, 255) as u8,
+    );
+    let cand_left = (
+        (prev_left.0 as i32 + corr.0).clamp(0, 255) as u8,
+        (prev_left.1 as i32 + corr.1).clamp(0, 255) as u8,
+        (prev_left.2 as i32 + corr.2).clamp(0, 255) as u8,
+    );
+    let d = (cand_right.0 as i32 - prev_right.0 as i32)
         .abs()
-        .max((candidate.1 as i32 - prev.1 as i32).abs())
-        .max((candidate.2 as i32 - prev.2 as i32).abs());
+        .max((cand_right.1 as i32 - prev_right.1 as i32).abs())
+        .max((cand_right.2 as i32 - prev_right.2 as i32).abs())
+        .max(
+            (cand_left.0 as i32 - prev_left.0 as i32)
+                .abs()
+                .max((cand_left.1 as i32 - prev_left.1 as i32).abs())
+                .max((cand_left.2 as i32 - prev_left.2 as i32).abs()),
+        );
     if d < 2 {
         geom_log(&format!(
-            "appearance run src={src}: converged primary=#{:02X}{:02X}{:02X} {src_note} inside={} pushed=#{:02X}{:02X}{:02X} d={d}",
-            sampled.0,
-            sampled.1,
-            sampled.2,
+            "appearance run src={src}: converged right=#{:02X}{:02X}{:02X} {src_note} inside={} pushed=({:02X}{:02X}{:02X}|{:02X}{:02X}{:02X}) d={d}",
+            right.0,
+            right.1,
+            right.2,
             s.inside
                 .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
                 .unwrap_or_else(|| "none".into()),
-            prev.0,
-            prev.1,
-            prev.2
+            prev_left.0, prev_left.1, prev_left.2,
+            prev_right.0, prev_right.1, prev_right.2
         ));
         return;
     }
-    *last = Some(candidate);
+    *last = Some((cand_left, cand_right));
     drop(last);
-    push_appearance(app, src, candidate, &src_note, s.inside);
+    push_appearance(app, src, cand_left, cand_right, &src_note);
 }
 
-/// 推送外观到前端（seq 自增 + 事件 emit）。
+/// 推送外观到前端（seq 自增 + 事件 emit）。R8.5：bg_left 为渐变左端，
+/// bg 为渐变右端。
 fn push_appearance(
     app: &AppHandle,
     src: &'static str,
+    bg_left: (u8, u8, u8),
     bg: (u8, u8, u8),
     src_note: &str,
-    inside: Option<(u8, u8, u8)>,
 ) {
     let luminance = 0.2126 * bg.0 as f64 + 0.7152 * bg.1 as f64 + 0.0722 * bg.2 as f64;
     let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
     let seq = APPEARANCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     crate::dbg_log(&format!(
-        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X} {src_note} inside={} (closed-loop)",
-        bg.0,
-        bg.1,
-        bg.2,
-        inside
-            .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
-            .unwrap_or_else(|| "none".into())
+        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X} bgLeft=#{:02X}{:02X}{:02X} {src_note} (gradient)",
+        bg.0, bg.1, bg.2, bg_left.0, bg_left.1, bg_left.2
     ));
     let _ = app.emit(
         "clock-appearance",
         serde_json::json!({
             "bg": format!("#{:02X}{:02X}{:02X}", bg.0, bg.1, bg.2),
+            "bgLeft": format!("#{:02X}{:02X}{:02X}", bg_left.0, bg_left.1, bg_left.2),
             "fg": fg,
             "seq": seq,
         }),

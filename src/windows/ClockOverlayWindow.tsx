@@ -8,11 +8,13 @@ import { fetchWeatherText } from '../http/weather';
 
 dayjs.locale('zh-cn');
 
-/** 覆盖层外观（后端实采任务栏底色 + 对比前景色，hex）。seq 为后端推送序号。 */
+/** 覆盖层外观（后端实采任务栏底色 + 对比前景色，hex）。seq 为后端推送序号；
+ *  bgLeft 为渐变左端（R8.5：任务栏底色横向渐变，双端复现）。 */
 interface ClockOverlayAppearance {
   bg: string;
   fg: string;
   seq?: number;
+  bgLeft?: string;
 }
 
 /**
@@ -58,14 +60,20 @@ function ClockOverlayWindow(): React.JSX.Element {
     loadAppearance();
     media.addEventListener('change', onChange);
     // R7.5：后端在遮盖展开/收缩后重采样，色变时推送（任务栏底色随亚克力
-    // /壁纸动态变化，静态采样会留色差——遮盖边界全程可见）
-    const unlisten = listen<ClockOverlayAppearance>('clock-appearance', (event) => {
+    // /壁纸动态变化，静态采样会留色差——遮盖边界全程可见）。
+    // R8.5：attach 即刻的首针事件可能早于本 listen 注册（webview 加载竞态），
+    // 注册完成后必须重拉一次 invoke，否则错过即永缺（后续 d<2 不再推送）。
+    let dispose: (() => void) | undefined;
+    void listen<ClockOverlayAppearance>('clock-appearance', (event) => {
       applyAppearance(event.payload);
+    }).then((fn) => {
+      dispose = fn;
+      loadAppearance();
     });
     return () => {
       clearInterval(timer);
       media.removeEventListener('change', onChange);
-      void unlisten.then((fn) => fn());
+      dispose?.();
     };
   }, []);
 
@@ -103,6 +111,12 @@ function ClockOverlayWindow(): React.JSX.Element {
 
   const color = appearance?.fg ?? (isDark ? '#ffffff' : '#1a1a1a');
   const backgroundColor = appearance?.bg ?? (isDark ? '#202020' : '#f3f3f3');
+  // R8.5：任务栏底色存在横向渐变（壁纸透出），双端点线性复现——平涂单色
+  // 必然与某一侧边缘差 1~4 RGB（敏感眼可见的「细微色差」）
+  const background =
+    appearance?.bgLeft && appearance.bgLeft !== backgroundColor
+      ? `linear-gradient(90deg, ${appearance.bgLeft}, ${backgroundColor})`
+      : backgroundColor;
   const fontFamily =
     "'Microsoft YaHei UI','Microsoft YaHei','Segoe UI',system-ui,sans-serif";
 
@@ -113,7 +127,7 @@ function ClockOverlayWindow(): React.JSX.Element {
         height: '100vh',
         width: '100vw',
         boxSizing: 'border-box',
-        backgroundColor,
+        background,
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',
