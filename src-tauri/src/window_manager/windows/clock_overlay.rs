@@ -429,21 +429,34 @@ static SHRINK_ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
     // R8.1：几何应用持串行锁执行；可见性管理自取同一把锁，必须锁外调用。
-    // R8.7：锁内返回收缩动画需求，锁外执行滑入（持锁睡眠会阻塞全部几何路径）。
+    // R8.7/R8.8：锁内返回收缩动画请求并已置位 SHRINK_ANIMATING 门（持锁内置位，
+    // 消除「锁释放后置位」的竞态间隙，复审 §6.3）；滑入锁外执行（持锁睡眠会
+    // 阻塞全部几何路径），且每步核对最新状态（复审 §6.2：原生回摆/快速再入时
+    // 不得滑向旧终点）。
     let (need_update, anim) = relocate_geometry_locked(app_handle);
     if let Some((from_left, anim_endorsed)) = anim {
+        let mut aborted = false;
         if let Some(window) = app_handle.get_webview_window("clock_overlay") {
             if let Some(hwnd) = get_window_hwnd(&window) {
-                SHRINK_ANIMATING.store(true, std::sync::atomic::Ordering::SeqCst);
                 let right = anim_endorsed.right;
                 let top = anim_endorsed.top;
                 let h = anim_endorsed.bottom - anim_endorsed.top;
                 let total = anim_endorsed.left - from_left;
-                // 4 步 × ~25ms ≈ 100ms 滑入：中间矩形 [x, right] 恒 ⊇ endorsed，
-                // 原生时钟（已在 endorsed 位）全程零暴露；42px 瞬移是复验⑪
-                // 录屏里「收缩抖动」的感知来源，平滑滑入显著弱化。
+                // 4 步 × ~25ms ≈ 100ms 滑入：中间矩形 [x, right] 恒 ⊇ 收缩前
+                // 遮盖态，原生时钟（已读到 endorsed 位）全程零暴露；42px 瞬移
+                // 是复验⑪录屏「收缩抖动」的感知来源，平滑滑入显著弱化。
                 let steps = 4i32;
                 for k in 1..=steps {
+                    let covered_again = GEOM
+                        .lock()
+                        .ok()
+                        .map(|g| g.phase == GeomPhase::Covered || g.mask.is_some())
+                        .unwrap_or(false);
+                    if covered_again {
+                        aborted = true;
+                        geom_log("clockrect: shrink anim aborted (covered again)");
+                        break;
+                    }
                     let x = from_left + total * k / steps;
                     unsafe {
                         let _ = SetWindowPos(
@@ -460,11 +473,22 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
                         std::thread::sleep(std::time::Duration::from_millis(25));
                     }
                 }
-                let _ = apply_overlay_geometry(&window, &anim_endorsed);
-                SHRINK_ANIMATING.store(false, std::sync::atomic::Ordering::SeqCst);
-                geom_log("clockrect: shrink animated (slide-in done)");
+                if !aborted {
+                    let _ = apply_overlay_geometry(&window, &anim_endorsed);
+                    geom_log("clockrect: shrink animated (slide-in done)");
+                }
+            } else {
+                aborted = true;
             }
+        } else {
+            aborted = true;
         }
+        if aborted {
+            // 中止后不落终态：重新被盖时遮盖流程下一针自行应用其几何；
+            // 未被再盖的中止（窗口不可得等罕见路径）下一针 relocate 收敛。
+            // 当前中间矩形 [x, right] 仍 ⊇ endorsed，原生不会因此暴露。
+        }
+        SHRINK_ANIMATING.store(false, std::sync::atomic::Ordering::SeqCst);
     }
     if need_update {
         update_clock_overlay_visibility(app_handle);
@@ -538,6 +562,8 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> (bool, Option<(i32, RECT)
     let anim = if mask.is_some()
         && from_left.map(|l| endorsed.left - l >= 12).unwrap_or(false)
     {
+        // R8.8：持锁内置位——锁释放与置位之间的间隙曾有竞态窗口（复审 §6.3）
+        SHRINK_ANIMATING.store(true, std::sync::atomic::Ordering::SeqCst);
         Some((from_left.unwrap_or(endorsed.left), endorsed))
     } else {
         if !apply_overlay_geometry(&window, &endorsed) {
@@ -1297,7 +1323,6 @@ fn sample_taskbar_pixel() -> Option<TaskbarSample> {
                     .and_then(|guard| guard.as_ref().copied())
             })?;
         let anchor_right = applied.right;
-        let anchor_left = applied.left;
         let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         let mut tray_rect = RECT::default();
         GetWindowRect(tray, &mut tray_rect).ok()?;
@@ -1391,12 +1416,17 @@ fn sample_taskbar_pixel() -> Option<TaskbarSample> {
             None
         };
 
-        // ---- 左侧净列（R8.4 主参考）：从覆盖层左缘外 2px 起向左每 8px 一列，
-        // 最多 5 列；归属（托盘）+ 三点离散度 ≤6（图标/悬停高亮列被过滤），
-        // 取最近的净列三点均值。
+        // ---- 左侧净列（R8.4 主参考；R8.8 屏幕坐标固定列）：右缘向左
+        // 175~200px 共 6 个**固定屏幕列**（遮盖 3607..3819 与常规 3649..3819
+        // 两态下位置不变，使渐变映射屏幕锚定——窗口移动/收缩只裁切不重映射；
+        // 候选窗曾取 190/195/200px 处全被图标污染（03:24 实测 left=none），
+        // 修正为 175~200px 覆盖实测净列 3639/3644 一带；CSS 映射按 -190px
+        // 名义位置，滑差 ≤10px ≈0.1 RGB 可忽略）。归属（托盘）+ 三点离散度
+        // ≤6 过滤污染；遮盖期这些列位于覆盖层窗口内部→归属拒绝→退化为
+        // 平涂（安全侧）。
         let mut left: Option<(u8, u8, u8)> = None;
-        for k in 1..=5i32 {
-            let sx = anchor_left - 2 - k * 8;
+        for k in 0..6i32 {
+            let sx = anchor_right - 175 - k * 5;
             if sx <= tray_rect.left + 2 {
                 break;
             }
@@ -1656,16 +1686,42 @@ fn spawn_appearance_workers(app: AppHandle) {
         .ok();
 }
 
+/// R8.8 外观更新候选（纯函数）：候选=本轮双端采样，变化量=与上次推送的
+/// 最大通道差。抽出纯函数并单测锁定语义——防止再次出现「采样值不参与
+/// 计算」（R8.5 回归：cand_left=prev_left+corr 使左端点/渐变斜率冻结）或
+/// 「inside 缺失误判收敛」（R8.5 回归：corr=0→d=0）一类缺陷。
+/// `inside` 不进入本函数：渲染偏差实测为 0，它只作为独立诊断量记录
+/// （见 run_appearance_sample 的 insideErr）。
+fn appearance_update(
+    prev: ((u8, u8, u8), (u8, u8, u8)),
+    left: (u8, u8, u8),
+    right: (u8, u8, u8),
+) -> (((u8, u8, u8), (u8, u8, u8)), i32) {
+    let cand = (left, right);
+    let ch_d = |a: (u8, u8, u8), b: (u8, u8, u8)| {
+        (a.0 as i32 - b.0 as i32)
+            .abs()
+            .max((a.1 as i32 - b.1 as i32).abs())
+            .max((a.2 as i32 - b.2 as i32).abs())
+    };
+    let d = ch_d(cand.0, prev.0).max(ch_d(cand.1, prev.1));
+    (cand, d)
+}
+
 /// 执行一次采样与推送（worker 串行调用，无并发）。失败保持最近可信色，
 /// 原因已在 sample_taskbar_pixel 内记诊断日志。
 ///
 /// R8.5 渐变双端点：覆盖层下方的任务栏表面是**横向渐变**（壁纸透出，实测
 /// 左端 E9D9CC → 右端 E7D8CD，亮态下更陡），平涂单色必然与某一侧边缘差
 /// 1~4 RGB——复验⑩「还是有」的细微持续色差。改为推送双端点 (left,right)，
-/// 前端 `linear-gradient(90deg, left, right)` 复现渐变，理论上任意 x 处
-/// 与真实表面差 ≤1。
-/// R8.2 闭环校准保留：内部点在覆盖层右缘（与右端条带配对），修正量
-/// `采样右端 - 内部色` 同步应用到双端（渲染偏差实测为 0，均匀假设成立）。
+/// 前端 `linear-gradient` 按**屏幕坐标锚定**复现渐变（窗口移动/收缩只裁切
+/// 不重映射）。
+/// R8.8 双端直接更新（复审 §2/§3/§5 确定性缺陷修复）：候选=本轮双端采样
+/// （`appearance_update`），渲染偏差实测为 0 故不做积分式校正。旧闭环公式
+/// `cand=prev+(采样-内部)` 的三重缺陷：左端采样不参与（渐变斜率冻结，复审
+/// §2）、内部点缺失时冻结更新并误报收敛（复审 §3，R8.5 回归）、上一次推送
+/// 未呈现时误差重复累计（复审 §5）。内部读数保留为**诊断量**：insideErr
+/// 非零即渲染/呈现偏差告警，不再进入控制回路。
 fn run_appearance_sample(app: &AppHandle, src: &'static str) {
     let Some(s) = sample_taskbar_pixel() else {
         geom_log(&format!("appearance run src={src}: no sample (kept trusted color)"));
@@ -1696,45 +1752,27 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
         push_appearance(app, src, left, right, &src_note);
         return;
     };
-    // 闭环候选：旧推送 + 观测色差（内部色在覆盖层右缘，与右端配对；
-    // 同一修正量应用到左端——渲染偏差实测为 0，均匀假设成立）
-    let corr = match s.inside {
-        Some(ins) => (
-            right.0 as i32 - ins.0 as i32,
-            right.1 as i32 - ins.1 as i32,
-            right.2 as i32 - ins.2 as i32,
+    // R8.8 双端直接更新：候选=本轮采样（见上方函数文档；appearance_update
+    // 纯函数可单测）。内部读数降级为诊断量。
+    let ((cand_left, cand_right), d) = appearance_update((prev_left, prev_right), left, right);
+    let inside_note = match s.inside {
+        Some(i) => format!(
+            "inside=#{:02X}{:02X}{:02X} (err={:+},{:+},{:+})",
+            i.0,
+            i.1,
+            i.2,
+            i.0 as i32 - cand_right.0 as i32,
+            i.1 as i32 - cand_right.1 as i32,
+            i.2 as i32 - cand_right.2 as i32
         ),
-        None => (0, 0, 0),
+        None => "inside=none (open-loop)".into(),
     };
-    let cand_right = (
-        (prev_right.0 as i32 + corr.0).clamp(0, 255) as u8,
-        (prev_right.1 as i32 + corr.1).clamp(0, 255) as u8,
-        (prev_right.2 as i32 + corr.2).clamp(0, 255) as u8,
-    );
-    let cand_left = (
-        (prev_left.0 as i32 + corr.0).clamp(0, 255) as u8,
-        (prev_left.1 as i32 + corr.1).clamp(0, 255) as u8,
-        (prev_left.2 as i32 + corr.2).clamp(0, 255) as u8,
-    );
-    let d = (cand_right.0 as i32 - prev_right.0 as i32)
-        .abs()
-        .max((cand_right.1 as i32 - prev_right.1 as i32).abs())
-        .max((cand_right.2 as i32 - prev_right.2 as i32).abs())
-        .max(
-            (cand_left.0 as i32 - prev_left.0 as i32)
-                .abs()
-                .max((cand_left.1 as i32 - prev_left.1 as i32).abs())
-                .max((cand_left.2 as i32 - prev_left.2 as i32).abs()),
-        );
     if d < 2 {
         geom_log(&format!(
-            "appearance run src={src}: converged right=#{:02X}{:02X}{:02X} {src_note} inside={} pushed=({:02X}{:02X}{:02X}|{:02X}{:02X}{:02X}) d={d}",
+            "appearance run src={src}: converged right=#{:02X}{:02X}{:02X} {src_note} {inside_note} pushed=({:02X}{:02X}{:02X}|{:02X}{:02X}{:02X}) d={d}",
             right.0,
             right.1,
             right.2,
-            s.inside
-                .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
-                .unwrap_or_else(|| "none".into()),
             prev_left.0, prev_left.1, prev_left.2,
             prev_right.0, prev_right.1, prev_right.2
         ));
@@ -1770,4 +1808,49 @@ fn push_appearance(
             "seq": seq,
         }),
     );
+}
+
+#[cfg(test)]
+mod tests {
+    // R8.8：合成输入单测，锁定外观更新语义（复审 §10 实验 A 的可判定部分）。
+    // 回归背景：R8.5 版实现 cand_left=prev_left+corr（左端采样不参与，渐变
+    // 斜率冻结）、inside=None 时 corr=0 导致更新冻结并误报收敛。
+    use super::appearance_update;
+    type Rgb = (u8, u8, u8);
+
+    #[test]
+    fn 左端变化必须进入候选_即使右端与内部读数都不变() {
+        // 复审 §2 反例：旧推送 (233,231)，新采样左 243/右 231——旧公式 corr=0
+        // 会输出 d=0 丢弃；直接更新必须采纳左端新值。
+        let prev = ((233u8, 220u8, 210u8), (231u8, 216u8, 205u8));
+        let (cand, d) = appearance_update(prev, (243, 230, 210), (231, 216, 205));
+        assert_eq!(cand.0, (243, 230, 210));
+        assert_eq!(cand.1, (231, 216, 205));
+        assert!(d >= 2);
+    }
+
+    #[test]
+    fn 候选恒等于本轮采样_与历史值和内部读数无关() {
+        // 直接更新语义：候选只由本轮采样决定（渲染偏差实测为 0，不做积分校正）
+        let prev = ((200u8, 200u8, 200u8), (200u8, 200u8, 200u8));
+        let (cand, _) = appearance_update(prev, (240, 228, 219), (241, 228, 218));
+        assert_eq!(cand, ((240, 228, 219), (241, 228, 218)));
+    }
+
+    #[test]
+    fn 采样与推送一致时变化量低于推送死区() {
+        let c = ((231u8, 216u8, 205u8), (233u8, 217u8, 204u8));
+        let (_, d) = appearance_update(c, c.0, c.1);
+        assert_eq!(d, 0);
+    }
+
+    #[test]
+    fn 渐变斜率变化_两端独立跟随() {
+        // 斜率变大：左端更亮、右端不变——两端必须各自跟随
+        let prev = ((233u8, 217u8, 204u8), (231u8, 216u8, 205u8));
+        let (cand, d) = appearance_update(prev, (241, 225, 212), (231, 216, 205));
+        assert_eq!(cand.0, (241, 225, 212));
+        assert_eq!(cand.1, (231, 216, 205));
+        assert_eq!(d, 8);
+    }
 }

@@ -110,13 +110,23 @@ function ClockOverlayWindow(): React.JSX.Element {
   const weekText = now.format('dddd');
 
   const color = appearance?.fg ?? (isDark ? '#ffffff' : '#1a1a1a');
-  const backgroundColor = appearance?.bg ?? (isDark ? '#202020' : '#f3f3f3');
-  // R8.5：任务栏底色存在横向渐变（壁纸透出），双端点线性复现——平涂单色
-  // 必然与某一侧边缘差 1~4 RGB（敏感眼可见的「细微色差」）
-  const background =
-    appearance?.bgLeft && appearance.bgLeft !== backgroundColor
-      ? `linear-gradient(90deg, ${appearance.bgLeft}, ${backgroundColor})`
-      : backgroundColor;
+  const flatBackground = appearance?.bg ?? (isDark ? '#202020' : '#f3f3f3');
+  const bgLeft = appearance?.bgLeft;
+  // R8.5/R8.8：任务栏底色存在横向渐变（壁纸透出）——双端采样（左列=窗口
+  // 右缘内 190px、右列=右缘外 8px，均为**固定屏幕位置**，跨遮盖/常规两态
+  // 不变）+ 渐变图 198px 宽、自右缘 -8px 锚定：窗口移动/收缩只**裁切**，
+  // 不再按 100vw 百分比重映射（旧实现窗口变宽时整段背景重新拉伸=收缩
+  // 过程中的色彩漂移来源之一）。bgLeft 兜底色填补渐变图左侧未覆盖段。
+  const hasGradient = !!bgLeft && bgLeft !== flatBackground;
+  const background: React.CSSProperties = hasGradient
+    ? {
+        backgroundColor: bgLeft ?? flatBackground,
+        backgroundImage: `linear-gradient(90deg, ${bgLeft}, ${flatBackground})`,
+        backgroundRepeat: 'no-repeat',
+        backgroundSize: '198px 100%',
+        backgroundPosition: 'right -8px top 0',
+      }
+    : { backgroundColor: flatBackground };
   const fontFamily =
     "'Microsoft YaHei UI','Microsoft YaHei','Segoe UI',system-ui,sans-serif";
 
@@ -127,7 +137,7 @@ function ClockOverlayWindow(): React.JSX.Element {
         height: '100vh',
         width: '100vw',
         boxSizing: 'border-box',
-        background,
+        ...background,
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',
