@@ -493,16 +493,16 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
             g.exit_watch_until = Some(
                 std::time::Instant::now() + std::time::Duration::from_millis(EXIT_WATCH_MS),
             );
-            // R8：收缩执行点即时采样——UIA 已读到原生归位，采样条大概率已
-            // 露出，成功则色差窗从「兜底」缩到一次采样+一帧渲染级；归属校验
-            // 挡住残影竞态（被拒则靠下面的兜底）。退出窗口期只保留这三个
-            // 事后时机（R8.1 撤掉 z-reclaim/visible-switch/mask-held-tick
-            // 活跃采样：00:56 实测过渡态亚克力被视频透出污染，采样在
-            // #F1E4DB↔#E7D8CD 间翻转推送=用户残余色差；稳态色由 15s 保鲜
-            // 维持，退出期信任它即可）；+1500ms 补采慢收敛亚克力。
-            refresh_clock_overlay_appearance(app_handle, 0, "post-shrink-now");
+            // R8.3：收缩后采样只保留延迟针（400/1500/4000ms）。R8 引入的
+            // delay=0 即时采样是「持续色差」毒源（复验⑧日志实锤）：退出
+            // 动画期亚克力正从视频透出过渡到壁纸透出，即时采样屡次采到
+            // 过渡色推送（#F0E4DB/#E8D9CE），快速连续测试时纠正针又被
+            // 下一次全屏盖住拒绝——色差驻留到 trusted 兜底才恢复。这与
+            // R8.1 撤销 z-reclaim/visible-switch/mask-held-tick 同理：
+            // 过渡态不采样，等世界稳定后再采纳。
             refresh_clock_overlay_appearance(app_handle, 400, "post-shrink-400");
             refresh_clock_overlay_appearance(app_handle, 1500, "post-shrink-1500");
+            refresh_clock_overlay_appearance(app_handle, 4000, "post-shrink-4000");
         }
     }
     // z 序维护按当前模式分流：常规模式重申 topmost（防任务栏重申后压到覆盖层
@@ -1400,12 +1400,13 @@ static APPEARANCE_WORKERS_STARTED: std::sync::atomic::AtomicBool =
 /// 底色动态跟随请求入口（R7.5 建立，R8 改为合并调度）。`delay_ms` 为 0 表示
 /// 立即，`src` 仅供诊断日志区分调用方。
 ///
-/// 时机全景（R8.1 收敛后）：
+/// 时机全景（R8.3 收敛后）：
 /// - **attach 即刻**：前端过渡色（主题近似值）换真色，并点火 worker/保鲜线程；
-/// - **收缩执行点三连采（0 / 400 / 1500ms）**：原生归位即采、合成稳定再校、
-///   慢收敛亚克力最后兜底——这是退出期**唯一**的采样时机；
-/// - **正常态 15s 可信色保鲜**：任务栏可见的稳态下轻采，亚克力/壁纸缓变时
-///   覆盖层色不再渐旧，会话首轮退出时的底色也不再陈旧。
+/// - **收缩后延迟三连采（400 / 1500 / 4000ms）**：等亚克力从「视频透出」
+///   过渡回「壁纸透出」稳定后再采纳——这是退出期**唯一**的采样时机
+///   （R8.3 撤销 delay=0 即时针：过渡色毒源，复验⑧日志实锤）；
+/// - **正常态保鲜（15s / 退出观测窗内 3s）**：任务栏可见的稳态下轻采，
+///   亚克力/壁纸缓变时覆盖层色不再渐旧，会话首轮退出时的底色也不再陈旧。
 ///
 /// R8.1 重要教训（撤销 R8/R7.6 的退出窗口期活跃采样 z-reclaim /
 /// visible-switch / mask-held-tick）：退出过渡期任务栏亚克力的透出内容正从
@@ -1461,10 +1462,18 @@ fn spawn_appearance_workers(app: AppHandle) {
     // 正常态可信色保鲜（R8）：稳态可见期每 15s 轻采一次。全屏期/回摆期跳过
     // （那边由时机层覆盖，且盖住者会顶掉归属校验）；这里的收益在正常态——
     // 旧实现只在退出轮采样，正常态底色缓变时覆盖层色渐旧无人纠正。
+    // R8.3：退出观测窗内（收缩后 6s）提速到 3s——连续测试中最后一轮若仍
+    // 留有过渡色，最迟 3s 纠正（此前实测最坏 6.5s+ 才被 15s 兜底拉回）。
     let _ = std::thread::Builder::new()
         .name("clock-appearance-trusted".into())
         .spawn(move || loop {
-            std::thread::sleep(std::time::Duration::from_secs(15));
+            let in_watch = GEOM
+                .lock()
+                .ok()
+                .and_then(|g| g.exit_watch_until)
+                .map(|t| t > std::time::Instant::now())
+                .unwrap_or(false);
+            std::thread::sleep(std::time::Duration::from_secs(if in_watch { 3 } else { 15 }));
             if !ATTACHED.load(std::sync::atomic::Ordering::SeqCst) {
                 continue;
             }
