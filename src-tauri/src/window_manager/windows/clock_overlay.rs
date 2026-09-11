@@ -1184,27 +1184,49 @@ unsafe fn sample_point_owned(pt: (i32, i32), tray: HWND) -> bool {
 /// 半覆盖的气泡/残影会拉高散度——宁可不采保留旧色，不推送污染值）。
 /// 失败原因经 geom_log 记入诊断。三道闸都不代表像素真值的充分证明，
 /// 但把已知竞态（#00FFFD/#67EDE8/#C8F2EF 三采样污染实测）全部挡住。
-/// R8.2 闭环校准（修「细微色差持续不恢复」）：返回 `(外部色, 内部色)`。
-/// 内部色 = 覆盖层右缘内 2px 的屏幕像素（三点中位）——即**我们推送色的实际
-/// 显示效果**。开环链路（外部采样 vs 推送值）自洽时日志全是 unchanged，但
-/// 用户仍见持续色差（复验⑦）——偏差位于「推送色→屏幕呈现」之间（WebView2
-/// /DWM 色彩管理、采样条与时钟区的横向底色差等），开环结构性观测不到。
-/// 内外部之差就是用户肉眼所见色差，由 run_appearance_sample 反馈到推送值。
-/// 内部点归属必须命中覆盖层自身（滑动跟随中/被盖时拒绝→None→退化纯开环）。
-fn sample_taskbar_pixel() -> Option<((u8, u8, u8), Option<(u8, u8, u8)>)> {
+/// R8.4 采样结果：主色 + 两个参考区读数 + 覆盖层实际显示色。
+struct TaskbarSample {
+    /// 推送用主色：左侧净列（纯任务栏表面）优先，条带回退
+    primary: (u8, u8, u8),
+    /// 条带（「显示桌面」细条）读数——诊断对照；R8.4 起仅作回退
+    strip: Option<(u8, u8, u8)>,
+    /// 左侧净列读数——诊断
+    left: Option<(u8, u8, u8)>,
+    /// 覆盖层实际显示色（闭环校准用）
+    inside: Option<(u8, u8, u8)>,
+}
+
+/// R8.2 闭环校准：内部色 = 覆盖层右缘内 2px 的屏幕像素（三点中位）——即
+/// **我们推送色的实际显示效果**。开环链路（外部采样 vs 推送值）自洽时日志
+/// 全是 unchanged，但用户仍见持续色差（复验⑦）——偏差位于「推送色→屏幕
+/// 呈现」之间，开环结构性观测不到。内外部之差就是用户肉眼所见色差，由
+/// run_appearance_sample 反馈到推送值。内部点归属必须命中覆盖层自身
+/// （滑动跟随中/被盖时拒绝→None→退化纯开环）。
+///
+/// R8.4 主参考迁移（修「退出后先无色差→很快有色差→保持」）：主参考从
+/// 「显示桌面」细条改覆盖层**左侧净列**（托盘图标间隙的纯任务栏表面）。
+/// 复验⑨实测：退出全屏后条带可稳定偏离主色 9~14 RGB 数秒（#F0E4DB vs
+/// #E7D8CD，条带是特殊交互元素，有独立的高亮/材质态），而我们把它平涂
+/// 给整个覆盖层 → 「本来无色差（trusted 色当时正确）→ 采样采纳条带分叉色
+/// → 与周围任务栏色差并保持」。左侧净列与覆盖层下方是同一块连续表面，
+/// 无条带的特殊状态；图标污染列用逐列离散度过滤（纯色列散度 ≤6 才采）。
+/// 条带降级为回退（左侧无净列时）+ 诊断对照（日志双读数，分叉可直读）。
+fn sample_taskbar_pixel() -> Option<TaskbarSample> {
     unsafe {
-        // 采样锚点：当前实际应用矩形右缘（恒在覆盖层窗口之外）
-        let anchor_right = LAST_APPLIED_RECT
+        // 采样锚点：当前实际应用矩形（遮盖在场=遮盖矩形，常规=认可矩形）
+        let applied = LAST_APPLIED_RECT
             .lock()
             .ok()
-            .and_then(|g| g.as_ref().map(|r| r.right))
-            .or_else(|| GEOM.lock().ok().and_then(|g| g.endorsed.map(|r| r.right)))
+            .and_then(|g| *g)
+            .or_else(|| GEOM.lock().ok().and_then(|g| g.endorsed))
             .or_else(|| {
                 crate::windows_hook::CLOCK_AREA_RECT_CACHE
                     .read()
                     .ok()
-                    .and_then(|guard| guard.as_ref().map(|r| r.right))
+                    .and_then(|guard| guard.as_ref().copied())
             })?;
+        let anchor_right = applied.right;
+        let anchor_left = applied.left;
         let tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
         let mut tray_rect = RECT::default();
         GetWindowRect(tray, &mut tray_rect).ok()?;
@@ -1219,45 +1241,135 @@ fn sample_taskbar_pixel() -> Option<((u8, u8, u8), Option<(u8, u8, u8)>)> {
             return None;
         }
         let screen_right = mi.rcMonitor.right;
-        // 条内取 3 个纵向位置、3 列（右缘外 3/8/13px，上/中/下错开抗单点噪点）
+        // 条内取 3 个纵向位置（上/中/下错开抗单点噪点）
         let y_mid = (tray_rect.top + tray_rect.bottom) / 2;
         let y_top = tray_rect.top + (tray_rect.bottom - tray_rect.top) / 4;
         let y_bot = tray_rect.bottom - (tray_rect.bottom - tray_rect.top) / 4;
-        let mut pts: Vec<(i32, i32)> = Vec::with_capacity(12);
+
+        // ---- 条带参考（回退 + 诊断）：3 列 × 3 行，读前逐点归属校验 ----
+        let mut strip_pts: Vec<(i32, i32)> = Vec::with_capacity(9);
         for dx in [3i32, 8, 13] {
             let sx = anchor_right + dx;
             if sx >= screen_right - 1 {
                 break;
             }
             for y in [y_top, y_mid, y_bot] {
-                pts.push((sx, y));
+                strip_pts.push((sx, y));
             }
         }
-        if pts.len() < 3 {
-            geom_log("appearance sample: no room right of anchor, skip");
-            return None;
+        let strip_pre_ok =
+            strip_pts.len() >= 3 && strip_pts.iter().all(|p| sample_point_owned(*p, tray));
+        if !strip_pre_ok {
+            geom_log("appearance sample: strip pre-check owned=false");
         }
-        // 闸①：读前逐点归属校验——被盖住者/其他窗口占据，宁可不采
-        if let Some(bad) = pts.iter().find(|p| !sample_point_owned(**p, tray)) {
-            geom_log(&format!("appearance sample: pre-check owned=false at ({},{}), skip", bad.0, bad.1));
-            return None;
-        }
+
         let dc = GetDC(None);
-        let mut colors: Vec<(u8, u8, u8)> = Vec::with_capacity(pts.len());
-        for p in &pts {
-            let color = GetPixel(dc, p.0, p.1).0;
-            if color == 0xFFFF_FFFF {
+        let strip = if strip_pre_ok {
+            let mut colors: Vec<(u8, u8, u8)> = Vec::with_capacity(strip_pts.len());
+            for p in &strip_pts {
+                let color = GetPixel(dc, p.0, p.1).0;
+                if color != 0xFFFF_FFFF {
+                    colors.push((
+                        (color & 0xFF) as u8,
+                        ((color >> 8) & 0xFF) as u8,
+                        ((color >> 16) & 0xFF) as u8,
+                    ));
+                }
+            }
+            // 闸②：读后复验三列中线（收窄检查与读取之间的竞态窗）
+            let post_ok = [3i32, 8, 13]
+                .iter()
+                .all(|dx| sample_point_owned((anchor_right + dx, y_mid), tray));
+            // 闸③：块内离散度守卫——半覆盖的气泡/残影会拉高散度
+            let spread = colors
+                .iter()
+                .fold((255u8, 255u8, 255u8, 0u8, 0u8, 0u8), |a, c| {
+                    (
+                        a.0.min(c.0),
+                        a.1.min(c.1),
+                        a.2.min(c.2),
+                        a.3.max(c.0),
+                        a.4.max(c.1),
+                        a.5.max(c.2),
+                    )
+                });
+            let spread_v = (spread.3 - spread.0)
+                .max(spread.4 - spread.1)
+                .max(spread.5 - spread.2) as i32;
+            if !post_ok {
+                geom_log("appearance sample: strip post-check owned=false, discard");
+                None
+            } else if colors.len() < 3 {
+                geom_log("appearance sample: strip GetPixel all failed");
+                None
+            } else if spread_v > 48 {
+                geom_log(&format!("appearance sample: strip dispersion {spread_v} > 48, discard"));
+                None
+            } else {
+                let n = colors.len() as u32;
+                let sum = colors.iter().fold((0u32, 0u32, 0u32), |a, c| {
+                    (a.0 + c.0 as u32, a.1 + c.1 as u32, a.2 + c.2 as u32)
+                });
+                Some((
+                    (sum.0 / n) as u8,
+                    (sum.1 / n) as u8,
+                    (sum.2 / n) as u8,
+                ))
+            }
+        } else {
+            None
+        };
+
+        // ---- 左侧净列（R8.4 主参考）：从覆盖层左缘外 2px 起向左每 8px 一列，
+        // 最多 5 列；归属（托盘）+ 三点离散度 ≤6（图标/悬停高亮列被过滤），
+        // 取最近的净列三点均值。
+        let mut left: Option<(u8, u8, u8)> = None;
+        for k in 1..=5i32 {
+            let sx = anchor_left - 2 - k * 8;
+            if sx <= tray_rect.left + 2 {
+                break;
+            }
+            let cols = [(sx, y_top), (sx, y_mid), (sx, y_bot)];
+            if !cols.iter().all(|p| sample_point_owned(*p, tray)) {
                 continue;
             }
-            colors.push((
-                (color & 0xFF) as u8,
-                ((color >> 8) & 0xFF) as u8,
-                ((color >> 16) & 0xFF) as u8,
+            let mut rows: Vec<(u8, u8, u8)> = Vec::with_capacity(3);
+            for p in cols {
+                let color = GetPixel(dc, p.0, p.1).0;
+                if color != 0xFFFF_FFFF {
+                    rows.push((
+                        (color & 0xFF) as u8,
+                        ((color >> 8) & 0xFF) as u8,
+                        ((color >> 16) & 0xFF) as u8,
+                    ));
+                }
+            }
+            if rows.len() < 3 {
+                continue;
+            }
+            let sp = rows.iter().fold((255u8, 255u8, 255u8, 0u8, 0u8, 0u8), |a, c| {
+                (
+                    a.0.min(c.0),
+                    a.1.min(c.1),
+                    a.2.min(c.2),
+                    a.3.max(c.0),
+                    a.4.max(c.1),
+                    a.5.max(c.2),
+                )
+            });
+            let spread_v = (sp.3 - sp.0).max(sp.4 - sp.1).max(sp.5 - sp.2) as i32;
+            if spread_v > 6 {
+                continue; // 图标/悬停高亮污染列，换更左侧
+            }
+            left = Some((
+                ((rows[0].0 as u32 + rows[1].0 as u32 + rows[2].0 as u32) / 3) as u8,
+                ((rows[0].1 as u32 + rows[1].1 as u32 + rows[2].1 as u32) / 3) as u8,
+                ((rows[0].2 as u32 + rows[1].2 as u32 + rows[2].2 as u32) / 3) as u8,
             ));
+            break;
         }
-        // R8.2 内部点：覆盖层右缘内 2px（padding 纯背景区，避开文字/keepalive
-        // 像素），三点中位抗单点噪声。归属必须命中覆盖层自身——滑动跟随中/
-        // 被其他窗口压住时拒绝，闭环退化为纯开环（安全侧）。
+
+        // ---- 内部点（闭环）：覆盖层右缘内 2px（padding 纯背景区），三点中位 ----
         let mut inside: Option<(u8, u8, u8)> = None;
         let own_hwnd = OVERLAY_HWND.lock().ok().and_then(|h| *h);
         let inside_owned = |p: (i32, i32)| -> bool {
@@ -1297,47 +1409,13 @@ fn sample_taskbar_pixel() -> Option<((u8, u8, u8), Option<(u8, u8, u8)>)> {
         } else if own_hwnd.is_some() {
             geom_log("appearance sample: inside points not owned, closed-loop off this round");
         }
-        // 闸②：读后复验三列中线（归属检查与像素采集不是同一时刻，收窄竞态窗）
-        let post_ok = [3i32, 8, 13]
-            .iter()
-            .all(|dx| sample_point_owned((anchor_right + dx, y_mid), tray));
         ReleaseDC(None, dc);
-        if !post_ok {
-            geom_log("appearance sample: post-check owned=false, discard");
+
+        let Some(primary) = left.or(strip) else {
+            geom_log("appearance sample: no clean surface (left & strip unavailable), skip");
             return None;
-        }
-        if colors.len() < 3 {
-            geom_log("appearance sample: GetPixel all failed, skip");
-            return None;
-        }
-        // 闸③：块内离散度守卫——半覆盖的气泡/残影/悬停高亮会拉高散度
-        let mut mn = (255u8, 255u8, 255u8);
-        let mut mx = (0u8, 0u8, 0u8);
-        for c in &colors {
-            mn.0 = mn.0.min(c.0);
-            mn.1 = mn.1.min(c.1);
-            mn.2 = mn.2.min(c.2);
-            mx.0 = mx.0.max(c.0);
-            mx.1 = mx.1.max(c.1);
-            mx.2 = mx.2.max(c.2);
-        }
-        let spread = (mx.0 - mn.0).max(mx.1 - mn.1).max(mx.2 - mn.2) as i32;
-        if spread > 48 {
-            geom_log(&format!("appearance sample: dispersion {spread} > 48, discard"));
-            return None;
-        }
-        let n = colors.len() as u32;
-        let sum = colors.iter().fold((0u32, 0u32, 0u32), |a, c| {
-            (a.0 + c.0 as u32, a.1 + c.1 as u32, a.2 + c.2 as u32)
-        });
-        Some((
-            (
-                (sum.0 / n) as u8,
-                (sum.1 / n) as u8,
-                (sum.2 / n) as u8,
-            ),
-            inside,
-        ))
+        };
+        Some(TaskbarSample { primary, strip, left, inside })
     }
 }
 
@@ -1345,8 +1423,9 @@ fn sample_taskbar_pixel() -> Option<((u8, u8, u8), Option<(u8, u8, u8)>)> {
 /// 返回 `(背景 hex, 前景 hex)`。绝不返回透明——透底叠字是覆盖式方案的头号风险。
 pub fn clock_overlay_appearance_colors() -> (String, String) {
     let (bg, source) = match sample_taskbar_pixel() {
-        // 命令路径（前端初始加载）只取外部采样色；闭环校准仅在 worker 推送路径
-        Some((sampled, _)) => {
+        // 命令路径（前端初始加载）取主参考色；闭环校准仅在 worker 推送路径
+        Some(s) => {
+            let sampled = s.primary;
             // R8.2：同步推送基准——前端将显示此色，闭环以 LAST_PUSHED_BG 为
             // 「当前显示色」参照，不同步会把命令设置的色误算成偏差
             if let Ok(mut last) = LAST_PUSHED_BG.lock() {
@@ -1503,28 +1582,40 @@ fn spawn_appearance_workers(app: AppHandle) {
 /// 开环链路采样自洽、永远看不见这类偏差）。内部色不可得时退化纯开环
 /// （|采样-旧推送|≥3 才推采样值）。收敛后 |差|<2 不推送，避免反复重绘。
 fn run_appearance_sample(app: &AppHandle, src: &'static str) {
-    let Some((sampled, inside)) = sample_taskbar_pixel() else {
+    let Some(s) = sample_taskbar_pixel() else {
         geom_log(&format!("appearance run src={src}: no sample (kept trusted color)"));
         return;
+    };
+    let sampled = s.primary;
+    let src_note = match (s.left, s.strip) {
+        (Some(l), Some(st)) => {
+            let d_ls = (l.0 as i32 - st.0 as i32)
+                .abs()
+                .max((l.1 as i32 - st.1 as i32).abs().max((l.2 as i32 - st.2 as i32).abs()));
+            format!("left=#{:02X}{:02X}{:02X} strip=#{:02X}{:02X}{:02X} (d={d_ls})", l.0, l.1, l.2, st.0, st.1, st.2)
+        }
+        (Some(l), None) => format!("left=#{:02X}{:02X}{:02X} strip=none", l.0, l.1, l.2),
+        (None, Some(st)) => format!("left=none strip=#{:02X}{:02X}{:02X}", st.0, st.1, st.2),
+        (None, None) => "left=none strip=none".into(),
     };
     let Ok(mut last) = LAST_PUSHED_BG.lock() else {
         return;
     };
     let Some(prev) = *last else {
-        // 首次推送（无参照显示色）：直接推任务栏本色
+        // 首次推送（无参照显示色）：直接推主参考色
         *last = Some(sampled);
         drop(last);
-        push_appearance(app, src, sampled, sampled, None);
+        push_appearance(app, src, sampled, &src_note, s.inside);
         return;
     };
     // 闭环候选：旧推送 + 观测色差（内部色在才可算）
-    let candidate = match inside {
+    let candidate = match s.inside {
         Some(ins) => (
             (prev.0 as i32 + sampled.0 as i32 - ins.0 as i32).clamp(0, 255) as u8,
             (prev.1 as i32 + sampled.1 as i32 - ins.1 as i32).clamp(0, 255) as u8,
             (prev.2 as i32 + sampled.2 as i32 - ins.2 as i32).clamp(0, 255) as u8,
         ),
-        // 内部色不可得：退化开环，候选=采样本色
+        // 内部色不可得：退化开环，候选=主参考色
         None => sampled,
     };
     let d = (candidate.0 as i32 - prev.0 as i32)
@@ -1533,11 +1624,11 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
         .max((candidate.2 as i32 - prev.2 as i32).abs());
     if d < 2 {
         geom_log(&format!(
-            "appearance run src={src}: converged sampled=#{:02X}{:02X}{:02X} inside={} pushed=#{:02X}{:02X}{:02X} d={d}",
+            "appearance run src={src}: converged primary=#{:02X}{:02X}{:02X} {src_note} inside={} pushed=#{:02X}{:02X}{:02X} d={d}",
             sampled.0,
             sampled.1,
             sampled.2,
-            inside
+            s.inside
                 .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
                 .unwrap_or_else(|| "none".into()),
             prev.0,
@@ -1548,7 +1639,7 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
     }
     *last = Some(candidate);
     drop(last);
-    push_appearance(app, src, candidate, sampled, inside);
+    push_appearance(app, src, candidate, &src_note, s.inside);
 }
 
 /// 推送外观到前端（seq 自增 + 事件 emit）。
@@ -1556,20 +1647,17 @@ fn push_appearance(
     app: &AppHandle,
     src: &'static str,
     bg: (u8, u8, u8),
-    sampled: (u8, u8, u8),
+    src_note: &str,
     inside: Option<(u8, u8, u8)>,
 ) {
     let luminance = 0.2126 * bg.0 as f64 + 0.7152 * bg.1 as f64 + 0.0722 * bg.2 as f64;
     let fg = if luminance > 128.0 { "#1a1a1a" } else { "#ffffff" };
     let seq = APPEARANCE_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     crate::dbg_log(&format!(
-        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X} sampled=#{:02X}{:02X}{:02X} inside={} (closed-loop)",
+        "clockrect: appearance push seq={seq} src={src} bg=#{:02X}{:02X}{:02X} {src_note} inside={} (closed-loop)",
         bg.0,
         bg.1,
         bg.2,
-        sampled.0,
-        sampled.1,
-        sampled.2,
         inside
             .map(|i| format!("#{:02X}{:02X}{:02X}", i.0, i.1, i.2))
             .unwrap_or_else(|| "none".into())
