@@ -423,20 +423,66 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 /// （3618..3660）暴露在认可位覆盖层左侧（23:50 真机实测每趟摆动都有
 /// ~150-300ms 暴露窗）。读数到达即唤起可见性管理完成展开，暴露窗压到
 /// 探测耗时级（~70ms，UIA 查询延迟为下限）。
+/// 收缩动画进行中标记（R8.7）：动画期间 update/relocate 跳过几何应用，
+/// 避免 150ms 探针针把滑入过程打断成跳变；终态由动画自身精确落位。
+static SHRINK_ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
-    // R8.1：几何应用持串行锁执行；可见性管理自取同一把锁，必须锁外调用
-    if relocate_geometry_locked(app_handle) {
+    // R8.1：几何应用持串行锁执行；可见性管理自取同一把锁，必须锁外调用。
+    // R8.7：锁内返回收缩动画需求，锁外执行滑入（持锁睡眠会阻塞全部几何路径）。
+    let (need_update, anim) = relocate_geometry_locked(app_handle);
+    if let Some((from_left, anim_endorsed)) = anim {
+        if let Some(window) = app_handle.get_webview_window("clock_overlay") {
+            if let Some(hwnd) = get_window_hwnd(&window) {
+                SHRINK_ANIMATING.store(true, std::sync::atomic::Ordering::SeqCst);
+                let right = anim_endorsed.right;
+                let top = anim_endorsed.top;
+                let h = anim_endorsed.bottom - anim_endorsed.top;
+                let total = anim_endorsed.left - from_left;
+                // 4 步 × ~25ms ≈ 100ms 滑入：中间矩形 [x, right] 恒 ⊇ endorsed，
+                // 原生时钟（已在 endorsed 位）全程零暴露；42px 瞬移是复验⑪
+                // 录屏里「收缩抖动」的感知来源，平滑滑入显著弱化。
+                let steps = 4i32;
+                for k in 1..=steps {
+                    let x = from_left + total * k / steps;
+                    unsafe {
+                        let _ = SetWindowPos(
+                            hwnd,
+                            None,
+                            x,
+                            top,
+                            right - x,
+                            h,
+                            SWP_NOACTIVATE | SWP_NOZORDER,
+                        );
+                    }
+                    if k < steps {
+                        std::thread::sleep(std::time::Duration::from_millis(25));
+                    }
+                }
+                let _ = apply_overlay_geometry(&window, &anim_endorsed);
+                SHRINK_ANIMATING.store(false, std::sync::atomic::Ordering::SeqCst);
+                geom_log("clockrect: shrink animated (slide-in done)");
+            }
+        }
+    }
+    if need_update {
         update_clock_overlay_visibility(app_handle);
     }
 }
 
-/// relocate 几何本体（持 [`GEOM_APPLY_LOCK`]）。返回是否需要随后调用可见性
-/// 管理——锁内不可重入调用 update（std Mutex 不可重入，会自锁死）。
-fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
+/// relocate 几何本体（持 [`GEOM_APPLY_LOCK]`）。返回 (是否需随后调用可见性
+/// 管理, 收缩动画需求 (动画起点左缘, 终态 endorsed))——锁内不可重入调用
+/// update（std Mutex 不可重入，会自锁死）；动画在锁外执行（见上）。
+fn relocate_geometry_locked(app_handle: &AppHandle) -> (bool, Option<(i32, RECT)>) {
     let _apply_guard = GEOM_APPLY_LOCK.lock();
+    // 动画进行中：任何几何路径直接让位（滑入由动画自身收尾，终态落位后自愈）
+    if SHRINK_ANIMATING.load(std::sync::atomic::Ordering::SeqCst) {
+        return (false, None);
+    }
     let (endorsed, phase, mask, shrink_requested, native) = match GEOM.lock() {
         Ok(g) => (g.endorsed, g.phase, g.mask, g.shrink_requested, g.native_observed),
-        Err(_) => return false,
+        Err(_) => return (false, None),
     };
     if phase == GeomPhase::Covered {
         if mask.is_none() {
@@ -444,11 +490,11 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
                 if !rect_eq(Some(n), Some(e)) {
                     // 原生偏离证据已到手而遮盖未展开：立即展开（内含探测、
                     // 遮盖构建与成套应用；若无盖住者则走 Visible 分支路径）
-                    return true;
+                    return (true, None);
                 }
             }
         }
-        return false;
+        return (false, None);
     }
     if !shrink_requested {
         if let (Some(endorsed), Some(native)) = (endorsed, native) {
@@ -456,7 +502,7 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
                 let u = union_rect(endorsed, native);
                 if !rect_eq(mask, Some(u)) {
                     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
-                        return false;
+                        return (false, None);
                     };
                     if apply_mask_geometry(&window, u) {
                         crate::dbg_log(&format!(
@@ -464,26 +510,41 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
                             u.left, u.top, u.right, u.bottom
                         ));
                     }
-                    return false;
+                    return (false, None);
                 }
                 if mask.is_some() {
                     // 并集未变（旧遮盖已盖住新观测）：维持现状
-                    return false;
+                    return (false, None);
                 }
             }
         }
     }
     if mask.is_some() && !shrink_requested {
-        return false; // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
+        return (false, None); // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
     }
-    let Some(endorsed) = endorsed else { return false };
-    let Some(window) = app_handle.get_webview_window("clock_overlay") else { return false };
+    let Some(endorsed) = endorsed else { return (false, None) };
+    let Some(window) = app_handle.get_webview_window("clock_overlay") else {
+        return (false, None)
+    };
     if mask.is_some() {
         crate::dbg_log("clockrect: shrink (native endorsed)");
     }
-    if !apply_overlay_geometry(&window, &endorsed) {
-        return false;
-    }
+    // R8.7 收缩动画：遮盖收缩（左缘左移 ≥12px）时不再瞬移落位，交由锁外
+    // 滑入动画（中间矩形恒 ⊇ endorsed，原生零暴露）；微小位移仍直接应用。
+    let from_left = LAST_APPLIED_RECT
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|r| r.left));
+    let anim = if mask.is_some()
+        && from_left.map(|l| endorsed.left - l >= 12).unwrap_or(false)
+    {
+        Some((from_left.unwrap_or(endorsed.left), endorsed))
+    } else {
+        if !apply_overlay_geometry(&window, &endorsed) {
+            return (false, None);
+        }
+        None
+    };
     if let Ok(mut g) = GEOM.lock() {
         g.mask = None;
         g.native_observed = None;
@@ -540,8 +601,10 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
     }
     // 可见性统一走跟随管理：覆盖层曾因矩形未就绪保持隐藏（如启动时任务栏正
     // 收起、UIA 探测失败），矩形就绪后由这里恢复显示或按全屏/滑出态维持隐藏。
-    // （由持锁外层 relocate_clock_overlay_endorsed 调用，此处只报告需求）
-    true
+    // （由持锁外层 relocate_clock_overlay_endorsed 调用，此处只报告需求；
+    // 动画收缩时 z 序维护已照常执行（NOMOVE|NOSIZE 与滑入不冲突），几何
+    // 由锁外滑入收尾）
+    (true, anim)
 }
 
 /// 任务栏当前状态：是否完全滑出屏幕 + 相对静止位的位移（滑入/滑出动画的实时偏移）。
@@ -708,6 +771,10 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     // R8.1：与 relocate 收缩路径串行化（锁序：本锁→GEOM）。WinEvent 线程/
     // 500ms 轮询线程/重探线程三方并发应用几何的交叉竞态曾把窗口落成
     // 「endorsed 左缘+遮盖宽度」（右缘 3861 出屏，见 GEOM_APPLY_LOCK 注释）。
+    // R8.7：收缩滑入动画期间让位（动画自身收尾，终态后由 wrapper 的 update 收敛）。
+    if SHRINK_ANIMATING.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
     let _apply_guard = GEOM_APPLY_LOCK.lock();
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
         return;
