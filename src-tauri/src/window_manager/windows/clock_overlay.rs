@@ -862,12 +862,14 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                                         if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
                                             *last = None;
                                         }
-                                        // R8.1 撤销此处的即时采样（R8 引入）：退出
-                                        // 过渡期亚克力透出内容正从视频切回壁纸，
-                                        // 活跃采样采到过渡色并推送，与随后的稳态
-                                        // 色来回翻转（00:56 实测 seq=2~11 全部
-                                        // src=z-reclaim）=用户残余色差来源。退出
-                                        // 期信任 15s 保鲜的稳态色，收缩后再采。
+                                        // R8.6 恢复此处的即时采样（R8.1 曾撤销）：
+                                        // 复验⑨录屏逐帧分析证实，任务栏材质在
+                                        // 全屏进出瞬间整体切换 ±9~24 亮度并持续
+                                        // 数秒——那不是「过渡毒色」而是表面真实
+                                        // 颜色，不跟随才是色差来源（滞后 0.4~3s
+                                        // 的分叉爆发被肉眼捕捉）。R8.4 左列主参考
+                                        // +R8.2 闭环+渐变就位后，跟随已无副作用。
+                                        refresh_clock_overlay_appearance(app_handle, 0, "z-reclaim");
                                     }
                                 }
                             }
@@ -880,9 +882,9 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                         "clockrect: phase->normal (exit cover, endorsed ({},{},{},{}), mask held)",
                         endorsed.left, endorsed.top, endorsed.right, endorsed.bottom
                     ));
-                    // R8.1 撤销 R7.6 的「退出确认 Visible 瞬间换色」：同上，
-                    // 此刻亚克力仍在过渡态，采样推送的是过渡色；稳态色已由
-                    // 15s 保鲜维持（且收缩后有 0/400/1500ms 三连采兜底）。
+                    // R8.6 恢复退出确认 Visible 瞬间换色（R7.6 建立、R8.1 撤销）：
+                    // 材质切换是表面真实颜色，早一针跟随早一针消除分叉。
+                    refresh_clock_overlay_appearance(app_handle, 0, "visible-switch");
                 }
             }
             // 遮盖保持期（R6 实时跟踪）：退出轮回摆期探测可能直接 Visible 而原生
@@ -917,17 +919,19 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 }
             }
             if let Some(m) = mask_now {
-                // R8.1 撤销 R7.6 的「遮盖在场每针换色」：回摆撑盖期的亚克力
-                // 同样处于过渡态（盖住者残影/回缩动画），逐针采样只会推送
-                // 翻转色。稳态色由 15s 保鲜跨全屏维持，收缩后三连采兜底。
+                // R8.6 恢复「遮盖在场每针换色」（R7.6 建立、R8.1 撤销）：录屏
+                // 逐帧分析证实材质切换是表面真实颜色，回摆撑盖期逐针跟随，
+                // 分叉不再有 0.4~3s 滞后窗。
+                refresh_clock_overlay_appearance(app_handle, 0, "mask-held-tick");
                 // 全尺寸成套应用（含首次展开针），不做 NOSIZE——首次展开若只
                 // 移位，158 宽窗口盖不全 3618-3769 残块
                 (m.left, m.top, m.right - m.left, m.bottom - m.top, -1)
             } else {
-                // R8.1：常规/屏外分支一律传全尺寸——SWP_NOSIZE 会把「窗口实际
-                // 尺寸」从应用链路里豁免，交叉竞态留下的错误尺寸（3649..3861）
-                // 因变化检测命中「无变化」而永久驻留；显式传尺寸让任何后写者
-                // 都自愈为正确几何。
+                // R8.6：常规可见态每针轻采（d≥2 才推送，自带节流）——任务栏
+                // 材质不止在全屏进出时切换（任意最大化窗口开/关都会切），
+                // 15s 保鲜跟不上，平涂滞后即「细微色差保持」。
+                // 全尺寸成套应用（弃 NOSIZE，理由见上）。
+                refresh_clock_overlay_appearance(app_handle, 0, "visible-tick");
                 let (ew, eh) = (endorsed.right - endorsed.left, endorsed.bottom - endorsed.top);
                 match read_tray_state() {
                     // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
@@ -1485,13 +1489,20 @@ static APPEARANCE_WORKERS_STARTED: std::sync::atomic::AtomicBool =
 /// 底色动态跟随请求入口（R7.5 建立，R8 改为合并调度）。`delay_ms` 为 0 表示
 /// 立即，`src` 仅供诊断日志区分调用方。
 ///
-/// 时机全景（R8.3 收敛后）：
+/// 时机全景（R8.6 收敛后）：
 /// - **attach 即刻**：前端过渡色（主题近似值）换真色，并点火 worker/保鲜线程；
-/// - **收缩后延迟三连采（400 / 1500 / 4000ms）**：等亚克力从「视频透出」
-///   过渡回「壁纸透出」稳定后再采纳——这是退出期**唯一**的采样时机
-///   （R8.3 撤销 delay=0 即时针：过渡色毒源，复验⑧日志实锤）；
-/// - **正常态保鲜（15s / 退出观测窗内 3s）**：任务栏可见的稳态下轻采，
-///   亚克力/壁纸缓变时覆盖层色不再渐旧，会话首轮退出时的底色也不再陈旧。
+/// - **逐针跟随（visible-tick / mask-held-tick / z-reclaim / visible-switch）**：
+///   任务栏可见的每一探针针都轻采一次——材质切换（全屏进出、最大化窗口开/
+///   关）是表面真实颜色 ±9~24，跟随滞后 0.4~3s 即肉眼色差爆发（复验⑨录屏
+///   逐帧实证）；d≥2 死区自带节流，稳态零推送；
+/// - **收缩后延迟三连采（400 / 1500 / 4000ms）**：收缩路径的兜底针；
+/// - **正常态保鲜（15s / 退出观测窗内 3s）**：逐针跟随的兜底网。
+///
+/// 历史（R8.6 修正认知）：R8.1/R8.3 曾以「过渡毒色翻转」为由撤销逐针采样——
+/// 复验⑨录屏逐帧分析证明那些颜色是任务栏表面的真实材质状态（不透后面窗口、
+/// 只透壁纸，受控实验排除垫底污染），翻转即表面本身在变；撤销跟随制造了
+/// 0.4~3s 的分叉滞后窗=复验⑦~⑩持续可见的「细微色差」。基础设施就位
+/// （左列主参考/闭环/渐变/死区）后恢复跟随。
 ///
 /// R8.1 重要教训（撤销 R8/R7.6 的退出窗口期活跃采样 z-reclaim /
 /// visible-switch / mask-held-tick）：退出过渡期任务栏亚克力的透出内容正从
