@@ -1,22 +1,22 @@
 # 会话续作指引：注入式任务栏时钟第三代（当前进度）
 
-> 更新时间：2026-09-12 深夜 · 用途：新会话窗口快速接续
+> 更新时间：2026-09-12 深夜（B 阶段完成） · 用途：新会话窗口快速接续
 
 ## 0. 当前决策（唯一生效，2026-09-12 深夜更新）
 
-> **A 阶段（只读通道）已完成并通过全部验收门槛**，注入路线的技术成立性已实证。下一阶段 = B（可逆修改：改一次 Text + 恢复 + 代次重置）。
+> **B 阶段（可逆修改）已完成并通过验收门槛**（一项保留：模板重建代次路径未自然触发，机制就位）。下一阶段 = C（静态五段+输入等价性）。
 
-- **生效方案**：`方案-注入式任务栏时钟第三代-2026-09-12.md`（v2 + §3「A 阶段实测结果」验收记录）；
-- **A 阶段关键定案**（详见方案 §3 A 阶段小节）：
-  - **通道修订（D1）**：外部 attach 对 explorer 不可靠（假成功/绑错岛）→ 生产通道 = **SetWindowsHookEx 引导加载 + 进程内初始化**（TranslucentTB 同款，本机全链路实证）；
-  - **部署依赖清零**：系统 Windows.UI.Xaml.dll 自带 InitializeXamlDiagnosticsEx，SDK xamldiagnostics.dll 不需分发；CLSID 免注册实证；
-  - **时钟判别式实测**：`SystemTray.DateTimeIconContent → ContainerGrid → StackPanel → TextBlock TimeInnerTextBlock/DateInnerTextBlock`；
-  - **验收数据**：22 次 advise/unadvise 循环 0 失败、advises==unadvises 无重复订阅、任务栏零影响（截图+explorer 存活+无 WER）；
-  - **Advise 必须独立线程调**（SetSite 线程内= E_UNEXPECTED）；**每线程只能初始化一次**（重试=新线程+新端点编号）；跨进程管道 ReadFile 有 TRUE+0 虚唤醒（只认 FALSE 为断开）——三项均为血泪实证，B 阶段代码直接沿用；
-- **工件**：`src-tauri/clockbar/`（探针 crate：Rust host + tap/tap.cpp 只读 DLL）；证据：`review-evidence-20260912/clockbar_tap_stageA.log`、`clockbar_a_verify.png`；
-- **遗留（B 前处理）**：①tap 侧 pipe 断开→自动 Unadvise（心跳恢复序列）②explorer 重启重注入（watch.rs，可延至 E）③模块暂留无害证明（D8 分期→E）；
-- 依据链与旧结论归档不变（见下）；
-- R9.4 构建仍是当前部署版（旧覆盖层路径，不再迭代；E 阶段前互斥开关停用）。
+- **生效方案**：`方案-注入式任务栏时钟第三代-2026-09-12.md`（v2 + §3「A 阶段实测结果」+ §3「B 阶段实测结果」）；
+- **B 阶段关键定案**（详见方案 §3 B 阶段小节，七条血泪全数内置 tap v30 实现）：
+  - **生产写通道 = 路线 B**：GetIInspectableFromHandle → winRT TextBlock.Text()，经 CoreDispatcher.RunAsync 落 UI 线程，实测 ~250ms 上屏；**路线 A（IVisualTreeService SetProperty）实测只改诊断模型不上屏，弃用**（与 w11-theming-suite#17 一致）；GetPropertyIndex/HitTest 在 26200 任务栏岛 E_INVALIDARG 不可用，属性索引用 GPVC 链 dump 获取（需过滤 IsValueNull 条目）；
+  - **系统 VM 每秒重写时钟 Text**（HH:mm 格式下亦然）→ 修改 ~0.3s 被覆盖，superseded 判定实测正确；**C 阶段设计输入：五段内容必须持续持有，一次性改 Text 不可行**；
+  - **B0 断开自动恢复实测通过**：host 正常退出/被硬杀两路径，tap 均 ~60ms 内 AUTO restore+Unadvise，不依赖宿主指令；
+  - **全屏×30 压力通过**：gen 稳定（全屏覆盖不重建任务栏 XAML 树）、objs=1 无泄漏、无残留；主题/格式翻转同样零重建；
+  - **七条血泪**：①失败路径必须自钉（否则 explorer 0xC0000005，实测崩溃一次）②树事件不保证父先子后③新鲜 explorer 沉降期 ~4.5min（E_NOTFOUND→零重放→正常）④树判别式改动先过 sim.cpp 离线回放⑤Advise 同步语义+回调内锁/引擎调用=UI 死锁（实测挂死任务栏）⑥duplex 管道并发写+阻塞 ReadFile 虚唤醒会吞数据→串行化发送+PeekNamedPipe 轮询⑦探针消息消费用全局游标；
+- **工件**：`src-tauri/clockbar/`（tap v30 + 探针 host：btest/bkill/bstress/bwatch/bhit/brapid + sim.cpp 回放仿真）；脚本：`D:\agents_tmp\bshot.ps1`（时钟区截图）/`bburst.ps1`（连拍）/`bstress_fs.ps1`（全屏压力，自建无边框窗）/`btheme.ps1`（主题翻转）；证据：`clockbar_tap_b30.log`、`bstress_host.log`、`bshot_*.png`（b0~bA 序列+rapid 连拍）；
+- A 阶段关键定案（不变，详见方案 §3 A 阶段小节）：钩子引导进程内初始化通道、SDK DLL 免分发、时钟判别式 DateTimeIconContent→ContainerGrid→StackPanel→TimeInnerTextBlock/DateInnerTextBlock、Advise 独立线程/每线程单次初始化/TRUE+0 虚唤醒；
+- **遗留（C 前处理）**：①explorer 重启重注入（watch.rs，E 阶段，当前每次重启手动注入）②模板重建代次路径待强触发器压测（DPI 变更等）③注册表时间格式现为 HH:mm（原 HH:mm:ss 系旧覆盖层所写，符合决策#3，liCalendar 启动会自行重写）；
+- R9.4 构建仍是当前部署版（旧覆盖层路径，不再迭代；E 阶段前互斥开关停用。B 阶段测试期间 liCalendar.exe 已被 taskkill 退出）。
 
 ---
 
@@ -29,7 +29,7 @@
 
 ## 1. 一句话现状
 
-第三代注入路线 **A 阶段完成**：只读 TAP 通道全链路打通（钩子引导加载→进程内初始化→免注册激活→IVisualTreeService3 订阅→任务栏全树枚举），22 次会话循环零失败、任务栏零影响；外部 attach 通道被证伪并弃用。下一阶段 B：可逆修改（改 Text + 快照恢复 + 树重建代次）。旧覆盖层（R1~R9.4）维持已部署版本不动。
+第三代注入路线 **B 阶段完成**：可逆修改全链路打通（路线 B 上屏实测 + B0 断开自动恢复双路径 + 全屏×30 代次稳定 + 七条血泪内置 v30），路线 A SetProperty 被实测证伪弃用。下一阶段 C：静态五段+输入等价性。旧覆盖层（R1~R9.4）维持已部署版本不动。
 
 ## 2. R7~R8 速查（详见总结文档 §3）
 
@@ -72,10 +72,10 @@
 
 ## 4. 下一步（恢复时）
 
-1. **B 阶段（可逆修改）**：按方案 §5 B 行——改一次 `TimeInnerTextBlock` 文本（含原始值快照）→ 恢复验证；host 退出/被杀两路径；树重建（全屏切换触发）代次重置；验收=恢复不依赖重启 explorer + 连续全屏进出 ×30 无残留。开工前处理 A 遗留①（tap pipe 断开自动 Unadvise）。
-2. 开发迭代纪律（A 阶段血泪）：改 DLL 必须换文件名（TAPVER 递增）+ 重启 explorer 清驻留；批处理纯 ASCII；CLSID 打包按 GUID 内存布局。
-3. 构建：`cd src-tauri/clockbar && cmd //c "set TAPVER=N&& tap\\build_tap.cmd"`（DLL）+ cargo build --release（探针，需 MSVC PATH/LIB 环境按项目 AGENTS.md）。
-4. C~F 阶段见方案 §5；旧覆盖层互斥开关在 E 阶段接入。
+1. **C 阶段（静态五段+输入）**：按方案 §5 C 行——假数据五段面板（天气|节日|节气|农历|时间）、宽度约束实测、输入/tooltip 等价性。**关键设计输入（B 阶段实测）**：系统 VM 每秒重写时钟 Text→五段内容必须由 tap 持续持有（插入面板或逐秒重写）；写通道=路线 B（winRT 直设经 dispatcher）；路线 A SetProperty 不上屏勿再试。
+2. 开发迭代纪律（A/B 阶段血泪）：改 DLL 必须换文件名（TAPVER 递增，现 v30）+ 重启 explorer 清驻留 + **新鲜 explorer 需 ~4.5min 沉降期**；批处理纯 ASCII+`/utf-8`；树判别式改动先过 sim.cpp 回放仿真；回调内零引擎调用零锁等待。
+3. 构建：`cd src-tauri/clockbar/tap && cmd //c "set TAPVER=N&& tap\\build_tap.cmd"`（DLL，需 /std:c++17，链接 Runtimeobject.lib）+ `cd src-tauri/clockbar && cargo build --release`（探针，需 MSVC PATH/LIB 环境按项目 AGENTS.md）。测试子命令：btest（双路线改+恢复）/bkill（被杀路径）/bstress+bstress_fs.ps1（全屏压力）/bwatch+btheme.ps1（代次观察）/brapid（连拍判别）。
+4. D~F 阶段见方案 §5；旧覆盖层互斥开关在 E 阶段接入。
 
 ## 5. 关键环境事实（新会话必读）
 
