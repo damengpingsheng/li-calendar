@@ -84,7 +84,10 @@ function ClockOverlayWindow(): React.JSX.Element {
   // 必须真的改动像素——1px 点在两个几乎相同的颜色间切换（不可感知）。
   const [keepaliveTick, setKeepaliveTick] = useState(0);
   useEffect(() => {
-    const keepalive = setInterval(() => setKeepaliveTick((t) => t + 1), 200);
+    // R8.9：200ms→100ms——退出瞬态的几何抖动会让 WebView 表面短暂呈现
+    // 透明帧（原生时钟透出，录屏 f10 帧实证），更密的强制重绘把透明帧
+    // 时长减半
+    const keepalive = setInterval(() => setKeepaliveTick((t) => t + 1), 100);
     return () => clearInterval(keepalive);
   }, []);
   const keepaliveColor = keepaliveTick % 2 === 0 ? 'rgba(0,0,0,0.004)' : 'rgba(0,0,0,0.008)';

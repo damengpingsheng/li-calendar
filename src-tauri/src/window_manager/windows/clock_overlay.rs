@@ -1742,6 +1742,24 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
         (None, Some(st)) => format!("left=none strip=#{:02X}{:02X}{:02X}", st.0, st.1, st.2),
         (None, None) => "left=none strip=none".into(),
     };
+    // R8.9 分歧门：左右两列是同一条连续表面的两个邻居参考，正常时应一致
+    // （材质整体切换时两边同步移动，基线差 1~6）。差值过大（>8）说明其中
+    // 一侧处于特殊状态（托盘图标悬停高亮/条带材质态/局部污染，实测
+    // F5E6DC d=15 与 E9E7E5 d=25 两例）——覆盖层正下方表面的真色不可知，
+    // **保留上次可信色，绝不推送捏造的陡峭渐变**（那正是用户可见的
+    // 「亮色块+竖向接缝」）。代价：真正的单侧突变延迟一轮——从未观测到。
+    if let (Some(l), Some(st)) = (s.left, s.strip) {
+        let d_ls = (l.0 as i32 - st.0 as i32)
+            .abs()
+            .max((l.1 as i32 - st.1 as i32).abs().max((l.2 as i32 - st.2 as i32).abs()));
+        if d_ls > 8 {
+            geom_log(&format!(
+                "appearance run src={src}: diverged left=#{:02X}{:02X}{:02X} strip=#{:02X}{:02X}{:02X} (d={d_ls}>8), keep trusted",
+                l.0, l.1, l.2, st.0, st.1, st.2
+            ));
+            return;
+        }
+    }
     let Ok(mut last) = LAST_PUSHED_BG.lock() else {
         return;
     };
