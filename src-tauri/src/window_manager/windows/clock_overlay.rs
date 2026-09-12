@@ -2033,3 +2033,37 @@ fn cover_set_color(c: (u8, u8, u8)) {
     }
 }
 // ==================== R9.1 原生遮盖条结束 ====================
+
+/// R9.2 周期诊断转储：覆盖层窗口可见性/矩形/最后推送色。
+/// 「时钟彻底消失」类问题的取证锚点——复现时刻对照本行即可判定窗口当时
+/// 的真实状态（可见性/位置），区分被埋/隐藏/渲染停滞/窗口丢失。
+pub fn overlay_diag_dump() {
+    let Some(window) = crate::windows_hook::app_handle()
+        .and_then(|app| app.get_webview_window("clock_overlay"))
+    else {
+        crate::dbg_log("overlay-diag: overlay window missing");
+        return;
+    };
+    let Some(hwnd) = get_window_hwnd(&window) else {
+        crate::dbg_log("overlay-diag: hwnd unavailable");
+        return;
+    };
+    unsafe {
+        let vis = IsWindowVisible(hwnd).as_bool();
+        let mut r = RECT::default();
+        let r_ok = GetWindowRect(hwnd, &mut r).is_ok();
+        let push = LAST_PUSHED_BG.lock().ok().and_then(|g| *g);
+        let push_note = push
+            .map(|(l, rr)| {
+                format!(
+                    "pushed=({:02X}{:02X}{:02X}|{:02X}{:02X}{:02X})",
+                    l.0, l.1, l.2, rr.0, rr.1, rr.2
+                )
+            })
+            .unwrap_or_else(|| "pushed=none".into());
+        crate::dbg_log(&format!(
+            "overlay-diag: visible={vis} rect_ok={r_ok} rect=({},{},{},{}) {push_note}",
+            r.left, r.top, r.right, r.bottom
+        ));
+    }
+}

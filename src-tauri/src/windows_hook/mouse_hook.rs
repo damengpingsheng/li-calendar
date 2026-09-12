@@ -288,6 +288,10 @@ pub fn start_hook_message_thread() {
                                     continue;
                                 }
                                 tick = tick.wrapping_add(1);
+                                // R9.2：每 20 针（~10s）转储覆盖层窗口状态（取证锚点）
+                                if tick % 20 == 0 {
+                                    crate::window_manager::overlay_diag_dump();
+                                }
                                 // 每 500ms：轻量可见性兜底（全屏/滑出检测均为纯 Win32 微秒级）。
                                 // 教训：依赖事件驱动的显隐在事件缺失的路径上（部分应用退出全屏
                                 // 时无前台切换、无窗口位移）要等兜底轮询，2s 太慢肉眼可见。

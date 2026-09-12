@@ -29,6 +29,7 @@ pub use clock_overlay::ensure_clock_overlay_attached;
 pub use clock_overlay::relocate_clock_overlay;
 pub use clock_overlay::relocate_clock_overlay_endorsed;
 pub use clock_overlay::hide_cover_sliver;
+pub use clock_overlay::overlay_diag_dump;
 pub use clock_overlay::update_clock_overlay_visibility;
 pub use clock_overlay::window_hwnd_by_label;
 
