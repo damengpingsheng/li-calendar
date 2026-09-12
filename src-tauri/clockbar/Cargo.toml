@@ -1,0 +1,14 @@
+[package]
+name = "clockbar-probe"
+version = "0.1.0"
+edition = "2021"
+
+# A 阶段独立探针：不依赖 tauri 主 crate，std-only（FFI 手写声明）。
+# B 阶段起会话管理器并入主 crate src-tauri/src/clockbar/。
+
+[[bin]]
+name = "clockbar_probe"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 1
