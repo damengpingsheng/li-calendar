@@ -41,11 +41,11 @@ type InitXamlDiagEx = unsafe extern "system" fn(
     wszTAPDllName: *const u16, tapClsid: *const u8, wszInitializationData: *const u16,
 ) -> i32;
 
-const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b30"; // 与 tap.cpp TAPVER=16 版本化一致
+const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b42"; // 与 tap.cpp TAPVER 版本化一致
 const SDK_DLL: &str = r"D:\environment\WindowsKits\10\bin\x64\XamlDiagnostics\xamldiagnostics.dll";
 const WUX_DLL: &str = "Windows.UI.Xaml.dll"; // 系统目录，POC 证实其导出 InitializeXamlDiagnosticsEx
-const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap30.dll";
-const TAP_VER: &str = "30";
+const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap42.dll";
+const TAP_VER: &str = "42";
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -236,9 +236,10 @@ fn ask_stats(msgs: &MsgQ) -> Option<String> {
 // ── B 阶段 ────────────────────────────────────────────
 
 fn shot(tag: &str) {
+    // C 阶段：长条比 B 阶段 560px 窗口宽，用会话目录的加宽截图（右锚 1500x160）
     let _ = std::process::Command::new("powershell")
         .args(["-NoProfile", "-ExecutionPolicy", "Bypass",
-               "-File", r"D:\agents_tmp\bshot.ps1", tag])
+               "-File", r"D:\agents_tmp\c_stage_20260913\cshot.ps1", tag])
         .status();
 }
 
@@ -599,6 +600,135 @@ fn main() {
             drain_msgs(&msgs, secs, "watch");
             println!("[probe] stats: {}", ask_stats(&msgs).unwrap_or_default());
         }
+        "c0tree" | "c0ins" | "c0meas" | "c0rm" | "c0add" => {
+            // C0 单步命令（tap 侧 c0* 协议；结果细节在 tap 日志）
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            let ack = format!(r#""t":"{cmd}""#);
+            if !pipe_write(cmd.as_bytes()) { eprintln!("[probe] {cmd} write failed"); std::process::exit(1); }
+            match wait_for(&msgs, |l| l.contains(&ack), 15_000) {
+                Some(l) => println!("[probe] {l}"),
+                None => { eprintln!("[probe] no {cmd} ack"); std::process::exit(1); }
+            }
+        }
+        "c1kill" => {
+            // B0 面板路径：c1set 建面板后硬杀自身——验证 tap 断线自动摘面板+恢复原生
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            let json = args.get(2).cloned().unwrap_or(
+                r#"{"weather":"晴 26°C","festival":"教师节","term":"白露","lunar":"七月廿二"}"#.into());
+            let mut line = String::from("c1set ");
+            line.push_str(&json);
+            if !pipe_write(line.as_bytes()) { eprintln!("[probe] c1set write failed"); std::process::exit(1); }
+            match wait_for(&msgs, |l| l.contains(r#""t":"c1set""#), 15_000) {
+                Some(l) => println!("[probe] {l}"),
+                None => { eprintln!("[probe] no c1set ack"); std::process::exit(1); }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            shot("c1kill_modified");
+            println!("[probe] C1KILL: killing self NOW (panel built, no cleanup)");
+            std::process::abort();
+        }
+        "c1hold" => {
+            // C1/C2 主测试会话：建立会话→下发数据→保持在线 secs 秒（面板在断开时才自动
+            // 恢复=B0 语义，故场景测试期间本进程必须驻留）。期间其他验证用 PowerShell 并行。
+            let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(600);
+            let json = args.get(3).cloned().unwrap_or_default();
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            if !json.is_empty() {
+                let mut line = String::from("c1set ");
+                line.push_str(&json);
+                if !pipe_write(line.as_bytes()) { eprintln!("[probe] c1set write failed"); std::process::exit(1); }
+                match wait_for(&msgs, |l| l.contains(r#""t":"c1set""#), 15_000) {
+                    Some(l) => println!("[probe] {l}"),
+                    None => { eprintln!("[probe] no c1set ack"); std::process::exit(1); }
+                }
+            }
+            println!("[probe] C1HOLD holding session for {secs}s (t0={})", chrono_lite());
+            // 心跳版 drain：每 10s 发 ping（tap 侧 35s 静默即视同断线自动恢复）
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut last_ping = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            let mut seen = 0usize;
+            while std::time::Instant::now() < deadline {
+                let lines: Vec<String> = {
+                    let Ok(q) = msgs.lock() else { break };
+                    if seen < q.len() { let l = q[seen..].to_vec(); seen = q.len(); l } else { Vec::new() }
+                };
+                for l in lines {
+                    println!("[{}][hold] tap: {}", chrono_lite(), l);
+                }
+                if last_ping.elapsed() >= std::time::Duration::from_secs(5) {
+                    pipe_write(b"ping");
+                    last_ping = std::time::Instant::now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            println!("[probe] C1HOLD done; exiting (disconnect triggers tap auto-restore)");
+        }
+        "c1set" => {
+            // C1：下发五段数据+样式 JSON（原样透传给 tap，限界解析在 tap 侧）
+            let json = args.get(2).cloned().unwrap_or_default();
+            if json.is_empty() { eprintln!("usage: c1set '<json>'"); std::process::exit(1); }
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            let mut line = String::from("c1set ");
+            line.push_str(&json);
+            if !pipe_write(line.as_bytes()) { eprintln!("[probe] c1set write failed"); std::process::exit(1); }
+            match wait_for(&msgs, |l| l.contains(r#""t":"c1set""#), 15_000) {
+                Some(l) => println!("[probe] {l}"),
+                None => { eprintln!("[probe] no c1set ack"); std::process::exit(1); }
+            }
+        }
+        "c1free" => {
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            if !pipe_write(b"c1free") { eprintln!("[probe] c1free write failed"); std::process::exit(1); }
+            match wait_for(&msgs, |l| l.contains(r#""t":"c1free""#), 15_000) {
+                Some(l) => println!("[probe] {l}"),
+                None => { eprintln!("[probe] no c1free ack"); std::process::exit(1); }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(600));
+            shot("c1_after_free");
+        }
+        "c1tap" => {
+            // C2：监听 tap 事件（左/右键投递）secs 秒，打印到达时刻（时延=相对启动秒）
+            let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(20);
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            println!("[probe] listening for tap events for {secs}s (t0={})", chrono_lite());
+            drain_msgs(&msgs, secs, "tap");
+            println!("[probe] stats: {}", ask_stats(&msgs).unwrap_or_default());
+        }
+        "ctest" => {
+            // C0 全序列：树/宽度链 dump → winRT 插入探针（连拍验证渲染）→ 量测 →
+            // 引擎 AddChild 对照 → 删除 → 量测（可逆性）
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            let step = |c: &str, ack: &str| -> bool {
+                let want = format!(r#""t":"{ack}""#);
+                if !pipe_write(c.as_bytes()) { eprintln!("[probe] {c} write failed"); return false; }
+                match wait_for(&msgs, |l| l.contains(&want), 15_000) {
+                    Some(l) => { println!("[probe] {l}"); true }
+                    None => { eprintln!("[probe] no {ack} ack"); false }
+                }
+            };
+            println!("[probe] === C0 baseline ===");
+            shot("c0_base");
+            step("c0tree", "c0tree");
+            println!("[probe] === winRT insert probe (route B structural) ===");
+            if step("c0ins", "c0ins") {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass",
+                           "-File", r"D:\agents_tmp\c_stage_20260913\cburst.ps1", "c0ins", "8", "300"])
+                    .status();
+                step("c0meas", "c0meas");
+                step("c0rm", "c0rm");
+                std::thread::sleep(std::time::Duration::from_millis(800));
+                shot("c0_after_rm");
+                step("c0meas", "c0meas");
+            }
+            println!("[probe] === engine AddChild discriminator ===");
+            step("c0add", "c0add");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            shot("c0_after_add");
+            println!("[probe] stats: {}", ask_stats(&msgs).unwrap_or_default());
+            println!("[probe] CTEST DONE (see tap log C0TREE/C0INS/C0MEAS/C0ADD lines)");
+        }
         "pipetest2" => {
             // 最小复现：server 读线程模式与 pipe_server 相同；client 连接后立即写 2 条，
             // 500ms 后再写 2 条——验证第二批是否送达（B 阶段 ack 丢失问题隔离）
@@ -665,7 +795,7 @@ fn main() {
             loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
         }
         _ => {
-            eprintln!("usage: clockbar_probe <btest/bkill/bstress secs/bwatch secs/cycle n/dump/hookdump/hookcycle/pipetest/raw endpoint>");
+            eprintln!("usage: clockbar_probe <c1set json/c1free/c1tap secs/ctest/btest/bkill/bstress secs/bwatch secs/cycle n/dump/hookdump/hookcycle/pipetest/raw endpoint>");
             std::process::exit(1);
         }
     }
