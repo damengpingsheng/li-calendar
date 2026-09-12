@@ -1,9 +1,12 @@
-// clockbar_probe — A 阶段只读探针（方案 v2 §5 A）
+// clockbar_probe — B 阶段可逆修改探针（方案 v2 §5 B；A 阶段子命令保留）
 // std-only：FFI 手写声明，不依赖任何 crate。
 // 子命令：
-//   cycle <n> [dwell_ms] n 次 attach/detach 循环验收（门槛 ≥20）
-//   dump <secs>         attach、收集 secs 秒树事件、打印 stats、detach
-//   raw <endpoint>      单次 attach 指定 endPointName（未知清单#1 实验用），不退出
+//   cycle <n> [dwell_ms]     A 阶段：n 次 attach/detach 循环
+//   dump <secs> / selfdump / hookdump / hookcycle / pipetest / raw   A 阶段保留
+//   btest                    B1：路线A/B 各一次 settext+restore，全程回读+截图
+//   bkill                    B0：settext2 后硬杀自身，验证 tap 断线自动恢复
+//   bstress <secs>           修改态驻留观察（外部脚本同时打全屏压力/主题切换）
+//   bwatch <secs>            纯观察模式（不改文本），记录 ready/lost/gen 事件
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -38,11 +41,11 @@ type InitXamlDiagEx = unsafe extern "system" fn(
     wszTAPDllName: *const u16, tapClsid: *const u8, wszInitializationData: *const u16,
 ) -> i32;
 
-const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-a1";
+const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b30"; // 与 tap.cpp TAPVER=16 版本化一致
 const SDK_DLL: &str = r"D:\environment\WindowsKits\10\bin\x64\XamlDiagnostics\xamldiagnostics.dll";
 const WUX_DLL: &str = "Windows.UI.Xaml.dll"; // 系统目录，POC 证实其导出 InitializeXamlDiagnosticsEx
-const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap15.dll";
-const TAP_VER: &str = "15";
+const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap30.dll";
+const TAP_VER: &str = "30";
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -111,14 +114,30 @@ fn pipe_server() -> Arc<Mutex<Vec<String>>> {
             eprintln!("[probe] CreateNamedPipeW failed gle={}", GetLastError());
             std::process::exit(2);
         }
-        let hu = h as usize; // 句柄按 usize 跨线程（Send）
+        let hu = h as usize; eprintln!("[srv] pipe handle=0x{:x}", hu); // 句柄按 usize 跨线程（Send）
         std::thread::spawn(move || {
             let h = hu as H;
             while !STOP.load(Ordering::Relaxed) {
                 let _ = ConnectNamedPipe(h, std::ptr::null());
                 if let Ok(mut g) = G_PIPE.lock() { *g = Some(h as usize); }
                 let mut carry = String::new();
+                // 【B 阶段血泪 #7】阻塞式 ReadFile 的 TRUE+0 虚唤醒会吞掉客户端已写入的
+                // 数据（实测：tap ok=1 写入 3 条，host 仅见 TRUE+0，数据永久丢失，且丢失
+                // 哪条呈随机性）。改为 PeekNamedPipe 轮询：确认有字节才 ReadFile，绕开该
+                // 内核行为；空轮询 20ms 间隔（B 阶段消息频率极低，CPU 代价可忽略）。
+                extern "system" {
+                    fn PeekNamedPipe(h: H, buf: *mut u8, bufsize: u32, read: *mut u32,
+                        avail: *mut u32, left: *mut u32) -> i32;
+                }
                 'read: loop {
+                    let mut avail: u32 = 0;
+                    let pok = PeekNamedPipe(h, std::ptr::null_mut(), 0, std::ptr::null_mut(),
+                        &mut avail, std::ptr::null_mut());
+                    if pok == 0 {
+                        eprintln!("[srv] peek end gle={}", GetLastError());
+                        break 'read;
+                    }
+                    if avail == 0 { std::thread::sleep(std::time::Duration::from_millis(20)); continue; }
                     let mut buf = [0u8; 4096];
                     let mut n = 0u32;
                     let ok = ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null());
@@ -126,7 +145,7 @@ fn pipe_server() -> Arc<Mutex<Vec<String>>> {
                         eprintln!("[srv] read end gle={} n={}", GetLastError(), n);
                         break 'read;
                     }
-                    if n == 0 { continue; } // TRUE+0 = 虚唤醒（tick 实验证实连接仍活），继续读
+                    if n == 0 { continue; }
                     carry.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
                     while let Some(pos) = carry.find('\n') {
                         let line: String = carry.drain(..=pos).collect();
@@ -144,21 +163,33 @@ fn pipe_server() -> Arc<Mutex<Vec<String>>> {
     msgs
 }
 
-fn wait_for(msgs: &MsgQ, pred: impl Fn(&str) -> bool, timeout_ms: u64) -> Option<String> {
+// 【B 阶段修复】全局消费游标：每条消息全进程只消费一次。旧的局部 seen 设计会让
+// 后续 wait_for 从队列头重扫，匹配到陈旧响应（实测 B 的 settext 匹配到 A 的旧 setres）。
+static CURSOR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn take_matching(msgs: &MsgQ, pred: impl Fn(&str) -> bool, timeout_ms: u64) -> Option<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-    let mut seen = 0usize;
     loop {
         let line = {
             let Ok(q) = msgs.lock() else { return None };
-            if seen < q.len() { let l = q[seen].clone(); seen += 1; Some(l) } else { None }
+            let c = CURSOR.load(Ordering::Relaxed);
+            if c < q.len() {
+                let l = q[c].clone();
+                CURSOR.store(c + 1, Ordering::Relaxed);
+                Some(l)
+            } else { None }
         };
         if let Some(l) = line {
             if pred(&l) { return Some(l); }
             continue;
         }
         if std::time::Instant::now() >= deadline { return None; }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(std::time::Duration::from_millis(25));
     }
+}
+
+fn wait_for(msgs: &MsgQ, pred: impl Fn(&str) -> bool, timeout_ms: u64) -> Option<String> {
+    take_matching(msgs, pred, timeout_ms)
 }
 
 fn do_attach(msgs: &MsgQ, endpoint: &str) -> Result<(), String> {
@@ -202,6 +233,106 @@ fn ask_stats(msgs: &MsgQ) -> Option<String> {
     wait_for(msgs, |l| l.contains(r#""t":"stats""#), 5_000)
 }
 
+// ── B 阶段 ────────────────────────────────────────────
+
+fn shot(tag: &str) {
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass",
+               "-File", r"D:\agents_tmp\bshot.ps1", tag])
+        .status();
+}
+
+/// 打印队列内新到达的消息（带本地时间戳），持续 secs 秒
+fn drain_msgs(msgs: &MsgQ, secs: u64, label: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+    let mut seen = 0usize;
+    while std::time::Instant::now() < deadline {
+        let lines: Vec<String> = {
+            let Ok(q) = msgs.lock() else { return };
+            if seen < q.len() { let l = q[seen..].to_vec(); seen = q.len(); l } else { Vec::new() }
+        };
+        for l in lines {
+            let now = chrono_lite();
+            println!("[{now}][{label}] tap: {l}");
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn chrono_lite() -> String {
+    // 无 crate：用系统命令拿时间太重；直接计数无关紧要，借用 std 无时钟——改用 Instant 相对秒不可读。
+    // 简案：调用 GetLocalTime via FFI（已链 kernel32/user32 区）。
+    unsafe {
+        #[repr(C)]
+        struct ST { y: u16, mo: u16, dow: u16, d: u16, h: u16, mi: u16, s: u16, ms: u16 }
+        extern "system" { fn GetLocalTime(st: *mut ST); }
+        let mut st = ST { y: 0, mo: 0, dow: 0, d: 0, h: 0, mi: 0, s: 0, ms: 0 };
+        GetLocalTime(&mut st);
+        format!("{:02}:{:02}:{:02}.{:03}", st.h, st.mi, st.s, st.ms)
+    }
+}
+
+/// B 会话建立：pipe 服务端已在 main 建立；等 loaded（若 1.5s 内无则钩子注入全新 explorer），
+/// 然后 advise → 等 ready（时钟链定位）。
+/// 注意：ready 在 Advise 重放时即刻发出，而 tap 的 advise ack 固定 Sleep(200) 后才发——
+/// ready 可能先于 advised 到达，必须聚合等待（wait_for 顺序消费会吞掉先到的 ready）。
+fn ensure_session(msgs: &MsgQ) -> Result<(), String> {
+    let want = format!(r#""ver":{}"#, TAP_VER);
+    if wait_for(msgs, |l| l.contains(r#""t":"loaded""#) && l.contains(&want), 1_500).is_none() {
+        println!("[probe] no resident tap; hook-injecting fresh...");
+        let hhk = hook_inject(msgs)?;
+        unsafe { UnhookWindowsHookEx(hhk); } // 初始化已把 DLL 钉住，钩子即可卸
+    } else {
+        println!("[probe] resident tap connected");
+    }
+    if !pipe_write(b"advise") { return Err("advise write failed".into()); }
+    // 聚合等待（共享游标）：advised 与 ready 各自消费一次，顺序不限
+    let mut got_adv = false;
+    let mut got_ready = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(25);
+    while !(got_adv && got_ready) {
+        match take_matching(msgs,
+            |l| l.contains(r#""t":"advised""#) || l.contains(r#""t":"ready""#), 2_000)
+        {
+            Some(l) => {
+                println!("[probe] MSG {l}");
+                if l.contains(r#""t":"advised""#) { got_adv = true; }
+                if l.contains(r#""t":"ready""#) { got_ready = true; }
+            }
+            None => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(format!("session incomplete: advised={got_adv} ready={got_ready} (25s)"));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn b_props(msgs: &MsgQ) {
+    if !pipe_write(b"props") { eprintln!("[probe] props write failed"); return; }
+    match wait_for(msgs, |l| l.contains(r#""t":"props""#), 8_000) {
+        Some(l) => println!("[probe] {l}"),
+        None => eprintln!("[probe] no props reply"),
+    }
+}
+
+fn b_set(msgs: &MsgQ, cmd: &str) -> bool {
+    if !pipe_write(cmd.as_bytes()) { eprintln!("[probe] set write failed"); return false; }
+    match wait_for(msgs, |l| l.contains(r#""t":"setres""#), 10_000) {
+        Some(l) => { println!("[probe] {l}"); l.contains("\"hr\":0") }
+        None => { eprintln!("[probe] no setres reply"); false }
+    }
+}
+
+fn b_restore(msgs: &MsgQ) -> bool {
+    if !pipe_write(b"restore") { eprintln!("[probe] restore write failed"); return false; }
+    match wait_for(msgs, |l| l.contains(r#""t":"rstres""#), 10_000) {
+        Some(l) => { println!("[probe] {l}"); l.contains("\"hr\":0") && !l.contains("\"err\"") }
+        None => { eprintln!("[probe] no rstres reply"); false }
+    }
+}
+
 /// 钩子注入（TranslucentTB 生产通道）：WH_CALLWNDPROC 挂任务栏线程载入 TAP DLL，
 /// DllMain 检测 explorer 宿主后自行进程内初始化。返回 hook 句柄（卸钩用）。
 fn hook_inject(msgs: &MsgQ) -> Result<H, String> {
@@ -221,13 +352,20 @@ fn hook_inject(msgs: &MsgQ) -> Result<H, String> {
         if hhk.is_null() { return Err(format!("SetWindowsHookExW gle={}", GetLastError())); }
         println!("[probe] hook installed, poking taskbar thread to force DLL load...");
         extern "system" { #[link(name = "user32")] fn SendMessageTimeoutW(hwnd: H, msg: u32, wp: usize, lp: isize, flags: u32, timeout: u32, res: *mut usize) -> isize; }
-        let mut res = 0usize;
-        SendMessageTimeoutW(tray, 0x0000, 0, 0, 2, 2000, &mut res);
         let want = format!(r#""ver":{}"#, TAP_VER);
-        match wait_for(msgs, |l| l.contains(r#""t":"loaded""#) && l.contains(&want), 45_000) {
-            Some(l) => { println!("[probe] tap: {l}"); Ok(hhk) }
-            None => { UnhookWindowsHookEx(hhk); Err("no matching-version `loaded` within 45s".into()) }
+        // poke 多次：任务栏线程瞬时忙时 SMTO 会静默放弃投递（B 阶段实测出现过连续失败），
+        // 每次 poke 间隔检查 loaded 到达即止
+        for poke in 1..=10 {
+            let mut res = 0usize;
+            let ok = SendMessageTimeoutW(tray, 0x0000, 0, 0, 2, 2000, &mut res);
+            println!("[probe] poke {poke} send_ret={ok}");
+            if wait_for(msgs, |l| l.contains(r#""t":"loaded""#) && l.contains(&want), 2_000).is_some() {
+                println!("[probe] tap: loaded v{TAP_VER} hhk=0x{:x}", hhk as usize);
+                return Ok(hhk);
+            }
         }
+        UnhookWindowsHookEx(hhk);
+        Err("no matching-version `loaded` within poke loop".into())
     }
 }
 
@@ -380,6 +518,144 @@ fn main() {
             }
             std::thread::sleep(std::time::Duration::from_secs(3));
         }
+        "btest" => {
+            // B1：路线A、路线B 各一轮 settext→回读→截图→restore→回读→截图
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            println!("[probe] === baseline ===");
+            shot("b0_base");
+            b_props(&msgs);
+            println!("[probe] === route A (SetProperty) ===");
+            shot("b1_beforeA");
+            let okA = b_set(&msgs, "settext B1TESTA");
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            shot("b2_afterA");
+            let rA = b_restore(&msgs);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            shot("b3_restoredA");
+            println!("[probe] === route B (winRT direct) ===");
+            shot("b4_beforeB");
+            let okB = b_set(&msgs, "settext2 B1TESTB");
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            shot("b5_afterB");
+            let rB = b_restore(&msgs);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            shot("b6_restoredB");
+            b_props(&msgs);
+            println!("[probe] stats: {}", ask_stats(&msgs).unwrap_or_default());
+            println!("[probe] BTEST DONE setA={okA} restoreA={rA} setB={okB} restoreB={rB}");
+            // 正常退出：pipe 断开触发 tap 自动恢复（应为 no-op）+ Unadvise
+        }
+        "bkill" => {
+            // B0：settext2 后硬杀自身（不走任何清理）——验证 tap 侧断线自动恢复
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            let okB = b_set(&msgs, "settext2 B1KILLED");
+            std::thread::sleep(std::time::Duration::from_millis(1200));
+            shot("b7_killed_modified");
+            println!("[probe] BKILL: modified={okB}; killing self NOW (no pipe close, no restore cmd)");
+            std::process::abort(); // 模拟被杀：立即终止，不发送任何命令
+        }
+        "bstress" => {
+            // 修改态驻留 secs 秒（外部并行跑全屏压力/主题切换），随后 restore（superseded 判定生效）
+            let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(60);
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            println!("[probe] BSTRESS: setting text and dwelling {secs}s (run bstress_fs.ps1 / btheme.ps1 now)");
+            let okB = b_set(&msgs, "settext2 B1STRESS");
+            shot("b8_stress_set");
+            drain_msgs(&msgs, secs, "stress");
+            shot("b9_stress_end");
+            let rB = b_restore(&msgs);
+            std::thread::sleep(std::time::Duration::from_millis(800));
+            shot("bA_stress_restored");
+            println!("[probe] stats: {}", ask_stats(&msgs).unwrap_or_default());
+            println!("[probe] BSTRESS DONE set={okB} restore={rB}");
+        }
+        "brapid" => {
+            // 判别「系统 VM 每秒重写文本」假说：先启动连拍（单进程 12 帧 @150ms），
+            // 随后立即 set——窗口期内必有多帧落在 set 之后
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            let _ = std::fs::remove_file("D:\\agents_tmp\\bburst_rapid_05.png");
+            let burst = std::thread::spawn(|| {
+                let _ = std::process::Command::new("powershell")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass",
+                           "-File", r"D:\agents_tmp\bburst.ps1", "rapid", "12", "150"])
+                    .status();
+            });
+            std::thread::sleep(std::time::Duration::from_millis(350)); // 连拍第 2~3 帧启动后 set
+            let ok = b_set(&msgs, "settext2 B1RAPID");
+            let _ = burst.join();
+            println!("[probe] BRAPID set={ok}");
+        }
+        "bhit" => {
+            // HitTest 判别：屏幕时钟区的可见元素句柄 vs 跟踪句柄（tap 日志看结果）
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            if !pipe_write(b"hitclock") { eprintln!("[probe] hitclock write failed"); std::process::exit(1); }
+            let _ = wait_for(&msgs, |l| l.contains(r#""t":"hittest""#), 8_000);
+            println!("[probe] hittest done — see tap log HITTEST lines");
+        }
+        "bwatch" => {
+            // 纯观察（不改文本）：记录 ready/lost（代次）事件——主题切换/DPI 等场景
+            let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(30);
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            drain_msgs(&msgs, secs, "watch");
+            println!("[probe] stats: {}", ask_stats(&msgs).unwrap_or_default());
+        }
+        "pipetest2" => {
+            // 最小复现：server 读线程模式与 pipe_server 相同；client 连接后立即写 2 条，
+            // 500ms 后再写 2 条——验证第二批是否送达（B 阶段 ack 丢失问题隔离）
+            let local: &str = r"\\.\pipe\lical-localtest2";
+            unsafe {
+                let lh = CreateNamedPipeW(wide(local).as_ptr(),
+                    PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE | GENERIC_READ | GENERIC_WRITE,
+                    PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                    1, 65536, 65536, 0, std::ptr::null());
+                if lh as isize == -1 { println!("create gle={}", GetLastError()); return; }
+                let lhu = lh as usize;
+                // reader（同 pipe_server 模式）
+                std::thread::spawn(move || {
+                    let h = lhu as H;
+                    let _ = ConnectNamedPipe(h, std::ptr::null());
+                    println!("[srv] connected");
+                    let mut carry = String::new();
+                    loop {
+                        let mut buf = [0u8; 4096];
+                        let mut n = 0u32;
+                        let ok = ReadFile(h, buf.as_mut_ptr(), buf.len() as u32, &mut n, std::ptr::null());
+                        if ok == 0 { println!("[srv] read err gle={} n={}", GetLastError(), n); break; }
+                        if n == 0 { println!("[srv] TRUE+0 wakeup"); continue; }
+                        carry.push_str(&String::from_utf8_lossy(&buf[..n as usize]));
+                        while let Some(pos) = carry.find('\n') {
+                            let line: String = carry.drain(..=pos).collect();
+                            println!("[srv] LINE: {}", line.trim_end());
+                        }
+                    }
+                });
+                // client
+                #[link(name = "kernel32")]
+                extern "system" {
+                    #[link_name = "CreateFileW"]
+                    fn CreateFileW2(name: *const u16, access: u32, share: u32, sa: *const u8,
+                        disp: u32, flags: u32, tmpl: H) -> H;
+                    #[link_name = "Sleep"]
+                    fn Sleep2(ms: u32);
+                    #[link_name = "WriteFile"]
+                    fn WriteFile2(h: H, buf: *const u8, len: u32, n: *mut u32, ov: *const u8) -> i32;
+                }
+                std::thread::spawn(move || {
+                    Sleep2(300);
+                    let h = CreateFileW2(wide(local).as_ptr(), GENERIC_READ | GENERIC_WRITE, 0,
+                        std::ptr::null(), 3, 0, std::ptr::null_mut());
+                    if h as isize == -1 { eprintln!("[cl] open failed gle={}", GetLastError()); return; }
+                    let msgs: [&[u8]; 4] = [b"m1\n", b"m2\n", b"m3\n", b"m4\n"];
+                    for (i, m) in msgs.iter().enumerate() {
+                        if i == 2 { Sleep2(500); }
+                        let mut n = 0u32;
+                        let ok = WriteFile2(h, m.as_ptr(), m.len() as u32, &mut n, std::ptr::null());
+                        println!("[cl] write {} ok={} n={}", i + 1, ok, n);
+                    }
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_secs(3));
+        }
         "raw" => {
             let endpoint = args.get(2).cloned().unwrap_or("VisualDiagConnection1".into());
             if let Err(e) = do_attach(&msgs, &endpoint) {
@@ -389,7 +665,7 @@ fn main() {
             loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
         }
         _ => {
-            eprintln!("usage: clockbar_probe <cycle n [dwell_ms] | dump secs | raw endpoint>");
+            eprintln!("usage: clockbar_probe <btest/bkill/bstress secs/bwatch secs/cycle n/dump/hookdump/hookcycle/pipetest/raw endpoint>");
             std::process::exit(1);
         }
     }
