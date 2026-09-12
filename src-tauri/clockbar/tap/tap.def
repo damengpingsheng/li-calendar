@@ -1,0 +1,4 @@
+LIBRARY lical_clock_tap
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE
