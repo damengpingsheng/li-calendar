@@ -1038,41 +1038,12 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     *last = None;
                 }
                 geom_log("z self-heal: overlay buried below taskbar, re-asserted topmost");
-            } else {
-                // R9.2 鉴别：窗口在上（未被埋）但右缘 padding 处实际像素与
-                // 推送右端色差大 → WebView 表面停滞（渲染器丢帧，与 z 无关），
-                // 记录供定位（背景纯色区采样，避开文字/图标）。
-                if let Ok(push) = LAST_PUSHED_BG.lock().map(|g| *g) {
-                    if let Some((_, pr)) = push {
-                        let px_x = endorsed.right - 5;
-                        let px_y = (endorsed.top + endorsed.bottom) / 2;
-                        let dc = unsafe { GetDC(None) };
-                        let px = unsafe { GetPixel(dc, px_x, px_y).0 };
-                        unsafe { ReleaseDC(None, dc) };
-                        if px != 0xFFFF_FFFF {
-                            let pr_rgb = (
-                                pr.0 as i32,
-                                pr.1 as i32,
-                                pr.2 as i32,
-                            );
-                            let px_rgb = (
-                                (px & 0xFF) as i32,
-                                ((px >> 8) & 0xFF) as i32,
-                                ((px >> 16) & 0xFF) as i32,
-                            );
-                            let err = (pr_rgb.0 - px_rgb.0)
-                                .abs()
-                                .max((pr_rgb.1 - px_rgb.1).abs().max((pr_rgb.2 - px_rgb.2).abs()));
-                            if err > 12 {
-                                geom_log(&format!(
-                                    "surface stall? pushed=({},{},{}) screen=({},{},{}) err={err} at ({px_x},{px_y})",
-                                    pr_rgb.0, pr_rgb.1, pr_rgb.2, px_rgb.0, px_rgb.1, px_rgb.2
-                                ));
-                            }
-                        }
-                    }
-                }
             }
+            // R9.4：移除 R9.2 的屏幕像素鉴别探针——GetPixel 在显示驱动高压/
+            // 卡死状态下会无限阻塞，且该阻塞发生在持有 GEOM_APPLY_LOCK 的
+            // update 路径内，会挂死整个几何系统（16:56 会话实测：重探线程
+            // 静默、TDR 看门狗连续报 diag stale、几何全冻结）。z 自愈保留
+            // hit-test（窗口管理器调用，不触 GPU 渲染路径）。
         }
     }
     // 变化检测：状态与当前完全一致则零窗口操作
