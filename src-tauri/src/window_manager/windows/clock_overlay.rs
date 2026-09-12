@@ -372,6 +372,15 @@ pub fn ensure_clock_overlay_attached(app_handle: &AppHandle) {
                 if let Some(hwnd) = get_window_hwnd(&window) {
                     show_overlay_above_taskbar(hwnd);
                     ATTACHED.store(true, std::sync::atomic::Ordering::SeqCst);
+                    // R9.3 TDR 看门狗：仅启动一次（重复 attach 幂等）
+                    static TDR_WATCHDOG_SPAWNED: std::sync::atomic::AtomicBool =
+                        std::sync::atomic::AtomicBool::new(false);
+                    if !TDR_WATCHDOG_SPAWNED.swap(
+                        true,
+                        std::sync::atomic::Ordering::SeqCst,
+                    ) {
+                        spawn_tdr_watchdog(app_handle.clone());
+                    }
                     if let Ok(mut h) = OVERLAY_HWND.lock() {
                         *h = Some(hwnd.0 as isize);
                     }
@@ -2034,10 +2043,54 @@ fn cover_set_color(c: (u8, u8, u8)) {
 }
 // ==================== R9.1 原生遮盖条结束 ====================
 
+/// R9.3 TDR 看门狗：最近一次 overlay-diag 转储时刻（重探线程每 10s 刷新）。
+static LAST_DIAG: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// R9.3 TDR 看门狗线程：显示驱动 ResourceTimeout（LiveKernelEvent 0x1cc，
+/// WER 证实 3 天 9 次、签名一致，PotPlayer 全屏切换 GPU 压力触发）会让
+/// WebView2 GPU 表面丢失且渲染管线卡死——覆盖层整块透明、原生注册表时钟
+/// 透出、重探线程卡死在 DWM 调用上（diag 停更、日志静默，复验⑰⑱实测）。
+/// 本线程独立且不触 GPU 调用：检测 diag 新鲜度丢失（>20s）→ 隐藏/重显
+/// 覆盖层窗口 + location.reload() 强制刷新，尝试唤醒渲染管线；每轮间隔 5s。
+fn spawn_tdr_watchdog(app_handle: AppHandle) {
+    std::thread::Builder::new()
+        .name("clock-tdr-watchdog".into())
+        .spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            if !ATTACHED.load(std::sync::atomic::Ordering::SeqCst) {
+                continue;
+            }
+            let stale = LAST_DIAG
+                .lock()
+                .ok()
+                .and_then(|g| *g)
+                .map(|t| t.elapsed().as_secs() > 20)
+                .unwrap_or(false);
+            if !stale {
+                continue;
+            }
+            crate::dbg_log("tdr-watchdog: diag stale >20s (display driver reset?), reload overlay webview");
+            if let Some(window) = app_handle.get_webview_window("clock_overlay") {
+                let _ = window.hide();
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let _ = window.show();
+                let _ = window.eval("location.reload()");
+                crate::dbg_log("tdr-watchdog: reload issued");
+            }
+            // 重置新鲜度基线：给 reload 后的 diag 链条 20s 恢复窗口，仍卡死
+            // 则每 5s 重试一轮
+            *LAST_DIAG.lock().unwrap() = Some(std::time::Instant::now());
+        })
+        .ok();
+}
+
 /// R9.2 周期诊断转储：覆盖层窗口可见性/矩形/最后推送色。
 /// 「时钟彻底消失」类问题的取证锚点——复现时刻对照本行即可判定窗口当时
 /// 的真实状态（可见性/位置），区分被埋/隐藏/渲染停滞/窗口丢失。
 pub fn overlay_diag_dump() {
+    if let Ok(mut g) = LAST_DIAG.lock() {
+        *g = Some(std::time::Instant::now());
+    }
     let Some(window) = crate::windows_hook::app_handle()
         .and_then(|app| app.get_webview_window("clock_overlay"))
     else {
