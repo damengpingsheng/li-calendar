@@ -41,11 +41,11 @@ type InitXamlDiagEx = unsafe extern "system" fn(
     wszTAPDllName: *const u16, tapClsid: *const u8, wszInitializationData: *const u16,
 ) -> i32;
 
-const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b45"; // 与 tap.cpp TAPVER 版本化一致
+const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b46"; // 与 tap.cpp TAPVER 版本化一致
 const SDK_DLL: &str = r"D:\environment\WindowsKits\10\bin\x64\XamlDiagnostics\xamldiagnostics.dll";
 const WUX_DLL: &str = "Windows.UI.Xaml.dll"; // 系统目录，POC 证实其导出 InitializeXamlDiagnosticsEx
-const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap45.dll";
-const TAP_VER: &str = "45";
+const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap46.dll";
+const TAP_VER: &str = "46";
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];

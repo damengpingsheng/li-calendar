@@ -329,8 +329,8 @@ class TapObject : public IObjectWithSite, public IVisualTreeServiceCallback2 {
             // v35：reparent 自我抑制——构建 lambda 把 Time 移出原生面板时引擎同步报 REM，
             // 这不是树重建。双重判据：构建窗口标志 + 正向校验（Time 现父=自建横板），
             // 后者防引擎队列化回调导致的时序漂移。
-            if (isTracked && h == g_hTime && (g_selfReparent || SelfReparentPositive())) {
-                log_line("TRACK suppress self-reparent REM h=%llX", h);
+            if (isTracked && (h == g_hTime || h == g_hDate) && (g_selfReparent || SelfReparentPositive())) {
+                log_line("TRACK suppress self-mutation REM h=%llX", h);
                 ReleaseSRWLockExclusive(&g_stateLock);
                 return;
             }
@@ -1098,7 +1098,7 @@ static wfnd::IInspectable g_timeRef{ nullptr };     // 原生 Time（被 reparen
 static wfnd::IInspectable g_spRef{ nullptr }, g_dateRef{ nullptr }, g_contRef{ nullptr };
 static double             g_segDesired[4] = { 0,0,0,0 };
 static bool               g_segHidden[4] = { false,false,false,false };
-static int                g_snapDateVisibility = -1;  // -1=未改
+static int                g_snapDateIndex = -1;     // Date 在原生面板的原位（v46 摘离恢复用）
 static int                g_snapTimeIndex = -1;       // Time 在原生面板的原位（恢复用）
 static winrt::event_token g_szToken{}, g_themeToken{};
 static bool               g_eventsOn = false;
@@ -1112,15 +1112,24 @@ static const char* SEGNAME[4] = { "weather", "festival", "term", "lunar" };
 static void AutoRestoreOnDisconnect(); // 定义于后（B0 恢复序列）
 static void PanelReflow(wux::Controls::StackPanel const& hp); // 定义于后（v41 tick 兜底调用）
 
-// v35 正向判据：Time 的现父是否为自建横板（UI 线程；winRT 调用非引擎调用）
+// v46 正向判据（UI 线程；winRT 调用非引擎调用）：
+// Time 的现父=自建横板；或 Date 处于摘离态（面板在场且 Date 无父）。
 static bool SelfReparentPositive() {
     try {
-        if (!g_panelOn || !g_timeRef || !g_hpanelRef) return false;
-        auto t = g_timeRef.try_as<wux::DependencyObject>();
-        auto hp = g_hpanelRef.try_as<wux::DependencyObject>();
-        if (!t || !hp) return false;
-        auto p = wuxm::VisualTreeHelper::GetParent(t);
-        return p && winrt::get_abi(p.as<wfnd::IInspectable>()) == winrt::get_abi(hp.as<wfnd::IInspectable>());
+        if (!g_panelOn) return false;
+        if (g_timeRef && g_hpanelRef) {
+            auto t = g_timeRef.try_as<wux::DependencyObject>();
+            auto hp = g_hpanelRef.try_as<wux::DependencyObject>();
+            if (t && hp) {
+                auto p = wuxm::VisualTreeHelper::GetParent(t);
+                if (p && winrt::get_abi(p.as<wfnd::IInspectable>()) == winrt::get_abi(hp.as<wfnd::IInspectable>())) return true;
+            }
+        }
+        if (g_dateRef) {
+            auto d = g_dateRef.try_as<wux::DependencyObject>();
+            if (d && !wuxm::VisualTreeHelper::GetParent(d)) return true;
+        }
+        return false;
     } catch (...) { return false; }
 }
 
@@ -1277,13 +1286,18 @@ static void PanelTick() {
             return;
         }
         unsigned fixed = 0;
-        // Date 隐藏保持
+        // v46：Date 摘离保持——系统若把它重新插回原生面板则再次摘除
         if (g_dateRef) {
-            if (auto d = g_dateRef.try_as<wux::FrameworkElement>()) {
-                if (d.Visibility() != wux::Visibility::Collapsed) {
-                    d.Visibility(wux::Visibility::Collapsed);
+            auto dU = g_dateRef.try_as<wux::UIElement>();
+            auto dch = sp.Children();
+            for (uint32_t c = 0; c < dch.Size(); c++) {
+                if (dU && winrt::get_abi(dch.GetAt(c)) == winrt::get_abi(dU)) {
+                    InterlockedExchange(&g_selfReparent, 1);
+                    dch.RemoveAt(c);
+                    InterlockedExchange(&g_selfReparent, 0);
                     fixed++;
-                    log_line("PANEL tick: re-hide Date (system resurrect)");
+                    log_line("PANEL tick: re-detach Date (system re-inserted)");
+                    break;
                 }
             }
         }
@@ -1466,30 +1480,40 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         g_hasData = true;
     }
 
-    // Date 元素（按名在 sp 内找）+ Time 原位记录
+    // Date 元素（按名在 sp 内找）+ Time/Date 原位记录
     wfnd::IInspectable dateIns{ nullptr };
-    int timeIdx = -1;
+    int timeIdx = -1, dateIdx = -1;
     auto ch0 = sp.Children();
     for (uint32_t c = 0; c < ch0.Size(); c++) {
         if (auto f = ch0.GetAt(c).try_as<wux::FrameworkElement>()) {
-            if (f.Name() == L"DateInnerTextBlock") dateIns = f;
+            if (f.Name() == L"DateInnerTextBlock") { dateIns = f; dateIdx = (int)c; }
             if (winrt::get_abi(ch0.GetAt(c)) == winrt::get_abi(tb.as<wux::UIElement>())) timeIdx = (int)c;
         }
     }
 
-    // 快照 + 引用（原生布局属性一律不写——v33 拉锯教训）
-    g_snapDateVisibility = -1;
-    if (dateIns) {
-        g_dateRef = dateIns;
-        if (auto d = dateIns.try_as<wux::FrameworkElement>())
-            g_snapDateVisibility = (int)d.Visibility();
-    }
+    // 快照 + 引用（原生属性一律不写——v33 拉锯教训；v46 起 Date 连 Visibility 也不写）
+    if (dateIns) g_dateRef = dateIns;
     g_snapTimeIndex = timeIdx;
+    g_snapDateIndex = dateIdx;
     g_spRef = sp; g_timeRef = tb;
     g_contRef = getObj(hCont);
 
-    // Date 隐藏（一次性；v33 实证系统不复活）
-    if (auto d = g_dateRef.try_as<wux::FrameworkElement>()) d.Visibility(wux::Visibility::Collapsed);
+    // v46：Date 整体摘出原生面板。真实使用证伪了「系统不复活 Date 可见性」——
+    // 每分钟边界及全屏进出期系统都会重设 Date.Visibility=Visible（PotPlayer 全屏
+    // 退出实测每秒一次），1s tick 纠偏窗内原生日期行闪现=「系统时钟露出」。
+    // 摘离后系统的 Text/Visibility 写入落到脱离树的对象上，视觉零效果。
+    if (g_dateRef) {
+        auto dU = g_dateRef.try_as<wux::UIElement>();
+        for (uint32_t c = 0; c < ch0.Size(); c++) {
+            if (dU && winrt::get_abi(ch0.GetAt(c)) == winrt::get_abi(dU)) {
+                InterlockedExchange(&g_selfReparent, 1);
+                ch0.RemoveAt(c);
+                InterlockedExchange(&g_selfReparent, 0);
+                log_line("PANEL build: Date detached (was idx %d)", dateIdx);
+                break;
+            }
+        }
+    }
 
     // 自建横板（新建或复用）
     wux::Controls::StackPanel hp{ nullptr };
@@ -1717,12 +1741,17 @@ static void PanelFree(bool restoreNative) {
         } catch (...) {}
         g_borderRef = nullptr;
     }
-    // Date 恢复（D7：只恢复仍属于自己的改动）
-    if (restoreNative) {
-        if (auto d = g_dateRef.try_as<wux::FrameworkElement>(); d && g_snapDateVisibility >= 0)
-            try { d.Visibility((wux::Visibility)g_snapDateVisibility); } catch (...) {}
+    // Date 恢复（v46：Date 被摘离，按原位插回；摘离期间其可见性从未被我们触碰）
+    if (restoreNative && g_dateRef && sp && g_snapDateIndex >= 0) {
+        try {
+            auto spCh2 = sp.Children();
+            int at = g_snapDateIndex;
+            if (at > (int)spCh2.Size()) at = (int)spCh2.Size();
+            spCh2.InsertAt((uint32_t)at, g_dateRef.try_as<wux::UIElement>());
+            log_line("PANEL free: Date re-inserted at %d", at);
+        } catch (...) {}
     }
-    g_snapDateVisibility = -1; g_snapTimeIndex = -1;
+    g_snapDateIndex = -1; g_snapTimeIndex = -1;
     g_spRef = nullptr; g_timeRef = nullptr; g_dateRef = nullptr; g_contRef = nullptr;
     InterlockedExchange(&g_panelOn, 0);
     log_line("PANEL free (restoreNative=%d)", (int)restoreNative);
