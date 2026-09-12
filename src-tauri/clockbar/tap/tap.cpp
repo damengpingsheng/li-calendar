@@ -1106,6 +1106,7 @@ static wux::DispatcherTimer g_timer{ nullptr };
 static wfnd::IInspectable g_borderRef{ nullptr };
 static volatile LONG      g_lastRecvTick = 0;      // pipe 最近收到命令的时刻（GetTickCount）
 static volatile LONG      g_lastResyncTick = 0;    // 上次僵尸重同步时刻（限频 30s）
+static volatile LONG      g_lastSizeTick = 0;      // 横板最近一次尺寸变化时刻（v44 稳定门）
 // 隐藏优先级：天气(0)→节日(1)→节气(2)→农历(3)；时间段=原生 Time 永不丢
 static const char* SEGNAME[4] = { "weather", "festival", "term", "lunar" };
 static void AutoRestoreOnDisconnect(); // 定义于后（B0 恢复序列）
@@ -1379,28 +1380,46 @@ static void PanelTick() {
 // 宽度策略（D3）：溢出→按优先级隐藏段；富余→按优先级恢复段。
 // v42 实测修正：MaxWidth 会钳平 DesiredSize，「desired−actual」测不到上限截断；
 // 正确度量 = 可见子项期望宽之和（含 Time 与段间距） − 横板实际宽。
+// v43 实测再修正：构建布局级联中子项 DesiredSize 尚为 0，求和只剩边距 → 幻影溢出
+// 把全部段隐藏且无法自愈（实测 40/40/30/20 恒定、与 capw/字号无关）。故任何可见
+// 子项未测量（desired≤0）时本轮放弃评估，交给后续 SizeChanged/tick。
 static void PanelReflow(wux::Controls::StackPanel const& hp) {
     try {
         if (!g_panelOn) return;
+        // v44：布局稳定门——级联期（新建/每次隐藏都会触发多轮布局）ActualWidth 滞后于
+        // 内容收窄，逐轮评估必然连环误判（v43 实测 act 102→75→54 递减、溢出恒 +40）。
+        // 只在 400ms 无尺寸变化后评估；SizeChanged 仅记脏标记。
+        LONG now = (LONG)GetTickCount(), last = g_lastSizeTick;
+        LONG dt = now - last; if (dt < 0) dt = -dt;
+        if (g_lastSizeTick != 0 && dt < 400) return;
+        double actual = hp.ActualWidth();
+        if (actual <= 0) return;
         double sum = 0;
+        bool measured = true;
         for (int i = 0; i < 4; i++) {
             if (!g_seg[i] || g_segHidden[i]) continue;
             if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
                 double d = f.DesiredSize().Width;
-                if (d > 0) { sum += d + (i > 0 ? 10 : 0); }
+                if (d <= 0) { measured = false; break; }
+                sum += d;
             }
         }
-        if (g_timeRef)
-            if (auto t = g_timeRef.try_as<wux::FrameworkElement>())
-                sum += t.DesiredSize().Width + 10;
-        double overflow = sum - hp.ActualWidth();
+        if (!measured) return;
+        if (g_timeRef) {
+            if (auto t = g_timeRef.try_as<wux::FrameworkElement>()) {
+                double td = t.DesiredSize().Width;
+                if (td <= 0) return;
+                sum += td;
+            }
+        }
+        double overflow = sum - actual;
         if (overflow > 2) {
             for (int i = 0; i < 4; i++) {         // 先隐藏低优先级（天气最先）
                 if (!g_seg[i] || g_segHidden[i]) continue;
                 if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
                     f.Visibility(wux::Visibility::Collapsed);
                     g_segHidden[i] = true;
-                    log_line("PANEL reflow: hide %s (overflow %.0f)", SEGNAME[i], overflow);
+                    log_line("PANEL reflow: hide %s (overflow %.0f, sum %.0f act %.0f)", SEGNAME[i], overflow, sum, actual);
                     return; // 一次一步，等下一轮布局
                 }
             }
@@ -1505,6 +1524,7 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         if (makeNew) {
             g_seg[i] = seg;
             g_segHidden[i] = false;
+            g_segDesired[i] = 0; // 清陈旧缓存（v44：避免跨会话污染 show 判据）
             hp.Children().Append(g_seg[i].try_as<wux::UIElement>());
         }
     }
@@ -1618,7 +1638,7 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         // v41：SizeChanged 挂在自建横板上并量自建横板——v40 实测挂在原生（垂直）面板上
         // desired≈actual 永远测不到溢出，capw 过小时时间被裁（违反「时间段永不丢」）
         g_szToken = g_hpanelRef.as<wux::FrameworkElement>().SizeChanged([](wfnd::IInspectable const& s, wux::SizeChangedEventArgs const&) {
-            if (auto hpt = s.try_as<wux::Controls::StackPanel>()) PanelReflow(hpt);
+            InterlockedExchange(&g_lastSizeTick, (LONG)GetTickCount()); // v44：只记脏，评估交给 tick（稳定门）
         });
         g_themeToken = sp.ActualThemeChanged([](wux::FrameworkElement const&, wfnd::IInspectable const&) {
             try { // 主题翻转：段前景色跟随 Time 重新取
