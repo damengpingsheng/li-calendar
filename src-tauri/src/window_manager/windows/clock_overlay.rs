@@ -152,16 +152,8 @@ fn rect_eq(a: Option<RECT>, b: Option<RECT>) -> bool {
         _ => false,
     }
 }
-
-/// 两个矩形的并集（N1 掩盖矩形 = 认可位 ∪ 原生观测位）。
-fn union_rect(a: RECT, b: RECT) -> RECT {
-    RECT {
-        left: a.left.min(b.left),
-        top: a.top.min(b.top),
-        right: a.right.max(b.right),
-        bottom: a.bottom.max(b.bottom),
-    }
-}
+// R9.0：union_rect 已随「并集放大遮盖」一并移除——平移式遮盖为等宽平移，
+// 无并集计算。
 
 /// 几何应用诊断日志（标记文件门控，随动跟随动画期间会逐帧触发）。
 fn geom_log(msg: &str) {
@@ -438,13 +430,15 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
         let mut aborted = false;
         if let Some(window) = app_handle.get_webview_window("clock_overlay") {
             if let Some(hwnd) = get_window_hwnd(&window) {
-                let right = anim_endorsed.right;
+                // R9.0 平移式遮盖：宽度恒定为 endorsed 宽，动画是**纯平移**
+                // （3607→3649），全程零 resize——WebView 表面不再因宽度变化
+                // 重分配（透明帧根因，见 update Covered 分支注释）。
+                let ew = anim_endorsed.right - anim_endorsed.left;
                 let top = anim_endorsed.top;
                 let h = anim_endorsed.bottom - anim_endorsed.top;
                 let total = anim_endorsed.left - from_left;
-                // 4 步 × ~25ms ≈ 100ms 滑入：中间矩形 [x, right] 恒 ⊇ 收缩前
-                // 遮盖态，原生时钟（已读到 endorsed 位）全程零暴露；42px 瞬移
-                // 是复验⑪录屏「收缩抖动」的感知来源，平滑滑入显著弱化。
+                // 4 步 × ~25ms ≈ 100ms 滑入：中间矩形 [x, x+ew] 恒 ⊇ 收缩前
+                // 遮盖态平移覆盖的全屏位形时钟区（等宽平移），原生时钟零暴露。
                 let steps = 4i32;
                 for k in 1..=steps {
                     let covered_again = GEOM
@@ -464,7 +458,7 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
                             None,
                             x,
                             top,
-                            right - x,
+                            ew,
                             h,
                             SWP_NOACTIVATE | SWP_NOZORDER,
                         );
@@ -523,14 +517,21 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> (bool, Option<(i32, RECT)
     if !shrink_requested {
         if let (Some(endorsed), Some(native)) = (endorsed, native) {
             if !rect_eq(Some(native), Some(endorsed)) {
-                let u = union_rect(endorsed, native);
+                // R9.0 平移式遮盖：等宽平移到全屏位形左缘（恒定宽度，零 resize）
+                let ew = endorsed.right - endorsed.left;
+                let u = RECT {
+                    left: native.left,
+                    top: endorsed.top,
+                    right: native.left + ew,
+                    bottom: endorsed.bottom,
+                };
                 if !rect_eq(mask, Some(u)) {
                     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
                         return (false, None);
                     };
                     if apply_mask_geometry(&window, u) {
                         crate::dbg_log(&format!(
-                            "clockrect: mask expand (native diverged) union=({},{},{},{})",
+                            "clockrect: mask expand (native diverged) translate=({},{},{},{})",
                             u.left, u.top, u.right, u.bottom
                         ));
                     }
@@ -854,21 +855,34 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     ));
                 }
             }
-            // N1 掩盖预备（评审 §3.3 修正）：遮盖目标 = 已展开 mask 优先，
-            // 否则本轮新观测的原生位置与认可位取并集；R7.2 补全屏位形记忆
-            // （跨轮保留的最后非认可位观测）作最终回退——进全屏头一秒
-            // 首针 UIA 未到时即可展开，消除 191~323ms 残块暴露窗。保持遮盖
-            // 必须位置+尺寸成套应用——只回左缘不缩宽会让窗口变成"认可左缘
-            // +遮盖宽度"，右缘冲进「显示桌面」区（盖住相邻图标，用户实测）。
+            // R9.0 平移式遮盖（替代 R7 的并集放大遮盖）：遮盖目标 = **认可矩形
+            // 等宽平移**到全屏位形左缘（native.left），窗口尺寸恒定不变。
+            // 依据（复验⑮录屏 f10-f15 帧+日志）：宽度变化（212↔170）迫使
+            // WebView2 表面重分配，快速切换期间渲染器丢帧呈现**透明帧**——
+            // 原生注册表时钟整个透出（窗口位置/z 序日志全正常），是「时钟
+            // 消失」感知的主体，keepalive 无法根治。而全屏位形时钟宽
+            // 151~163px < 认可宽 158~170px，等宽平移到 native.left 即可完整
+            // 盖住（并集的 3770..3819 段只是空任务栏，无需覆盖）。
+            // 代价：回摆期（原生在两位置间振荡）平移跟踪存在 ≤~220ms 的
+            // 42px 原生残条暴露窗（R8.7 收缩动画同样适用于平移滑入）。
+            // R7.2 全屏位形记忆（跨轮保留的最后非认可位观测）保留——进全屏
+            // 头一秒首针 UIA 未到时即可平移到位。
             let cur_mask = GEOM.lock().ok().and_then(|g| g.mask);
             let native = GEOM
                 .lock()
                 .ok()
                 .and_then(|g| g.native_observed.or(g.last_native_layout));
+            let ew = endorsed.right - endorsed.left;
             let mask_target = cur_mask.or_else(|| {
                 native.and_then(|n| {
-                    let u = union_rect(endorsed, n);
-                    (!rect_eq(Some(u), Some(endorsed))).then_some(u)
+                    // 平移矩形：[native.left, native.left+ew] ⊇ 全屏位形时钟
+                    let m = RECT {
+                        left: n.left,
+                        top: endorsed.top,
+                        right: n.left + ew,
+                        bottom: endorsed.bottom,
+                    };
+                    (!rect_eq(Some(m), Some(endorsed))).then_some(m)
                 })
             });
             if cur_mask.is_none() {
@@ -881,7 +895,7 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     if !rect_eq(g.mask, Some(m)) {
                         g.mask = Some(m);
                         geom_log(&format!(
-                            "mask prepared union=({},{},{},{})",
+                            "mask prepared translate=({},{},{},{}) w={ew}",
                             m.left, m.top, m.right, m.bottom
                         ));
                     }
@@ -996,12 +1010,19 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                 let native = GEOM.lock().ok().and_then(|g| g.native_observed);
                 if let Some(n) = native {
                     if !rect_eq(Some(n), Some(endorsed)) {
-                        let u = union_rect(endorsed, n);
+                        // R9.0 平移式遮盖：等宽平移到全屏位形左缘（恒定宽度）
+                        let ew = endorsed.right - endorsed.left;
+                        let u = RECT {
+                            left: n.left,
+                            top: endorsed.top,
+                            right: n.left + ew,
+                            bottom: endorsed.bottom,
+                        };
                         if let Ok(mut g) = GEOM.lock() {
                             g.mask = Some(u);
                         }
                         geom_log(&format!(
-                            "mask prepared union=({},{},{},{}) (visible-branch)",
+                            "mask prepared translate=({},{},{},{}) (visible-branch)",
                             u.left, u.top, u.right, u.bottom
                         ));
                         if let Ok(mut last) = LAST_APPLIED_RECT.lock() {

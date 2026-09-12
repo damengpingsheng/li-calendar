@@ -115,19 +115,15 @@ function ClockOverlayWindow(): React.JSX.Element {
   const color = appearance?.fg ?? (isDark ? '#ffffff' : '#1a1a1a');
   const flatBackground = appearance?.bg ?? (isDark ? '#202020' : '#f3f3f3');
   const bgLeft = appearance?.bgLeft;
-  // R8.5/R8.8：任务栏底色存在横向渐变（壁纸透出）——双端采样（左列=窗口
-  // 右缘内 190px、右列=右缘外 8px，均为**固定屏幕位置**，跨遮盖/常规两态
-  // 不变）+ 渐变图 198px 宽、自右缘 -8px 锚定：窗口移动/收缩只**裁切**，
-  // 不再按 100vw 百分比重映射（旧实现窗口变宽时整段背景重新拉伸=收缩
-  // 过程中的色彩漂移来源之一）。bgLeft 兜底色填补渐变图左侧未覆盖段。
+  // R8.5/R9.0：任务栏底色存在横向渐变（壁纸透出）——双端采样（左列=窗口左
+  // 邻、右列=右邻）+ 渐变 100% 映射。R9.0 平移式遮盖后**窗口尺寸恒定**
+  // （遮盖=等宽平移，零 resize），100% 映射不再随窗口宽度重映射——
+  // R8.8 的屏幕坐标锚定（198px/right -8px）随之废弃（且其 CSS 像素换算
+  // 在 175% DPI 下本就不准）。
   const hasGradient = !!bgLeft && bgLeft !== flatBackground;
   const background: React.CSSProperties = hasGradient
     ? {
-        backgroundColor: bgLeft ?? flatBackground,
         backgroundImage: `linear-gradient(90deg, ${bgLeft}, ${flatBackground})`,
-        backgroundRepeat: 'no-repeat',
-        backgroundSize: '198px 100%',
-        backgroundPosition: 'right -8px top 0',
       }
     : { backgroundColor: flatBackground };
   const fontFamily =
