@@ -997,6 +997,75 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             })
             .ok();
     }
+    // R9.2 z 自愈（常规可见态）：任务栏重排（图标增减/全屏进出触发 Shell
+    // 重排）会重申任务栏在 topmost 带内的槽位，可能把覆盖层压到任务栏之下
+    // ——外部 z 扰动不改变状态五元组，变化检测永不重申 → 覆盖层被埋（原生
+    // 时钟持续可见，复验⑰实测需重启才恢复）。每针 WindowFromPoint 自检
+    // 覆盖层中心归属，非本窗口即重申 topmost 并清应用缓存。
+    if below == -1 {
+        let center = windows::Win32::Foundation::POINT {
+            x: (endorsed.left + endorsed.right) / 2,
+            y: (endorsed.top + endorsed.bottom) / 2,
+        };
+        let hit = unsafe { WindowFromPoint(center) };
+        if !hit.0.is_null() {
+            let hit_root = unsafe { GetAncestor(hit, GA_ROOT) };
+            let buried = get_window_hwnd(&window)
+                .map(|own| unsafe { GetAncestor(own, GA_ROOT) } != hit_root)
+                .unwrap_or(false);
+            if buried {
+                unsafe {
+                    let _ = SetWindowPos(
+                        hwnd,
+                        Some(HWND_TOPMOST),
+                        0,
+                        0,
+                        0,
+                        0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+                    );
+                }
+                if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
+                    *last = None;
+                }
+                geom_log("z self-heal: overlay buried below taskbar, re-asserted topmost");
+            } else {
+                // R9.2 鉴别：窗口在上（未被埋）但右缘 padding 处实际像素与
+                // 推送右端色差大 → WebView 表面停滞（渲染器丢帧，与 z 无关），
+                // 记录供定位（背景纯色区采样，避开文字/图标）。
+                if let Ok(push) = LAST_PUSHED_BG.lock().map(|g| *g) {
+                    if let Some((_, pr)) = push {
+                        let px_x = endorsed.right - 5;
+                        let px_y = (endorsed.top + endorsed.bottom) / 2;
+                        let dc = unsafe { GetDC(None) };
+                        let px = unsafe { GetPixel(dc, px_x, px_y).0 };
+                        unsafe { ReleaseDC(None, dc) };
+                        if px != 0xFFFF_FFFF {
+                            let pr_rgb = (
+                                pr.0 as i32,
+                                pr.1 as i32,
+                                pr.2 as i32,
+                            );
+                            let px_rgb = (
+                                (px & 0xFF) as i32,
+                                ((px >> 8) & 0xFF) as i32,
+                                ((px >> 16) & 0xFF) as i32,
+                            );
+                            let err = (pr_rgb.0 - px_rgb.0)
+                                .abs()
+                                .max((pr_rgb.1 - px_rgb.1).abs().max((pr_rgb.2 - px_rgb.2).abs()));
+                            if err > 12 {
+                                geom_log(&format!(
+                                    "surface stall? pushed=({},{},{}) screen=({},{},{}) err={err} at ({px_x},{px_y})",
+                                    pr_rgb.0, pr_rgb.1, pr_rgb.2, px_rgb.0, px_rgb.1, px_rgb.2
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
     // 变化检测：状态与当前完全一致则零窗口操作
     if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
         if *last == Some((target_x, target_y, target_w, target_h, below)) {
