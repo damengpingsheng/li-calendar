@@ -8,20 +8,23 @@
 use std::sync::Mutex;
 use tauri::{AppHandle, Emitter, Manager, WebviewWindow};
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, RECT};
+use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, RECT, WPARAM};
 use windows::Win32::System::Com::{CoInitializeEx, COINIT_MULTITHREADED};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Registry::{
     RegCloseKey, RegOpenKeyExW, RegQueryValueExW, HKEY, HKEY_CURRENT_USER, KEY_READ,
 };
 use windows::Win32::Graphics::Gdi::{
-    GetDC, GetMonitorInfoW, GetPixel, MonitorFromWindow, ReleaseDC, MONITORINFO,
-    MONITOR_DEFAULTTONEAREST,
+    BeginPaint, CreateSolidBrush, EndPaint, FillRect, GetDC, GetMonitorInfoW, GetPixel,
+    InvalidateRect, MonitorFromWindow, ReleaseDC, MONITORINFO, MONITOR_DEFAULTTONEAREST,
+    PAINTSTRUCT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    FindWindowW, GetAncestor, GetWindowLongPtrW, GetWindowRect, IsWindowVisible,
-    SetWindowLongPtrW, SetWindowPos, ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE,
-    HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW,
-    SW_SHOWNOACTIVATE, WINDOW_EX_STYLE, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    CreateWindowExW, DefWindowProcW, FindWindowW, GetAncestor, GetClientRect, GetWindowLongPtrW,
+    GetWindowRect, IsWindow, IsWindowVisible, RegisterClassW, SetWindowLongPtrW, SetWindowPos,
+    ShowWindow, WindowFromPoint, GA_ROOT, GWL_EXSTYLE, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SWP_SHOWWINDOW, SW_HIDE, SW_SHOWNOACTIVATE, WINDOW_EX_STYLE,
+    WM_ERASEBKGND, WM_PAINT, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_POPUP,
 };
 
 use super::get_window_hwnd;
@@ -415,76 +418,14 @@ pub fn relocate_clock_overlay(app_handle: &AppHandle) {
 /// （3618..3660）暴露在认可位覆盖层左侧（23:50 真机实测每趟摆动都有
 /// ~150-300ms 暴露窗）。读数到达即唤起可见性管理完成展开，暴露窗压到
 /// 探测耗时级（~70ms，UIA 查询延迟为下限）。
-/// 收缩动画进行中标记（R8.7）：动画期间 update/relocate 跳过几何应用，
-/// 避免 150ms 探针针把滑入过程打断成跳变；终态由动画自身精确落位。
-static SHRINK_ANIMATING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// R9.1：SHRINK_ANIMATING 门随 R8.7 收缩动画一并退役——收缩只剩「隐藏
+/// 原生遮盖条」一个动作，覆盖层几何恒定，无动画亦无并发间隙。
 
 pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
     // R8.1：几何应用持串行锁执行；可见性管理自取同一把锁，必须锁外调用。
-    // R8.7/R8.8：锁内返回收缩动画请求并已置位 SHRINK_ANIMATING 门（持锁内置位，
-    // 消除「锁释放后置位」的竞态间隙，复审 §6.3）；滑入锁外执行（持锁睡眠会
-    // 阻塞全部几何路径），且每步核对最新状态（复审 §6.2：原生回摆/快速再入时
-    // 不得滑向旧终点）。
-    let (need_update, anim) = relocate_geometry_locked(app_handle);
-    if let Some((from_left, anim_endorsed)) = anim {
-        let mut aborted = false;
-        if let Some(window) = app_handle.get_webview_window("clock_overlay") {
-            if let Some(hwnd) = get_window_hwnd(&window) {
-                // R9.0 平移式遮盖：宽度恒定为 endorsed 宽，动画是**纯平移**
-                // （3607→3649），全程零 resize——WebView 表面不再因宽度变化
-                // 重分配（透明帧根因，见 update Covered 分支注释）。
-                let ew = anim_endorsed.right - anim_endorsed.left;
-                let top = anim_endorsed.top;
-                let h = anim_endorsed.bottom - anim_endorsed.top;
-                let total = anim_endorsed.left - from_left;
-                // 4 步 × ~25ms ≈ 100ms 滑入：中间矩形 [x, x+ew] 恒 ⊇ 收缩前
-                // 遮盖态平移覆盖的全屏位形时钟区（等宽平移），原生时钟零暴露。
-                let steps = 4i32;
-                for k in 1..=steps {
-                    let covered_again = GEOM
-                        .lock()
-                        .ok()
-                        .map(|g| g.phase == GeomPhase::Covered || g.mask.is_some())
-                        .unwrap_or(false);
-                    if covered_again {
-                        aborted = true;
-                        geom_log("clockrect: shrink anim aborted (covered again)");
-                        break;
-                    }
-                    let x = from_left + total * k / steps;
-                    unsafe {
-                        let _ = SetWindowPos(
-                            hwnd,
-                            None,
-                            x,
-                            top,
-                            ew,
-                            h,
-                            SWP_NOACTIVATE | SWP_NOZORDER,
-                        );
-                    }
-                    if k < steps {
-                        std::thread::sleep(std::time::Duration::from_millis(25));
-                    }
-                }
-                if !aborted {
-                    let _ = apply_overlay_geometry(&window, &anim_endorsed);
-                    geom_log("clockrect: shrink animated (slide-in done)");
-                }
-            } else {
-                aborted = true;
-            }
-        } else {
-            aborted = true;
-        }
-        if aborted {
-            // 中止后不落终态：重新被盖时遮盖流程下一针自行应用其几何；
-            // 未被再盖的中止（窗口不可得等罕见路径）下一针 relocate 收敛。
-            // 当前中间矩形 [x, right] 仍 ⊇ endorsed，原生不会因此暴露。
-        }
-        SHRINK_ANIMATING.store(false, std::sync::atomic::Ordering::SeqCst);
-    }
-    if need_update {
+    // R9.1：收缩=隐藏原生遮盖条（覆盖层恒定于 endorsed 位，零几何变化），
+    // 无需动画/SHRINK_ANIMATING 门（随 R8.7 机制一并退役）。
+    if relocate_geometry_locked(app_handle) {
         update_clock_overlay_visibility(app_handle);
     }
 }
@@ -492,15 +433,11 @@ pub fn relocate_clock_overlay_endorsed(app_handle: &AppHandle) {
 /// relocate 几何本体（持 [`GEOM_APPLY_LOCK]`）。返回 (是否需随后调用可见性
 /// 管理, 收缩动画需求 (动画起点左缘, 终态 endorsed))——锁内不可重入调用
 /// update（std Mutex 不可重入，会自锁死）；动画在锁外执行（见上）。
-fn relocate_geometry_locked(app_handle: &AppHandle) -> (bool, Option<(i32, RECT)>) {
+fn relocate_geometry_locked(app_handle: &AppHandle) -> bool {
     let _apply_guard = GEOM_APPLY_LOCK.lock();
-    // 动画进行中：任何几何路径直接让位（滑入由动画自身收尾，终态落位后自愈）
-    if SHRINK_ANIMATING.load(std::sync::atomic::Ordering::SeqCst) {
-        return (false, None);
-    }
     let (endorsed, phase, mask, shrink_requested, native) = match GEOM.lock() {
         Ok(g) => (g.endorsed, g.phase, g.mask, g.shrink_requested, g.native_observed),
-        Err(_) => return (false, None),
+        Err(_) => return false,
     };
     if phase == GeomPhase::Covered {
         if mask.is_none() {
@@ -508,70 +445,52 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> (bool, Option<(i32, RECT)
                 if !rect_eq(Some(n), Some(e)) {
                     // 原生偏离证据已到手而遮盖未展开：立即展开（内含探测、
                     // 遮盖构建与成套应用；若无盖住者则走 Visible 分支路径）
-                    return (true, None);
+                    return true;
                 }
             }
         }
-        return (false, None);
+        return false;
     }
     if !shrink_requested {
         if let (Some(endorsed), Some(native)) = (endorsed, native) {
             if !rect_eq(Some(native), Some(endorsed)) {
-                // R9.0 平移式遮盖：等宽平移到全屏位形左缘（恒定宽度，零 resize）
-                let ew = endorsed.right - endorsed.left;
+                // R9.1 原生遮盖条：等宽遮盖不再动覆盖层几何——亮出遮盖条
+                // （native.left..endorsed.left 段），覆盖层恒定于 endorsed 位。
                 let u = RECT {
                     left: native.left,
                     top: endorsed.top,
-                    right: native.left + ew,
+                    right: endorsed.left,
                     bottom: endorsed.bottom,
                 };
                 if !rect_eq(mask, Some(u)) {
-                    let Some(window) = app_handle.get_webview_window("clock_overlay") else {
-                        return (false, None);
-                    };
-                    if apply_mask_geometry(&window, u) {
+                    if apply_mask_geometry(Some(u)) {
                         crate::dbg_log(&format!(
-                            "clockrect: mask expand (native diverged) translate=({},{},{},{})",
+                            "clockrect: cover sliver show (native diverged) rect=({},{},{},{})",
                             u.left, u.top, u.right, u.bottom
                         ));
                     }
-                    return (false, None);
+                    return false;
                 }
                 if mask.is_some() {
-                    // 并集未变（旧遮盖已盖住新观测）：维持现状
-                    return (false, None);
+                    // 遮盖条已在场（旧遮盖已盖住新观测）：维持现状
+                    return false;
                 }
             }
         }
     }
     if mask.is_some() && !shrink_requested {
-        return (false, None); // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
+        return false; // 遮盖保持期：原生仍在全屏位形，收缩会露出残块
     }
-    let Some(endorsed) = endorsed else { return (false, None) };
+    let Some(endorsed) = endorsed else { return false };
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
-        return (false, None)
+        return false
     };
     if mask.is_some() {
         crate::dbg_log("clockrect: shrink (native endorsed)");
+        // R9.1：收缩=隐藏原生遮盖条（覆盖层恒定于 endorsed 位，无需任何
+        // 几何变化）——旧 resize/平移/动画机制整体退役。
+        apply_mask_geometry(None);
     }
-    // R8.7 收缩动画：遮盖收缩（左缘左移 ≥12px）时不再瞬移落位，交由锁外
-    // 滑入动画（中间矩形恒 ⊇ endorsed，原生零暴露）；微小位移仍直接应用。
-    let from_left = LAST_APPLIED_RECT
-        .lock()
-        .ok()
-        .and_then(|g| g.as_ref().map(|r| r.left));
-    let anim = if mask.is_some()
-        && from_left.map(|l| endorsed.left - l >= 12).unwrap_or(false)
-    {
-        // R8.8：持锁内置位——锁释放与置位之间的间隙曾有竞态窗口（复审 §6.3）
-        SHRINK_ANIMATING.store(true, std::sync::atomic::Ordering::SeqCst);
-        Some((from_left.unwrap_or(endorsed.left), endorsed))
-    } else {
-        if !apply_overlay_geometry(&window, &endorsed) {
-            return (false, None);
-        }
-        None
-    };
     if let Ok(mut g) = GEOM.lock() {
         g.mask = None;
         g.native_observed = None;
@@ -631,7 +550,7 @@ fn relocate_geometry_locked(app_handle: &AppHandle) -> (bool, Option<(i32, RECT)
     // （由持锁外层 relocate_clock_overlay_endorsed 调用，此处只报告需求；
     // 动画收缩时 z 序维护已照常执行（NOMOVE|NOSIZE 与滑入不冲突），几何
     // 由锁外滑入收尾）
-    (true, anim)
+    true
 }
 
 /// 任务栏当前状态：是否完全滑出屏幕 + 相对静止位的位移（滑入/滑出动画的实时偏移）。
@@ -798,10 +717,7 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     // R8.1：与 relocate 收缩路径串行化（锁序：本锁→GEOM）。WinEvent 线程/
     // 500ms 轮询线程/重探线程三方并发应用几何的交叉竞态曾把窗口落成
     // 「endorsed 左缘+遮盖宽度」（右缘 3861 出屏，见 GEOM_APPLY_LOCK 注释）。
-    // R8.7：收缩滑入动画期间让位（动画自身收尾，终态后由 wrapper 的 update 收敛）。
-    if SHRINK_ANIMATING.load(std::sync::atomic::Ordering::SeqCst) {
-        return;
-    }
+    // R9.1：几何只剩 endorsed 恒定位（遮盖条独立成窗），此类竞态失去成因。
     let _apply_guard = GEOM_APPLY_LOCK.lock();
     let Some(window) = app_handle.get_webview_window("clock_overlay") else {
         return;
@@ -836,6 +752,9 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
     // 驻留；显式尺寸让任何后写者自愈），
     // -1 = 常规 topmost，OFFSCREEN_MARK = 屏外。位置一律从认可矩形/遮盖矩形取，
     // 缓存矩形只进状态机不进几何。
+    // R9.1 原生遮盖条矩形：Some=显示于该矩形（全屏位形下原生时钟超出
+    // endorsed 左缘的部分），None=隐藏（原生在 endorsed 位被覆盖层完整盖住）。
+    let mut sliver: Option<RECT> = None;
     let (target_x, target_y, target_w, target_h, below) = match taskbar_cover_probe() {
         TrayCover::Covered(cover) => {
             if let Ok(mut g) = GEOM.lock() {
@@ -855,73 +774,57 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     ));
                 }
             }
-            // R9.0 平移式遮盖（替代 R7 的并集放大遮盖）：遮盖目标 = **认可矩形
-            // 等宽平移**到全屏位形左缘（native.left），窗口尺寸恒定不变。
-            // 依据（复验⑮录屏 f10-f15 帧+日志）：宽度变化（212↔170）迫使
-            // WebView2 表面重分配，快速切换期间渲染器丢帧呈现**透明帧**——
-            // 原生注册表时钟整个透出（窗口位置/z 序日志全正常），是「时钟
-            // 消失」感知的主体，keepalive 无法根治。而全屏位形时钟宽
-            // 151~163px < 认可宽 158~170px，等宽平移到 native.left 即可完整
-            // 盖住（并集的 3770..3819 段只是空任务栏，无需覆盖）。
-            // 代价：回摆期（原生在两位置间振荡）平移跟踪存在 ≤~220ms 的
-            // 42px 原生残条暴露窗（R8.7 收缩动画同样适用于平移滑入）。
-            // R7.2 全屏位形记忆（跨轮保留的最后非认可位观测）保留——进全屏
-            // 头一秒首针 UIA 未到时即可平移到位。
+            // R9.1 原生遮盖条（fixed-WebView，替代 R9.0 平移/R7 并集）：覆盖层
+            // **恒定于 endorsed 位不再移动/缩放**（根治 WebView 透明帧与整钟
+            // 滑动两大残余），全屏位形下原生时钟超出 endorsed 左缘的部分
+            // （native.left..endorsed.left，宽 42/31px）由原生遮盖条
+            // （cover_apply，实色=渐变左端采样色）接管。R7.2 全屏位形记忆
+            // 保留——进全屏头一秒首针 UIA 未到时即可亮出遮盖条。
             let cur_mask = GEOM.lock().ok().and_then(|g| g.mask);
             let native = GEOM
                 .lock()
                 .ok()
                 .and_then(|g| g.native_observed.or(g.last_native_layout));
-            let ew = endorsed.right - endorsed.left;
-            let mask_target = cur_mask.or_else(|| {
-                native.and_then(|n| {
-                    // 平移矩形：[native.left, native.left+ew] ⊇ 全屏位形时钟
-                    let m = RECT {
-                        left: n.left,
-                        top: endorsed.top,
-                        right: n.left + ew,
-                        bottom: endorsed.bottom,
-                    };
-                    (!rect_eq(Some(m), Some(endorsed))).then_some(m)
+            let sliver_rect = native.and_then(|n| {
+                (n.left < endorsed.left).then(|| RECT {
+                    left: n.left,
+                    top: endorsed.top,
+                    right: endorsed.left,
+                    bottom: endorsed.bottom,
                 })
             });
-            if cur_mask.is_none() {
-                geom_log(&format!(
-                    "covered-fallback: native={native:?} target={mask_target:?}"
-                ));
-            }
-            if let Some(m) = mask_target {
-                if let Ok(mut g) = GEOM.lock() {
-                    if !rect_eq(g.mask, Some(m)) {
-                        g.mask = Some(m);
+            if let Ok(mut g) = GEOM.lock() {
+                match (sliver_rect, g.mask) {
+                    (Some(r), Some(m)) if !rect_eq(Some(r), Some(m)) => {
+                        g.mask = Some(r);
                         geom_log(&format!(
-                            "mask prepared translate=({},{},{},{}) w={ew}",
-                            m.left, m.top, m.right, m.bottom
+                            "cover sliver updated=({},{},{},{})",
+                            r.left, r.top, r.right, r.bottom
                         ));
                     }
+                    (Some(r), None) => {
+                        g.mask = Some(r);
+                        geom_log(&format!(
+                            "cover sliver prepared=({},{},{},{})",
+                            r.left, r.top, r.right, r.bottom
+                        ));
+                    }
+                    (None, Some(_)) => {
+                        g.mask = None;
+                        geom_log("cover sliver cleared (native at endorsed)");
+                    }
+                    _ => {}
                 }
-                // 同步"最后应用矩形"：遮盖应用绕过 apply_overlay_geometry 的
-                // 变更记录，不同步会让收缩被"无变化"跳过
-                if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
-                    *last = Some(m);
-                }
-                (
-                    mask_target.unwrap().left,
-                    mask_target.unwrap().top,
-                    mask_target.unwrap().right - mask_target.unwrap().left,
-                    mask_target.unwrap().bottom - mask_target.unwrap().top,
-                    cover.0 as isize,
-                )
-            } else {
-                // R8.1：全尺寸（弃 NOSIZE，理由见 Visible 分支注释）
-                (
-                    endorsed.left,
-                    endorsed.top,
-                    endorsed.right - endorsed.left,
-                    endorsed.bottom - endorsed.top,
-                    cover.0 as isize,
-                )
             }
+            sliver = sliver_rect;
+            // 覆盖层几何恒定于 endorsed 位（below=cover 仅 dive，不动几何）
+            (
+                endorsed.left,
+                endorsed.top,
+                endorsed.right - endorsed.left,
+                endorsed.bottom - endorsed.top,
+                cover.0 as isize,
+            )
         }
         TrayCover::Visible => {
             // 记录最近 Visible 时刻（R6）：回摆期相位瞬时回到 Covered 时，
@@ -994,69 +897,72 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
                     refresh_clock_overlay_appearance(app_handle, 0, "visible-switch");
                 }
             }
-            // 遮盖保持期（R6 实时跟踪）：退出轮回摆期探测可能直接 Visible 而原生
-            // 仍在全屏位形（探测只看任务栏左段，代表不了时钟区）——此时候盖
-            // 未展开也必须立即展开，否则原生残块压在托盘区露出（23:39 实测
-            // 40.575/41.722 两个暴露窗）。收缩不在此处：由 relocate 在
-            // note_probe 置位收缩请求后执行。
-            let mut mask_now = GEOM.lock().ok().and_then(|g| g.mask);
-            if mask_now.is_none() {
+            // 遮盖保持期（R6 实时跟踪）→ R9.1 遮盖条：退出轮回摆期探测可能
+            // 直接 Visible 而原生仍在全屏位形（探测只看任务栏左段，代表不了
+            // 时钟区）——原生遮盖条必须立即亮出，否则原生残块压在托盘区露出
+            // （23:39 实测 40.575/41.722 两个暴露窗）。收缩不在此处：由
+            // relocate 在 note_probe 置位收缩请求后执行（隐藏遮盖条）。
+            if GEOM
+                .lock()
+                .ok()
+                .and_then(|g| g.mask)
+                .is_none()
+            {
                 // 只信当轮真实观测（R7.1 语义，R7.4 恢复）：全屏位形记忆
                 // （last_native_layout）绝不能在这里做 fallback——退出稳态/
                 // 观测窗内收缩刚清空观测，用记忆重建会与下一针收缩形成
                 // 「收缩→重建」死循环（02:17:31 诊断行实测同毫秒发生）。
-                // 预测展开是 Covered 分支的职责（那边有盖住者压着，多盖
-                // 42px 底色在安全侧且色差 <2 不可见）。
+                // 预测展开是 Covered 分支的职责。
                 let native = GEOM.lock().ok().and_then(|g| g.native_observed);
                 if let Some(n) = native {
-                    if !rect_eq(Some(n), Some(endorsed)) {
-                        // R9.0 平移式遮盖：等宽平移到全屏位形左缘（恒定宽度）
-                        let ew = endorsed.right - endorsed.left;
-                        let u = RECT {
+                    if n.left < endorsed.left {
+                        let r = RECT {
                             left: n.left,
                             top: endorsed.top,
-                            right: n.left + ew,
+                            right: endorsed.left,
                             bottom: endorsed.bottom,
                         };
                         if let Ok(mut g) = GEOM.lock() {
-                            g.mask = Some(u);
+                            g.mask = Some(r);
                         }
                         geom_log(&format!(
-                            "mask prepared translate=({},{},{},{}) (visible-branch)",
-                            u.left, u.top, u.right, u.bottom
+                            "cover sliver prepared=({},{},{},{}) (visible-branch)",
+                            r.left, r.top, r.right, r.bottom
                         ));
-                        if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
-                            *last = Some(u);
-                        }
-                        mask_now = Some(u);
+                        sliver = Some(r);
                     }
                 }
-            }
-            if let Some(m) = mask_now {
-                // R8.6 恢复「遮盖在场每针换色」（R7.6 建立、R8.1 撤销）：录屏
-                // 逐帧分析证实材质切换是表面真实颜色，回摆撑盖期逐针跟随，
-                // 分叉不再有 0.4~3s 滞后窗。
-                refresh_clock_overlay_appearance(app_handle, 0, "mask-held-tick");
-                // 全尺寸成套应用（含首次展开针），不做 NOSIZE——首次展开若只
-                // 移位，158 宽窗口盖不全 3618-3769 残块
-                (m.left, m.top, m.right - m.left, m.bottom - m.top, -1)
             } else {
-                // R8.6：常规可见态每针轻采（d≥2 才推送，自带节流）——任务栏
-                // 材质不止在全屏进出时切换（任意最大化窗口开/关都会切），
-                // 15s 保鲜跟不上，平涂滞后即「细微色差保持」。
-                // 全尺寸成套应用（弃 NOSIZE，理由见上）。
+                sliver = GEOM.lock().ok().and_then(|g| g.mask);
+            }
+            // R8.6 每针轻采（d≥2 才推送，自带节流）——任务栏材质不止在全屏
+            // 进出时切换（任意最大化窗口开/关都会切），15s 保鲜跟不上。
+            if GEOM
+                .lock()
+                .ok()
+                .map(|g| g.mask.is_some())
+                .unwrap_or(false)
+            {
+                refresh_clock_overlay_appearance(app_handle, 0, "mask-held-tick");
+            } else {
                 refresh_clock_overlay_appearance(app_handle, 0, "visible-tick");
-                let (ew, eh) = (endorsed.right - endorsed.left, endorsed.bottom - endorsed.top);
-                match read_tray_state() {
-                    // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
-                    // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
-                    Some(state) if state.fully_hidden || !state.ready => {
-                        (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK)
-                    }
-                    Some(state) => {
-                        (endorsed.left + state.dx, endorsed.top + state.dy, ew, eh, -1)
-                    }
-                    None => (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK),
+            }
+            // R9.1：覆盖层恒定于 endorsed 位（遮盖条已接管全屏位形左缘段），
+            // 全尺寸成套应用（弃 NOSIZE，理由见上）。
+            let (ew, eh) = (endorsed.right - endorsed.left, endorsed.bottom - endorsed.top);
+            match read_tray_state() {
+                // 任务栏完全滑出或基准未学习：无盖住者可潜入，只能移出屏幕
+                // （此路径仅自动隐藏任务栏用户触发；全屏场景走 Covered 分支）
+                Some(state) if state.fully_hidden || !state.ready => {
+                    sliver = None;
+                    (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK)
+                }
+                Some(state) => {
+                    (endorsed.left + state.dx, endorsed.top + state.dy, ew, eh, -1)
+                }
+                None => {
+                    sliver = None;
+                    (offscreen_x(endorsed.right), endorsed.top, ew, eh, OFFSCREEN_MARK)
                 }
             }
         }
@@ -1124,6 +1030,13 @@ pub fn update_clock_overlay_visibility(app_handle: &AppHandle) {
             "apply pos=({target_x},{target_y}) size=({cx},{cy}) below={below} after=({},{},{},{}) ok={applied}",
             after.left, after.top, after.right, after.bottom
         ));
+        // R9.1：原生遮盖条与覆盖层同 z 策略（covered=同潜入 dive，其余隐藏；
+        // 屏外态亦隐藏——任务栏不可见时无需遮盖）
+        if below == OFFSCREEN_MARK {
+            cover_apply(None, below);
+        } else {
+            cover_apply(sliver, below);
+        }
     }
 }
 
@@ -1184,46 +1097,53 @@ fn apply_overlay_geometry(window: &WebviewWindow, rect: &RECT) -> bool {
     }
 }
 
-/// 遮盖几何应用（R7 扩展/更新用）：单次 SetWindowPos 成套应用位置+尺寸，
-/// z 序按当前模式分流（与 update_clock_overlay_visibility 的应用路径同语义）。
-/// 同步 GEOM.mask、LAST_APPLIED_RECT 与 LAST_FOLLOW_POS——不同步会让收缩被
-/// 「无变化」跳过、下一轮 update 重复应用。
-fn apply_mask_geometry(window: &WebviewWindow, m: RECT) -> bool {
-    let w = m.right - m.left;
-    let h = m.bottom - m.top;
-    if w <= 0 || h <= 0 {
-        return false;
+/// R9.1 遮盖条应用（原 apply_mask_geometry 改语义）：Some(rect)=显示/定位
+/// 原生遮盖条（GDI 实色，resize 无副作用）；None=隐藏。**不再触碰覆盖层
+/// 窗口几何**——覆盖层恒定于 endorsed 位。z 序：遮盖条创建即为 TOPMOST，
+/// relocate 展开路径发生于常规相位，TOPMOST 即正确。
+fn apply_mask_geometry(m: Option<RECT>) -> bool {
+ // 覆盖层几何恒定，参数仅为兼容调用点保留
+    match m {
+        Some(r) => {
+            if r.right <= r.left || r.bottom <= r.top {
+                return false;
+            }
+            if let Ok(mut g) = GEOM.lock() {
+                g.mask = Some(r);
+            }
+            let Some(hwnd) = ensure_cover_window() else {
+                return false;
+            };
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    Some(HWND_TOPMOST),
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+            geom_log(&format!(
+                "cover sliver show rect=({},{},{},{})",
+                r.left, r.top, r.right, r.bottom
+            ));
+            true
+        }
+        None => {
+            if let Ok(mut g) = GEOM.lock() {
+                g.mask = None;
+            }
+            if let Some(h) = COVER_HWND.lock().ok().and_then(|g| *g) {
+                unsafe {
+                    ShowWindow(HWND(h as *mut core::ffi::c_void), SW_HIDE);
+                }
+            }
+            geom_log("cover sliver hide");
+            true
+        }
     }
-    let Some(hwnd) = get_window_hwnd(window) else {
-        return false;
-    };
-    if let Ok(mut g) = GEOM.lock() {
-        g.mask = Some(m);
-    }
-    if let Ok(mut last) = LAST_APPLIED_RECT.lock() {
-        *last = Some(m);
-    }
-    let below = CURRENT_BELOW.load(std::sync::atomic::Ordering::SeqCst);
-    unsafe {
-        let insert_after = if below == OFFSCREEN_MARK {
-            None
-        } else if below == -1 {
-            Some(HWND_TOPMOST)
-        } else {
-            Some(HWND(below as *mut core::ffi::c_void))
-        };
-        let _ = SetWindowPos(hwnd, insert_after, m.left, m.top, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        let mut after = RECT::default();
-        let ok = GetWindowRect(hwnd, &mut after).is_ok();
-        geom_log(&format!(
-            "apply pos=({},{}) size=({w},{h}) below={below} after=({},{},{},{}) ok={ok}",
-            m.left, m.top, after.left, after.top, after.right, after.bottom
-        ));
-    }
-    if let Ok(mut last) = LAST_FOLLOW_POS.lock() {
-        *last = Some((m.left, m.top, w, h, below));
-    }
-    true
 }
 
 /// 无激活显示并把覆盖层压到任务栏之上（同为 topmost 组内，后声明者在上）。
@@ -1788,6 +1708,7 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
         // 首次推送（无参照显示色）：直接推双端采样值
         *last = Some((left, right));
         drop(last);
+        cover_set_color(left);
         push_appearance(app, src, left, right, &src_note);
         return;
     };
@@ -1819,6 +1740,7 @@ fn run_appearance_sample(app: &AppHandle, src: &'static str) {
     }
     *last = Some((cand_left, cand_right));
     drop(last);
+    cover_set_color(cand_left);
     push_appearance(app, src, cand_left, cand_right, &src_note);
 }
 
@@ -1893,3 +1815,148 @@ mod tests {
         assert_eq!(d, 8);
     }
 }
+
+// ==================== R9.1 原生遮盖条（fixed-WebView 架构） ====================
+// 复验⑮⑯录屏定案的两大残余（WebView 透明帧整块消失 / 平移式遮盖整钟滑动）
+// 同源于「遮盖职责落在 WebView 窗口上」：宽度变化→表面重分配透明帧；位置
+// 变化→文字整体滑动。R9.1 把遮盖职责拆给一个**纯 Win32 实色小窗**：
+// - WebView 覆盖层**恒定**于 endorsed 位（零移动零 resize，文字永不滑动）；
+// - 全屏位形下原生时钟多出 endorsed 左缘之外的部分（native.left..endorsed.left，
+//   宽 42/31px）由本窗口以实色（=渐变左端采样色，与覆盖层左缘无缝衔接）盖住；
+// - GDI 窗口 resize/paint 无表面重分配问题，显隐零成本。
+// 两者合计恰好等于旧并集遮盖（3607..3819），回摆期双位形同时覆盖的能力保留。
+
+/// 遮盖条窗口句柄（懒创建，隐藏待用）。
+static COVER_HWND: Mutex<Option<isize>> = Mutex::new(None);
+/// 遮盖条当前实色（=外观推送的渐变左端色；初值取浅色主题近似任务栏色）。
+static COVER_COLOR: Mutex<(u8, u8, u8)> = Mutex::new((0xE7, 0xD8, 0xCD));
+
+unsafe extern "system" fn cover_wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_PAINT | WM_ERASEBKGND => {
+            let mut ps = PAINTSTRUCT::default();
+            let hdc = BeginPaint(hwnd, &mut ps);
+            let c = COVER_COLOR.lock().map(|c| *c).unwrap_or((0xE7, 0xD8, 0xCD));
+            let color = COLORREF(c.0 as u32 | (c.1 as u32) << 8 | (c.2 as u32) << 16);
+            let brush = CreateSolidBrush(color);
+            let mut rc = RECT::default();
+            let _ = GetClientRect(hwnd, &mut rc);
+            FillRect(hdc, &rc, brush);
+            let _ = windows::Win32::Graphics::Gdi::DeleteObject(brush.into());
+            let _ = EndPaint(hwnd, &ps);
+            if msg == WM_ERASEBKGND {
+                return LRESULT(1);
+            }
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// 懒创建遮盖条窗口（隐藏）。失败返回 None（调用方放弃遮盖，原生时钟兜底）。
+fn ensure_cover_window() -> Option<HWND> {
+    let Some(h) = COVER_HWND.lock().ok().and_then(|g| *g) else {
+        unsafe {
+            let hinstance = GetModuleHandleW(None).ok()?;
+            let class_name = w!("liCalClockCover");
+            let wc = windows::Win32::UI::WindowsAndMessaging::WNDCLASSW {
+                lpfnWndProc: Some(cover_wnd_proc),
+                hInstance: hinstance.into(),
+                lpszClassName: class_name,
+                ..Default::default()
+            };
+            RegisterClassW(&wc);
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE((WS_EX_NOACTIVATE.0 | WS_EX_TOOLWINDOW.0) as u32),
+                class_name,
+                w!(""),
+                WS_POPUP,
+                0,
+                0,
+                42,
+                84,
+                None,
+                None,
+                Some(hinstance.into()),
+                None,
+            )
+            .ok()?;
+            let _ = SetWindowPos(
+                hwnd,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            );
+            if let Ok(mut g) = COVER_HWND.lock() {
+                *g = Some(hwnd.0 as isize);
+            }
+        }
+        return COVER_HWND
+            .lock()
+            .ok()
+            .and_then(|g| *g)
+            .map(|h| HWND(h as *mut core::ffi::c_void));
+    };
+    let hwnd = HWND(h as *mut core::ffi::c_void);
+    if unsafe { IsWindow(Some(hwnd)) }.as_bool() {
+        Some(hwnd)
+    } else {
+        None
+    }
+}
+
+/// 遮盖条显隐+定位+同步 z 序（与覆盖层同 dive/topmost 策略）。
+fn cover_apply(show_rect: Option<RECT>, below: isize) {
+    let Some(hwnd) = ensure_cover_window() else {
+        return;
+    };
+    match show_rect {
+        Some(r) => {
+            let insert = (below > 0).then(|| HWND(below as *mut core::ffi::c_void));
+            unsafe {
+                let _ = SetWindowPos(
+                    hwnd,
+                    insert,
+                    r.left,
+                    r.top,
+                    r.right - r.left,
+                    r.bottom - r.top,
+                    SWP_NOACTIVATE | SWP_SHOWWINDOW,
+                );
+            }
+        }
+        None => unsafe {
+            ShowWindow(hwnd, SW_HIDE);
+        },
+    }
+}
+
+/// 隐藏原生遮盖条（组件开关关闭等场景；pub 供 mouse_hook 调用）。
+pub fn hide_cover_sliver() {
+    cover_apply(None, -1);
+}
+
+/// 更新遮盖条颜色（外观推送的渐变左端采样色）并触发重绘。
+fn cover_set_color(c: (u8, u8, u8)) {
+    let changed = COVER_COLOR.lock().map(|mut g| {
+        let old = *g;
+        *g = c;
+        old != c
+    });
+    if changed.unwrap_or(false) {
+        if let Some(h) = COVER_HWND.lock().ok().and_then(|g| *g) {
+            unsafe {
+                let _ = InvalidateRect(Some(HWND(h as *mut core::ffi::c_void)), None, false);
+            }
+        }
+    }
+}
+// ==================== R9.1 原生遮盖条结束 ====================

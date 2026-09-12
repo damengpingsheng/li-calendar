@@ -61,6 +61,8 @@ pub fn set_taskbar_widget_enabled(enabled: bool) {
         if let Some(window) = app.get_webview_window("clock_overlay") {
             let _ = window.hide();
         }
+        // R9.1：原生遮盖条随组件开关同步隐藏
+        crate::window_manager::hide_cover_sliver();
     }
     if !enabled {
         if let Ok(mut global_sender) = EVENT_SENDER.lock() {

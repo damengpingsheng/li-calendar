@@ -25,6 +25,8 @@ pub use windows::clock_overlay_reprobe_interval_ms;
 #[cfg(windows)]
 pub use windows::ensure_clock_overlay_attached;
 #[cfg(windows)]
+pub use windows::hide_cover_sliver;
+#[cfg(windows)]
 pub use windows::update_clock_overlay_visibility;
 #[cfg(windows)]
 pub use windows::{
