@@ -8,6 +8,7 @@ use windows::core::*;
 use windows::Win32::Foundation::*;
 use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
+use windows::Win32::UI::Accessibility::{SetWinEventHook, UnhookWinEvent, HWINEVENTHOOK};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::clock_window::{
@@ -15,8 +16,10 @@ use super::clock_window::{
     update_clock_area_cache,
 };
 use super::registry_clock::disable_custom_clock;
+use tauri::Manager;
 use super::state::{
     EVENT_SENDER, HOOK_HANDLE, IS_MENU_OPEN, NATIVE_MENU_TRACKING, TASKBAR_WIDGET_ENABLED,
+    WIN_EVENT_HANDLES,
 };
 use super::types::{ClickEvent, MouseButton};
 use super::window_utils::is_foreground_fullscreen;
@@ -41,6 +44,24 @@ static NATIVE_DISMISS_PENDING: AtomicBool = AtomicBool::new(false);
 /// * `enabled` - 为真时安装钩子并允许拦截；为假时清空事件通道并恢复系统时钟。
 pub fn set_taskbar_widget_enabled(enabled: bool) {
     TASKBAR_WIDGET_ENABLED.store(enabled, Ordering::SeqCst);
+    // Phase 0：覆盖层随开关显隐——关闭后钩子放行，点击若落在无处理器的
+    // 覆盖层上会表现为"点时钟没反应"，必须同步隐藏；重新开启走完整贴合
+    // 流程（已建窗则重贴，未建窗则补建）。
+    let overlay_app = super::app_handle();
+    if enabled {
+        std::thread::Builder::new()
+            .name("clock-overlay-reenable".into())
+            .spawn(move || {
+                if let Some(app) = overlay_app {
+                    crate::window_manager::ensure_clock_overlay_attached(&app);
+                }
+            })
+            .ok();
+    } else if let Some(app) = overlay_app {
+        if let Some(window) = app.get_webview_window("clock_overlay") {
+            let _ = window.hide();
+        }
+    }
     if !enabled {
         if let Ok(mut global_sender) = EVENT_SENDER.lock() {
             *global_sender = None;
@@ -49,7 +70,7 @@ pub fn set_taskbar_widget_enabled(enabled: bool) {
     }
 }
 
-/// 退出前的确定性清理：显式卸载低级鼠标钩子并清空事件通道。
+/// 退出前的确定性清理：显式卸载低级鼠标钩子与 WinEvent 钩子并清空事件通道。
 ///
 /// 不依赖「进程终止时系统隐式移除钩子」——若退出瞬间钩子回调正在执行，
 /// 隐式清理可能留下短暂的全局输入卡顿/路由异常；显式卸载可彻底避免。
@@ -64,8 +85,92 @@ pub fn uninstall_global_mouse_hook() {
     if let Ok(mut handle) = super::state::HOOK_HANDLE.lock() {
         *handle = None;
     }
+    // WinEvent 钩子随鼠标钩子一同卸载（同为显式清理，不留给进程终止）
+    if let Ok(mut handles) = WIN_EVENT_HANDLES.lock() {
+        for hook in handles.drain(..) {
+            unsafe {
+                let _ = UnhookWinEvent(HWINEVENTHOOK(hook as *mut c_void));
+            }
+        }
+    }
     if let Ok(mut global_sender) = super::state::EVENT_SENDER.lock() {
         *global_sender = None;
+    }
+}
+
+/// WinEvent 回调：前台切换（全屏进出）或任务栏窗口位移（自动隐藏滑入/滑出）
+/// 时立即刷新覆盖层可见性——轮询有 2s 滞后，事件驱动才能与任务栏动作同步。
+///
+/// 在钩子消息泵线程上回调（OUTOFCONTEXT），只做轻量判定与 ShowWindow（微秒级），
+/// 不碰 UIA；`EVENT_OBJECT_LOCATIONCHANGE` 全局量极大，必须先按窗口句柄过滤。
+unsafe extern "system" fn overlay_win_event_proc(
+    _hook: HWINEVENTHOOK,
+    event: u32,
+    hwnd: HWND,
+    id_object: i32,
+    _id_child: i32,
+    _id_thread: u32,
+    _event_time: u32,
+) {
+    // 只关心窗口本体（标题栏/滚动条等子对象对象 ID 非零，直接忽略）
+    if id_object != OBJID_WINDOW.0 {
+        return;
+    }
+    if event == EVENT_OBJECT_LOCATIONCHANGE {
+        // 位移事件来自所有窗口（拖动任意窗口都触发），只放行两类：
+        // 1) 任务栏自身——自动隐藏滑入/滑出跟随；
+        // 2) 前台窗口——全屏进入/退出是前台窗口自身的矩形展开/缩回（前台
+        //    不变、任务栏不动，FOREGROUND 事件收不到），必须逐帧做全屏检测，
+        //    否则显隐要等 2s 兜底轮询（进入时浮在视频上"闪现"、退出时原生
+        //    时钟露出一段）。
+        if hwnd.0.is_null() {
+            return;
+        }
+        let is_foreground = GetForegroundWindow() == hwnd;
+        if !is_foreground && get_window_class_name_checked(hwnd) != "Shell_TrayWnd" {
+            return;
+        }
+    }
+    // EVENT_SYSTEM_FOREGROUND（前台切换→全屏检测）无需过滤，直接刷新
+    if let Some(app) = super::app_handle() {
+        crate::window_manager::update_clock_overlay_visibility(&app);
+    }
+}
+
+/// 回调内安全读取类名（缓冲不足/失败返回空串，绝不 panic——extern 回调铁律）。
+unsafe fn get_window_class_name_checked(hwnd: HWND) -> String {
+    let mut buf = [0u16; 32];
+    let len = GetClassNameW(hwnd, &mut buf);
+    if len > 0 {
+        String::from_utf16_lossy(&buf[..len as usize])
+    } else {
+        String::new()
+    }
+}
+
+/// 安装覆盖层可见性所需的 WinEvent 钩子（须在带消息泵的线程上调用）。
+unsafe fn install_overlay_win_event_hooks() {
+    // 前台切换：全屏应用进入/退出
+    // 任务栏位移：自动隐藏滑入/滑出（每帧触发，回调内先按类名过滤）
+    for event_range in [
+        (EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND),
+        (EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_LOCATIONCHANGE),
+    ] {
+        // windows 0.62：SetWinEventHook 直接返回 HWINEVENTHOOK（失败为空句柄）
+        let hook = SetWinEventHook(
+            event_range.0,
+            event_range.1,
+            None,
+            Some(overlay_win_event_proc),
+            0,
+            0,
+            WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
+        );
+        if !hook.0.is_null() {
+            if let Ok(mut handles) = WIN_EVENT_HANDLES.lock() {
+                handles.push(hook.0 as isize);
+            }
+        }
     }
 }
 
@@ -113,6 +218,12 @@ impl WindowsHookManager {
                     println!("Windows 鼠标钩子已卸载");
                 }
             }
+            // WinEvent 钩子随鼠标钩子一同卸载（Drop 路径对称清理）
+            if let Ok(mut handles) = WIN_EVENT_HANDLES.lock() {
+                for hook in handles.drain(..) {
+                    let _ = UnhookWinEvent(HWINEVENTHOOK(hook as *mut c_void));
+                }
+            }
             Ok(())
         }
     }
@@ -155,18 +266,43 @@ pub fn start_hook_message_thread() {
                             *handle = Some(hook.0 as isize);
                         }
                         println!("✅ 已在专用消息泵线程上安装鼠标钩子");
+                        // WinEvent（前台切换/任务栏位移）驱动覆盖层显隐，与鼠标钩子同泵线程
+                        install_overlay_win_event_hooks();
                         // 初始化时做一次 UIA 取矩形；钩子回调内只读缓存，不得在此线程之外重复轮询刷新。
                         update_clock_area_cache();
                         // 周期性重探时钟矩形（独立线程，UIA 不进钩子回调）：
                         // 启动时探测发生在自定义时钟文本写入前后，任务栏重排会令矩形过期；
                         // 周期刷新保证任何重排后最多 ~2 秒自愈（表现为点时钟无反应/弹原生菜单）。
                         std::thread::spawn(|| {
+                            let mut tick: u32 = 0;
                             loop {
-                                std::thread::sleep(std::time::Duration::from_secs(2));
+                                // R5：轮询间隔由状态机建议——退出 pending
+                                // （settle 计时/进全屏等首观测）150ms 加密，稳态
+                                // 500ms。加密只持续全屏进出瞬态，UIA 开销可忽略。
+                                let interval_ms =
+                                    crate::window_manager::clock_overlay_reprobe_interval_ms();
+                                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
                                 if !TASKBAR_WIDGET_ENABLED.load(Ordering::SeqCst) {
                                     continue;
                                 }
-                                update_clock_area_cache();
+                                tick = tick.wrapping_add(1);
+                                // 每 500ms：轻量可见性兜底（全屏/滑出检测均为纯 Win32 微秒级）。
+                                // 教训：依赖事件驱动的显隐在事件缺失的路径上（部分应用退出全屏
+                                // 时无前台切换、无窗口位移）要等兜底轮询，2s 太慢肉眼可见。
+                                if let Some(app) = super::app_handle() {
+                                    crate::window_manager::update_clock_overlay_visibility(&app);
+                                }
+                                // 每 2s：UIA 时钟矩形重探（重操作，维持 2s 节奏）+ 重贴；
+                                // 加密期每针都做——settle 确认与遮盖展开都吃 UIA 读数，
+                                // 2s 节奏会把瞬态拉长一个量级。
+                                if interval_ms == 150 || tick % 4 == 0 {
+                                    update_clock_area_cache();
+                                    if let Some(app) = super::app_handle() {
+                                        crate::window_manager::relocate_clock_overlay_endorsed(
+                                            &app,
+                                        );
+                                    }
+                                }
                             }
                         });
                     }

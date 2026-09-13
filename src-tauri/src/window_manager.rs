@@ -13,6 +13,18 @@ pub use windows::main_window::show_or_create_main_window;
 #[cfg(windows)]
 pub use windows::relocate_clock_overlay;
 #[cfg(windows)]
+pub use windows::relocate_clock_overlay_endorsed;
+#[cfg(windows)]
+pub use windows::clock_overlay_appearance_colors;
+#[cfg(windows)]
+pub use windows::clock_overlay_note_probe;
+#[cfg(windows)]
+pub use windows::clock_overlay_reprobe_interval_ms;
+#[cfg(windows)]
+pub use windows::ensure_clock_overlay_attached;
+#[cfg(windows)]
+pub use windows::update_clock_overlay_visibility;
+#[cfg(windows)]
 pub use windows::{
     dismiss_native_menu_from_hook, hide_clock_context_menu, hide_from_hook, menu_rect_contains,
     native_menu_rect, native_menu_rect_contains, precreate_clock_context_menu,

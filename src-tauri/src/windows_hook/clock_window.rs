@@ -13,6 +13,14 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 use super::state::CLOCK_AREA_RECT_CACHE;
 use super::window_utils::get_window_class_name;
 
+/// 时钟矩形诊断日志：存在标记文件 `D:\agents_tmp\clockrect_debug` 时才写
+/// （周期探测每 2s 一条，常开会刷爆 menu_dbg.log）。
+fn clockrect_log(msg: &str) {
+    if std::path::Path::new(r"D:\agents_tmp\clockrect_debug").exists() {
+        crate::dbg_log(&format!("clockrect: {msg}"));
+    }
+}
+
 /// 校验/修正时钟矩形：物理矩形必须完整落在任务栏带内（允许 20px 容差，越界部分收拢）。
 ///
 /// UIA `BoundingRectangle` 在进程 DPI 感知与系统不匹配时会返回**逻辑坐标**
@@ -61,7 +69,9 @@ unsafe fn validate_or_scale_clock_rect(rect: RECT) -> Option<RECT> {
 }
 
 /// 通过 UI Automation 在 Shell 托盘树上查找时钟控件屏幕矩形。
-pub fn get_clock_rect_via_uia() -> Option<RECT> {
+/// 返回 (矩形, 来源标签)——来源供诊断日志区分 HWND 快速路径（微秒级）与
+/// UIA 树遍历（重操作，可能数十 ms），端到端时延分析需要（评审 §3.B）。
+pub fn get_clock_rect_via_uia() -> (Option<RECT>, &'static str) {
     unsafe {
         // 优先：按时钟窗口 HWND + GetWindowRect 获取【物理像素】矩形。
         // 低级鼠标钩子 lParam 传的是【物理屏幕坐标】，而 UIA BoundingRectangle 在 DPI 缩放下
@@ -74,16 +84,23 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
                 && rect.bottom > rect.top
             {
                 if let Some(valid) = validate_or_scale_clock_rect(rect) {
-                    return Some(valid);
+                    return (Some(valid), "hwnd");
                 }
             }
         }
 
         // 原 UIA 兜底（返回值经 validate_or_scale_clock_rect 校验/DPI 修正）。
         let automation: IUIAutomation =
-            CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
-        let hwnd_tray = FindWindowW(w!("Shell_TrayWnd"), None).ok()?;
-        let tray_element = automation.ElementFromHandle(hwnd_tray).ok()?;
+            match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+                Ok(a) => a,
+                Err(_) => return (None, "none"),
+            };
+        let Ok(hwnd_tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
+            return (None, "none");
+        };
+        let Ok(tray_element) = automation.ElementFromHandle(hwnd_tray) else {
+            return (None, "none");
+        };
 
         // 优先按 AutomationId「ClockButton」（Win10/11 常见）
         let automation_id_condition = automation
@@ -93,7 +110,7 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
             if let Ok(clock_element) = tray_element.FindFirst(TreeScope_Descendants, &condition) {
                 if let Ok(rect) = clock_element.CurrentBoundingRectangle() {
                     if let Some(valid) = validate_or_scale_clock_rect(rect) {
-                        return Some(valid);
+                        return (Some(valid), "uia-autoid");
                     }
                 }
             }
@@ -110,28 +127,45 @@ pub fn get_clock_rect_via_uia() -> Option<RECT> {
             if let Ok(clock_element) = tray_element.FindFirst(TreeScope_Descendants, &condition) {
                 if let Ok(rect) = clock_element.CurrentBoundingRectangle() {
                     if let Some(valid) = validate_or_scale_clock_rect(rect) {
-                        return Some(valid);
+                        return (Some(valid), "uia-class");
                     }
                 }
             }
         }
 
-        None
+        (None, "none")
     }
 }
 
 /// 将 UIA 得到的时钟矩形写入 [`super::state::CLOCK_AREA_RECT_CACHE`]。
 pub fn update_clock_area_cache() {
-    if let Some(rect) = get_clock_rect_via_uia() {
+    let started = std::time::Instant::now();
+    let (probed, src) = get_clock_rect_via_uia();
+    if let Some(rect) = probed {
+        clockrect_log(&format!(
+            "uia rect=({},{},{},{}) src={src} ms={:.1}",
+            rect.left,
+            rect.top,
+            rect.right,
+            rect.bottom,
+            started.elapsed().as_secs_f32() * 1000.0
+        ));
         persist_clock_rect(&rect);
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }
+        // 真实观测（UIA/HWND 成功）：喂给覆盖层几何状态机（认可矩形更新/
+        // 退出确认）。注册表回退样本不是新观测，不喂。
+        crate::window_manager::clock_overlay_note_probe(rect);
         return;
     }
     // 探测失败（Win11 XAML 任务栏可能无常驻经典时钟窗口）：
     // 回退到持久化的最后已知正确物理矩形（注册表 HKCU\Software\liCalendar\ClockRect）。
     if let Some(rect) = load_persisted_clock_rect() {
+        clockrect_log(&format!(
+            "registry-echo rect=({},{},{},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }
@@ -261,9 +295,15 @@ pub fn refresh_clock_rect_if_in_taskbar(x: i32, y: i32) {
         if !ok {
             return;
         }
+        clockrect_log(&format!(
+            "hook-hwnd rect=({},{},{},{})",
+            rect.left, rect.top, rect.right, rect.bottom
+        ));
         if let Ok(mut w) = CLOCK_AREA_RECT_CACHE.write() {
             *w = Some(rect);
         }
+        // 真实观测（钩子内 HWND 快速路径）：喂给覆盖层几何状态机
+        crate::window_manager::clock_overlay_note_probe(rect);
     }
 }
 

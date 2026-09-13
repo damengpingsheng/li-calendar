@@ -299,6 +299,21 @@ pub async fn relocate_clock_overlay_command(app_handle: AppHandle) -> Result<(),
     Ok(())
 }
 
+/// 时钟覆盖层外观（任务栏实采底色 + 前景对比色）；前端挂载与主题变化时调用。
+#[derive(serde::Serialize)]
+pub struct ClockOverlayAppearance {
+    /// 不透明背景色（hex，如 `#202020`）——覆盖式方案绝不允许透明（透底会叠出原生时钟）
+    pub bg: String,
+    /// 前景文字色（hex，按背景亮度取对比色）
+    pub fg: String,
+}
+
+#[tauri::command]
+pub async fn clock_overlay_appearance() -> Result<ClockOverlayAppearance, String> {
+    let (bg, fg) = crate::window_manager::clock_overlay_appearance_colors();
+    Ok(ClockOverlayAppearance { bg, fg })
+}
+
 /// 时钟右键菜单动作：设置 / 退出（由 clock_context_menu 窗口前端调用）。
 #[tauri::command]
 pub async fn clock_menu_action(app_handle: AppHandle, action: String) -> Result<(), String> {

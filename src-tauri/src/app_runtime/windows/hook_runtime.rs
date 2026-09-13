@@ -29,6 +29,17 @@ pub fn start_taskbar_runtime(app_handle: AppHandle, state: &AppState) {
         let mut runtime_hook_manager = WindowsHookManager::new();
         // 启动消息循环线程（安装钩子后同线程会做一次 UIA 初始化时钟区域缓存）。
         start_hook_message_thread();
+        // Phase 0：时钟覆盖层——隐藏构建，等 UIA 时钟矩形就绪后贴合显示。
+        // 独立线程：建窗与探测均可阻塞；矩形拿不到则保持隐藏，原生时钟兜底。
+        {
+            let overlay_app = app_handle.clone();
+            std::thread::Builder::new()
+                .name("clock-overlay-init".into())
+                .spawn(move || {
+                    crate::window_manager::ensure_clock_overlay_attached(&overlay_app);
+                })
+                .ok();
+        }
         // 获取事件接收器并开始监听点击事件。
         if let Some(event_receiver) = runtime_hook_manager.take_event_receiver() {
             tauri::async_runtime::spawn(start_hook_listener(

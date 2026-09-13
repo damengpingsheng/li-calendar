@@ -15,14 +15,15 @@ mod window_manager;
 mod windows_hook;
 #[cfg(desktop)]
 use commands::{
-    apply_custom_clock_text, clock_menu_action, get_clock_text, get_macos_tray_bar_icon,
-    get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
-    get_supported_window_effects, get_system_time_millis_since_epoch, greet, hide_calendar,
-    hide_clock_context_menu, open_main_window, popup_ready, relocate_clock_overlay_command,
-    restore_default_clock, set_calendar_pin, set_desktop_widget_enabled, set_macos_tray_bar_icon,
-    set_macos_tray_date_icon_style, set_macos_tray_icon_px, set_macos_tray_title_template,
-    set_macos_vibrancy, set_taskbar_widget_enabled_command, show_calendar, test_clock_detection,
-    toggle_calendar, toggle_calendar_at_position,
+    apply_custom_clock_text, clock_menu_action, clock_overlay_appearance, get_clock_text,
+    get_macos_tray_bar_icon, get_macos_tray_date_icon_style, get_macos_tray_icon_px,
+    get_macos_tray_title_template, get_supported_window_effects, get_system_time_millis_since_epoch,
+    greet, hide_calendar, hide_clock_context_menu, open_main_window, popup_ready,
+    relocate_clock_overlay_command, restore_default_clock, set_calendar_pin,
+    set_desktop_widget_enabled, set_macos_tray_bar_icon, set_macos_tray_date_icon_style,
+    set_macos_tray_icon_px, set_macos_tray_title_template, set_macos_vibrancy,
+    set_taskbar_widget_enabled_command, show_calendar, test_clock_detection, toggle_calendar,
+    toggle_calendar_at_position,
 };
 #[cfg(desktop)]
 use menu::handle_menu_event;
@@ -76,15 +77,32 @@ static ALLOW_EXIT: AtomicBool = AtomicBool::new(false);
 
 #[cfg(desktop)]
 /// 追加写入诊断日志（定位右键菜单「退出」无反应）。
+/// 行首带本地时间戳（几何归因依赖事件时序测量）。
 fn dbg_log(msg: &str) {
+    use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(r"D:\agents_tmp\menu_dbg.log")
     {
-        use std::io::Write;
-        let _ = writeln!(f, "{}", msg);
+        let ts = timestamp_string();
+        let _ = writeln!(f, "[{ts}] {msg}");
     }
+}
+
+/// 本地时间戳 HH:MM:SS.mmm（Windows）；非 Windows 平台返回空串。
+#[cfg(all(desktop, windows))]
+fn timestamp_string() -> String {
+    let st = unsafe { windows::Win32::System::SystemInformation::GetLocalTime() };
+    format!(
+        "{:02}:{:02}:{:02}.{:03}",
+        st.wHour, st.wMinute, st.wSecond, st.wMilliseconds
+    )
+}
+
+#[cfg(all(desktop, not(windows)))]
+fn timestamp_string() -> String {
+    String::new()
 }
 
 #[cfg(desktop)]
@@ -173,6 +191,7 @@ pub fn run() {
             relocate_clock_overlay_command,
             set_calendar_pin,
             clock_menu_action,
+            clock_overlay_appearance,
             hide_clock_context_menu
         ])
         .setup(|app| app_runtime::desktop::setup_desktop_app(app)) // 设置生命周期钩子

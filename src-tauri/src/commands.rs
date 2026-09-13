@@ -22,7 +22,8 @@ pub use macos::{
 };
 #[cfg(windows)]
 pub use windows::{
-    clock_menu_action, apply_custom_clock_text, get_clock_text, get_macos_tray_bar_icon,
+    clock_menu_action, clock_overlay_appearance, apply_custom_clock_text, get_clock_text,
+    get_macos_tray_bar_icon,
     get_macos_tray_date_icon_style, get_macos_tray_icon_px, get_macos_tray_title_template,
     get_supported_window_effects, hide_clock_context_menu, relocate_clock_overlay_command,
     restore_default_clock, set_desktop_widget_enabled, set_macos_tray_bar_icon,
