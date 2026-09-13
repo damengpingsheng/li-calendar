@@ -12,6 +12,8 @@ mod menu;
 #[cfg(desktop)]
 mod window_manager;
 #[cfg(all(desktop, windows))]
+mod clockbar;
+#[cfg(all(desktop, windows))]
 mod windows_hook;
 #[cfg(desktop)]
 use commands::{
@@ -20,10 +22,10 @@ use commands::{
     get_macos_tray_title_template, get_supported_window_effects, get_system_time_millis_since_epoch,
     greet, hide_calendar, hide_clock_context_menu, open_main_window, popup_ready,
     relocate_clock_overlay_command, restore_default_clock, set_calendar_pin,
-    set_desktop_widget_enabled, set_macos_tray_bar_icon, set_macos_tray_date_icon_style,
-    set_macos_tray_icon_px, set_macos_tray_title_template, set_macos_vibrancy,
-    set_taskbar_widget_enabled_command, show_calendar, test_clock_detection, toggle_calendar,
-    toggle_calendar_at_position,
+    set_clockbar_injection_enabled, set_desktop_widget_enabled, set_macos_tray_bar_icon,
+    set_macos_tray_date_icon_style, set_macos_tray_icon_px, set_macos_tray_title_template,
+    set_macos_vibrancy, set_taskbar_widget_enabled_command, show_calendar, test_clock_detection,
+    toggle_calendar, toggle_calendar_at_position,
 };
 #[cfg(desktop)]
 use menu::handle_menu_event;
@@ -113,6 +115,10 @@ pub(crate) fn request_app_exit(app: &tauri::AppHandle) {
     dbg_log("request_app_exit called");
     #[cfg(all(desktop, windows))]
     {
+        // E3 正常退出全清理（①注入会话）：c1free 摘面板 + unadvise + 断管，
+        // tap 侧断线 AUTO 恢复双保险。注入模式不写注册表时间格式（用户决策
+        // #3 H:mm 语义保持，方案 §5 E 行口径：无写入即无需恢复）。
+        crate::clockbar::shutdown();
         // 恢复系统任务栏时钟（注册表 + 刷新），避免退出后时钟停留在替换文案。
         crate::windows_hook::disable_custom_clock();
         // 显式卸载低级鼠标钩子。
@@ -137,6 +143,36 @@ pub(crate) fn request_app_exit(app: &tauri::AppHandle) {
 #[cfg(desktop)]
 /// 桌面端主运行入口点。
 pub fn run() {
+    // E6 排障：全局 panic 钩子落盘（静默退出取证——Rust 线程 panic 默认只在
+    // stderr，窗口化进程不可见；定位互斥开关切换期进程消失）
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let loc = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_default();
+        let msg = if let Some(s) = info.payload().downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = info.payload().downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "(non-string payload)".into()
+        };
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(r"D:\agents_tmp\lical_panic.log")
+        {
+            use std::io::Write;
+            let _ = writeln!(
+                f,
+                "[{}] PANIC at {loc}: {msg}\n{:?}",
+                timestamp_string(),
+                std::backtrace::Backtrace::force_capture()
+            );
+        }
+        default_hook(info);
+    }));
     // 创建共享的应用状态
     let shared_state = app_runtime::desktop::create_shared_state();
 
@@ -186,6 +222,7 @@ pub fn run() {
             set_macos_tray_icon_px,
             set_macos_tray_bar_icon,
             set_taskbar_widget_enabled_command,
+            set_clockbar_injection_enabled,
             set_macos_vibrancy,
             open_main_window,
             relocate_clock_overlay_command,

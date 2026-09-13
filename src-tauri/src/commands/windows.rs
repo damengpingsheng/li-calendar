@@ -123,10 +123,49 @@ pub async fn apply_custom_clock_text(
     _state: State<'_, AppState>,
     text: String,
 ) -> Result<(), String> {
+    // E6 互斥：注入式时钟接管期间不接受注册表时钟文案写入（否则注入面板的
+    // reparent 时间段会显示被改写的文案，且违反测试基线「注册表 H:mm 勿动」）。
+    if crate::clockbar::injection_enabled() {
+        crate::clockbar::dbg_log("apply_custom_clock_text skipped (injection enabled)");
+        return Ok(());
+    }
     // 调用底层方法设置自定义时钟文本
     set_custom_clock_text(&text).map_err(|error| error.to_string())?;
     // 自定义文案会改变时钟区域布局，重新探测点击区域
     refresh_clock_area_cache();
+    Ok(())
+}
+
+/// 注入式任务栏时钟开关（E0：随自启可关；E6：与旧覆盖层互斥，二选一）。
+///
+/// 开启：启动 clockbar 会话管理器并移除在场的旧覆盖层窗口；
+/// 关闭：优雅拆除注入会话（tap 断线 AUTO 恢复原生时钟），旧覆盖层若属
+/// 「替换任务栏日历」开启态则重新贴合。
+#[tauri::command]
+pub async fn set_clockbar_injection_enabled(
+    app_handle: AppHandle,
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    crate::clockbar::dbg_log(&format!("toggle command enter enabled={enabled}"));
+    crate::clockbar::apply_injection(enabled);
+    crate::clockbar::dbg_log("toggle command apply_injection done");
+    if enabled {
+        // 互斥：旧覆盖层在场则移除（注入面板接管时钟区）
+        if let Some(overlay) = app_handle.get_webview_window("clock_overlay") {
+            let _ = overlay.close();
+        }
+    } else if state.taskbar_widget_enabled.load(Ordering::SeqCst) {
+        // 互斥另一态：恢复旧覆盖层（ensure 幂等，重试 UIA 时钟矩形就绪）
+        let h = app_handle.clone();
+        std::thread::Builder::new()
+            .name("overlay-restore".into())
+            .spawn(move || {
+                crate::window_manager::ensure_clock_overlay_attached(&h);
+            })
+            .ok();
+    }
+    crate::clockbar::dbg_log("toggle command done");
     Ok(())
 }
 

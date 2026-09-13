@@ -111,6 +111,48 @@ pub fn setup_desktop_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
         app_state.taskbar_widget_enabled.store(taskbar_widget_enabled, Ordering::SeqCst);
         apply_taskbar_widget_enabled(taskbar_widget_enabled);
 
+        // E0：注入式任务栏时钟（用户决策 #4 默认开启）。先于 spawn_windows_concurrently
+        // 启动，使旧覆盖层的互斥门在 overlay 初始化前生效（E6：二选一，不同时操作时钟）。
+        let clockbar_injection_enabled = persisted_config.clockbar_injection_enabled.unwrap_or(true);
+        crate::clockbar::apply_injection(clockbar_injection_enabled);
+
+        // E6 试验钩子（F 阶段清理）：标记文件驱动开关切换，等价设置页命令路径。
+        // D:\agents_tmp\lical_inject_on / lical_inject_off 触发一次并自删。
+        {
+            let toggle_handle = app_handle.clone();
+            std::thread::Builder::new()
+                .name("clockbar-toggle-hook".into())
+                .spawn(move || loop {
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                    let on = std::path::Path::new(r"D:\agents_tmp\lical_inject_on").exists();
+                    let off = std::path::Path::new(r"D:\agents_tmp\lical_inject_off").exists();
+                    if on || off {
+                        let _ = std::fs::remove_file(r"D:\agents_tmp\lical_inject_on");
+                        let _ = std::fs::remove_file(r"D:\agents_tmp\lical_inject_off");
+                        crate::clockbar::dbg_log(&format!("toggle hook fired on={on} off={off}"));
+                        let enabled = on;
+                        crate::clockbar::apply_injection(enabled);
+                        if enabled {
+                            if let Some(overlay) = toggle_handle.get_webview_window("clock_overlay") {
+                                let _ = overlay.close();
+                            }
+                        } else if let Some(state) = toggle_handle.try_state::<AppState>() {
+                            if state.taskbar_widget_enabled.load(Ordering::SeqCst) {
+                                let h = toggle_handle.clone();
+                                std::thread::Builder::new()
+                                    .name("overlay-restore".into())
+                                    .spawn(move || {
+                                        crate::window_manager::ensure_clock_overlay_attached(&h);
+                                    })
+                                    .ok();
+                            }
+                        }
+                        crate::clockbar::dbg_log("toggle hook done");
+                    }
+                })
+                .ok();
+        }
+
         if let Err(error) =
             super::windows::startup::initialize_window_manager_for_windows(app_handle, &app_state)
         {

@@ -346,6 +346,12 @@ pub fn window_hwnd_by_label(app_handle: &AppHandle, label: &str) -> Option<HWND>
 /// UIA 初始化在钩子消息线程上，时序可能晚于此处；每 500ms 重试、最多 10 秒。
 /// 已存在窗口时（重复调用/心跳续跑）直接重贴，不重复建窗。
 pub fn ensure_clock_overlay_attached(app_handle: &AppHandle) {
+    // E6 互斥门：注入式时钟接管期间旧覆盖层不启动（二选一，不同时操作任务栏时钟）。
+    // 关闭注入开关时由 set_clockbar_injection_enabled 主动调回本函数恢复。
+    if crate::clockbar::injection_enabled() {
+        crate::dbg_log("clock overlay: skipped (clockbar injection enabled)");
+        return;
+    }
     // UIA 时钟矩形探测依赖 COM（与钩子消息线程同要求），本线程必须自行初始化
     unsafe {
         let _ = CoInitializeEx(None, COINIT_MULTITHREADED);

@@ -1,4 +1,18 @@
-// lical_clock_tap — C 阶段 TAP DLL（方案 v2 §5 C；v30=B 阶段，v31 起=C0 探针/C1 面板）
+// lical_clock_tap — E 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，v49/v50=E）
+// v49 变更（2026-09-13 E1 实证）：
+//   ① Install 沉降期长预算——E1 第 3 轮实证：宿主可在 explorer 出生数秒内注入，
+//      旧 60 次×0.5s≈30s 预算被沉降期（hr=0x80070490，端口未就绪的预期值）耗尽 →
+//      DLL 驻留+Install 线程躺平 → 此后宿主重试永远无效，只能重启 explorer。
+//      改为：0x80070490 长预算重试（3600 次×1s≈1h，每 60 次记一条日志）；
+//      其他 hr 仍按失败躺平纪律（60 次短预算）。
+//   ② 新增 unload 命令（D8 安全卸载序列）：g_unloading 门控 → 摘面板（Time/Date
+//      原位回插）→ 属性恢复 → Unadvise → ack → FreeLibraryAndExitThread 尽力而为
+//      （自钉+引擎钉下模块预期暂留=无害，D8 分期第 3 期语义；模块级卸载=explorer
+//      重启自然消亡）。
+// v50 变更（E4 实测驱动）：自钉（PIN，不可逆）改为 InstallThread 开头自持引用
+//   （LoadLibraryW 自身路径，可 FreeLibrary 释放）——失败路径保护等价（引用计数≥1
+//   不可被宿主卸钩间接触发卸载），且使 unload 真正减到 0 成为可能（引擎若持引用
+//   则模块仍暂留=如实记录）。flush/tapq 线程响应 g_unloading 退出，卸载前静默。
 // 纪律（方案 §6）：DllMain 仅返回 TRUE；不调用 DisableThreadLibraryCalls（/MT 静态 CRT）；
 // 全 COM 入口 try/catch(...) 包裹；任何异常/失败一律躺平记日志，不重试。
 // C 阶段沿用 B 阶段全部七条血泪（见下）+ 新增：树回调内零引擎调用零锁等待纪律
@@ -6,9 +20,10 @@
 // 仅在 UI 线程触碰；一切改动带快照与代次令牌。
 //
 // 【B 阶段血泪记录（实现已按此设计，勿回退）】
-// #1 失败路径自钉：初始化 60 次失败后 host 卸钩 → 钩子引用归零 DLL 被卸 → pipe/flush 线程
-//    执行已卸载代码 → explorer 0xC0000005（2026-09-12 21:49 实测）。DllMain 内
-//    GET_MODULE_HANDLE_EX_FLAG_PIN 自钉（成功时引擎本就永久钉住；模块暂留=D8 分期语义）。
+// #1 失败路径自持：初始化失败后 host 卸钩 → 钩子引用归零 DLL 被卸 → pipe/flush 线程
+//    执行已卸载代码 → explorer 0xC0000005（2026-09-12 21:49 实测）。v30~v49 用
+//    DllMain 自钉（PIN，不可逆）；v50 改为 InstallThread 开头 LoadLibrary 自持引用
+//    （保护等价且可逆，使 E4 安全卸载可能达成；DllMain 内禁 LoadLibrary——loader lock）。
 // #2 树事件到达顺序不保证父先于子 → 定位扫描必须在每个 ADD 事件上尝试，不能只认 Time 命名事件。
 // #3 新鲜 explorer 的 XAML 诊断端口沉降期：~90s 内 init 报 0x80070490（E_NOTFOUND），
 //    ~2.5min 时 advise 成功但零重放，~4.5min 起全链路正常（重试循环必须容忍，勿缩短放弃）。
@@ -80,6 +95,8 @@ static std::string    g_logBuf;
 static volatile LONG  g_logLines = 0;
 static const LONG     kMaxLoggedLines = 1500000;
 static volatile LONG  g_flushQueued = 0;
+static volatile LONG  g_unloading = 0;    // v49 unload 序列门控：置位后 tick/树回调/辅助线程退场
+static HMODULE        g_selfHold = nullptr; // v50 自持引用（InstallThread 开头 LoadLibrary 自身）
 static volatile LONG  g_objectsAlive = 0;
 static volatile LONG  g_adviseCount = 0;
 static volatile LONG  g_unadviseCount = 0;
@@ -109,6 +126,7 @@ static DWORD WINAPI flush_thread(LPVOID) {
     HANDLE h = INVALID_HANDLE_VALUE;
     for (;;) {
         Sleep(300);
+        if (g_unloading) { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); return 0; } // v50 卸载退场
         if (!InterlockedExchange(&g_flushQueued, 0)) continue;
         std::string out;
         AcquireSRWLockExclusive(&g_logLock);
@@ -458,6 +476,11 @@ public:
     STDMETHODIMP OnVisualTreeChange(ParentChildRelation relation, VisualElement element,
                                     VisualMutationType mutationType) {
         try {
+            if (g_unloading) { // v49：卸载序列开始后只做 BSTR 归还，零引擎交互
+                if (element.Type) SysFreeString(element.Type);
+                if (element.Name) SysFreeString(element.Name);
+                return S_OK;
+            }
             char typeA[128] = "", nameA[128] = "";
             if (element.Type) WideCharToMultiByte(CP_UTF8, 0, element.Type, -1, typeA, sizeof(typeA), NULL, NULL);
             if (element.Name) WideCharToMultiByte(CP_UTF8, 0, element.Name, -1, nameA, sizeof(nameA), NULL, NULL);
@@ -1221,6 +1244,7 @@ static void TapEnqueue(const char* msg) {
 static DWORD WINAPI tapq_thread(LPVOID) {
     for (;;) {
         WaitForSingleObject(g_tapQEvent, INFINITE);
+        if (g_unloading) return 0; // v50 卸载退场（unload 序列 SetEvent 唤醒）
         for (;;) {
             char msg[160];
             bool have = false;
@@ -1260,6 +1284,7 @@ static void SendTapEvent(const char* button, double x, double y) {
 // border 在场）+ 僵尸检测（原生 sp 脱离视觉树 ⇒ 引擎全盲的静默重建）。
 static void PanelTick() {
     try {
+        if (g_unloading) return; // v49：卸载序列开始后 tick 静默
         if (!g_panelOn) return;
         HeartbeatCheck();
         unsigned gen = 0;
@@ -1832,13 +1857,46 @@ static HRESULT RunInitAttempt(int attempt) {
 }
 
 static DWORD WINAPI InstallThread(LPVOID) {
-    for (int attempt = 1; attempt <= 60; attempt++) {
+    // v50：自持引用替代 DllMain 自钉（PIN 不可逆，血泪 #1 保护改用可逆形态）。
+    // InstallThread 是工作线程可安全 LoadLibrary；取到引用前宿主不可能触发卸载
+    // （卸钩只发生在 loaded 或 20s 超时后，此窗口 <1ms）。
+    {
+        HMODULE self = nullptr;
+        if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                               (LPCWSTR)&InstallThread, &self)) {
+            WCHAR selfPath[MAX_PATH];
+            if (GetModuleFileNameW(self, selfPath, MAX_PATH) > 0) {
+                g_selfHold = LoadLibraryW(selfPath);
+                log_line("InstallThread: self-hold ref=%p (v50)", (void*)g_selfHold);
+            }
+        }
+    }
+    // v49：沉降期长预算（见文件头 v49 变更①）。0x80070490=端口未就绪的预期值，
+    // 最多重试 3600 次×1s≈1h；其他失败 hr 按躺平纪律 60 次短预算。
+    int nonsettle_fail = 0;
+    int settle_count = 0;
+    for (int attempt = 1; attempt <= 36000; attempt++) {
         HRESULT hr = RunInitAttempt(attempt);
+        if (SUCCEEDED(hr)) {
+            log_line("Install attempt=%d hr=0x%08lx SUCCESS (settle=%d nonsettle_fail=%d)",
+                     attempt, (unsigned long)hr, settle_count, nonsettle_fail);
+            return 0;
+        }
+        if ((unsigned long)hr == 0x80070490UL) {
+            settle_count++;
+            if (settle_count == 1 || settle_count % 60 == 0)
+                log_line("Install settling (E_NOTFOUND) %d/3600", settle_count);
+            if (settle_count >= 3600) break;
+            Sleep(1000);
+            continue;
+        }
+        nonsettle_fail++;
         log_line("Install attempt=%d hr=0x%08lx", attempt, (unsigned long)hr);
-        if (SUCCEEDED(hr)) return 0;
+        if (nonsettle_fail >= 60) break; // 失败躺平纪律（真失败不重试到死）
         Sleep(500);
     }
-    log_line("Install: gave up after 60 attempts");
+    log_line("Install: gave up (settle=%d nonsettle_fail=%d)", settle_count, nonsettle_fail);
     return 1;
 }
 
@@ -1850,6 +1908,7 @@ static HRESULT SelfInit() {
 }
 
 // ── pipe 客户端线程：host 控制命令（有界，异常即断开重连）──
+extern "C" BOOL APIENTRY DllMain(HMODULE, DWORD, LPVOID); // v49 unload 取模块句柄用（定义在后）
 static void send_loaded(HANDLE h) {
     char out[192];
     _snprintf_s(out, sizeof(out), _TRUNCATE,
@@ -2038,6 +2097,45 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                         "{\"v\":2,\"t\":\"c1free\",\"rc\":%d,\"hr\":%lu}\n",
                         rc, (unsigned long)job->hr);
                     send_line(a2);
+                } else if (!strcmp(cmd, "unload")) {
+                    // v49 D8 安全卸载序列（E4）：界面恢复+活动停止 → 尽力而为自卸载。
+                    // 自钉（血泪 #1 保护）+引擎钉下模块预期暂留（无害=D8 分期第 3 期语义），
+                    // 模块级卸载=explorer 重启自然消亡。
+                    InterlockedExchange(&g_unloading, 1);
+                    log_line("UNLOAD: sequence start");
+                    // ① 面板摘除（Time/Date 原位回插，UI 线程）
+                    if (g_panelOn) {
+                        InterlockedExchange(&g_panelWanted, 0);
+                        auto job = std::make_shared<UiJob>(); job->mode = 11;
+                        RunC1Job(job, 8000);
+                        log_line("UNLOAD: panel freed rc");
+                    }
+                    // ② 属性恢复（B0 语义，superseded 判定内置）
+                    CmdRestore("unload");
+                    // ③ 退订诊断（停止接收新工作；在途回调由 g_unloading 早期退出）
+                    TapObject* o = cur_obj();
+                    if (o) o->UnadvisePublic();
+                    // ④ ack（断开前发出）
+                    send_line("{\"v\":2,\"t\":\"unloadack\",\"hr\":0}\n");
+                    log_line("UNLOAD: restored+unadvised, ack sent");
+                    // ⑤ v50：停辅助线程（flush 300ms 内退场、tapq 唤醒退场）→
+                    //    释放自持引用 → 减当前引用退线程。引擎若持引用则模块暂留
+                    //    （无害），否则真卸载（模块列表零残留）。
+                    if (g_tapQEvent) SetEvent(g_tapQEvent);
+                    Sleep(700); // 等 flush 线程过 300ms 节拍退出、ack 落盘
+                    HMODULE self = nullptr;
+                    if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                           (LPCWSTR)&DllMain, &self)) {
+                        if (g_selfHold) {
+                            FreeLibrary(g_selfHold);
+                            g_selfHold = nullptr;
+                            log_line("UNLOAD: self-hold released");
+                        }
+                        log_line("UNLOAD: FreeLibraryAndExitThread");
+                        FreeLibraryAndExitThread(self, 0);
+                    }
+                    log_line("UNLOAD: self handle failed — stay resident");
                 } else if (!strcmp(cmd, "settext") || !strcmp(cmd, "settext2")) {
                     int route = !strcmp(cmd, "settext") ? 1 : 2;
                     MultiByteToWideChar(CP_UTF8, 0, arg, -1, wcmd, 128);
@@ -2118,13 +2216,9 @@ BOOL APIENTRY DllMain(HMODULE, DWORD reason, LPVOID) {
             const WCHAR* base = wcsrchr(exe, L'\\');
             base = base ? base + 1 : exe;
             if (_wcsicmp(base, L"explorer.exe") == 0) {
-                // 【血泪 #1】自钉：初始化失败路径的卸载守卫（详见文件头说明）
-                HMODULE self = nullptr;
-                if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
-                                       GET_MODULE_HANDLE_EX_FLAG_PIN,
-                                       (LPCWSTR)&DllMain, &self)) {
-                    log_line("DllMain: pinned self in explorer (failure-path unload guard)");
-                }
+                // 【血泪 #1 v50】守卫改为 InstallThread 开头的可逆自持引用
+                // （DllMain 内不可 LoadLibrary——loader lock；PIN 不可逆断绝卸载可能）
+                log_line("DllMain: loaded into explorer (v50 self-hold taken in InstallThread)");
                 ensure_flush_thread();
                 log_line("DllMain: loaded into explorer, starting InstallThread");
                 HANDLE t = CreateThread(NULL, 0, InstallThread, NULL, 0, NULL);

@@ -31,6 +31,9 @@ tauri-plugin-clipboard-manager = "2"
 
 [target.'cfg(windows)'.dependencies]
 raw-window-handle = "0.6"
+# 注入式任务栏时钟数据链（方案 v2 §3 D5）：tyme4rs 锁版本，与探针 crate 一致。
+# 24 敏感日期对照 lunar-typescript 23 例逐字一致+1 例口径论证（方案 §3 D 小节）。
+tyme4rs = "=1.5.0"
 windows = { version = "0.62.2", features = [
   "Win32_Foundation",
   "Win32_UI_Input_KeyboardAndMouse",

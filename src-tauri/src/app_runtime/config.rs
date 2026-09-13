@@ -20,6 +20,9 @@ pub struct PersistedFeatureConfig {
     /// 是否启用任务栏日历替换/拦截（仅 Windows）。
     #[cfg(windows)]
     pub taskbar_widget_enabled: Option<bool>,
+    /// 是否启用注入式任务栏时钟（仅 Windows；用户决策 #4 默认开启，关闭时仅原生时钟）。
+    #[cfg(windows)]
+    pub clockbar_injection_enabled: Option<bool>,
     /// 桌面日历小组件上次保存的物理像素位置（仅 Windows）。
     #[cfg(windows)]
     pub desktop_window_position: Option<PersistedPosition>,

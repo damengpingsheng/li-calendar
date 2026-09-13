@@ -49,11 +49,11 @@ type InitXamlDiagEx = unsafe extern "system" fn(
     wszTAPDllName: *const u16, tapClsid: *const u8, wszInitializationData: *const u16,
 ) -> i32;
 
-const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b48"; // 与 tap.cpp TAPVER 版本化一致
+const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b50"; // 与 tap.cpp TAPVER 版本化一致
 const SDK_DLL: &str = r"D:\environment\WindowsKits\10\bin\x64\XamlDiagnostics\xamldiagnostics.dll";
 const WUX_DLL: &str = "Windows.UI.Xaml.dll"; // 系统目录，POC 证实其导出 InitializeXamlDiagnosticsEx
-const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap48.dll";
-const TAP_VER: &str = "48";
+const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap50.dll";
+const TAP_VER: &str = "50";
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -955,6 +955,21 @@ fn main() {
                 std::process::exit(1);
             }
             loop { std::thread::sleep(std::time::Duration::from_secs(3600)); }
+        }
+        "eunload" => {
+            // E4：建立会话后发送 unload（tap v49 D8 序列：摘面板→恢复→Unadvise→
+            // FreeLibraryAndExitThread），随后外部枚举 explorer 模块列表验证卸载语义。
+            if let Err(e) = ensure_session(&msgs) {
+                eprintln!("[probe] SESSION FAILED: {e}");
+                std::process::exit(1);
+            }
+            if !pipe_write(b"unload") { eprintln!("[probe] unload write failed"); std::process::exit(1); }
+            match wait_for(&msgs, |l| l.contains(r#""t":"unloadack""#), 15_000) {
+                Some(l) => println!("[probe] {l}"),
+                None => eprintln!("[probe] no unloadack (pipe may have closed on unload)"),
+            }
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            println!("[probe] EUNLOAD done — enumerate explorer modules now");
         }
         _ => {
             eprintln!("usage: clockbar_probe <c1set json/c1free/c1tap secs/ctest/btest/bkill/bstress secs/bwatch secs/cycle n/dump/hookdump/hookcycle/pipetest/raw endpoint>");

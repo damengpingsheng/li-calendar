@@ -25,6 +25,8 @@ const calendarFooterVisibleDefaults = {
 const configWindowsDefaults = {
   desktopWidgetEnabled: true,
   taskbarWidgetEnabled: true,
+  /** 注入式任务栏时钟（用户决策 #4：默认开启） */
+  clockbarInjectionEnabled: true,
   desktopWindowPosition: null,
   customTrayClockEnabled: true,
   timeFormat: trayClockTimeFormats.HhMm,

@@ -57,6 +57,8 @@ export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {
   desktopWidgetEnabled: boolean;
   /** 启用任务栏弹窗组件 */
   taskbarWidgetEnabled: boolean;
+  /** 注入式任务栏时钟（与旧覆盖层互斥，默认开启；关闭时仅原生时钟） */
+  clockbarInjectionEnabled: boolean;
 }
 
 export interface WindowsDesktop {
