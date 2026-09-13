@@ -24,6 +24,8 @@ pub mod watch;
 pub mod weather;
 
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(windows)]
+use std::sync::Mutex;
 
 /// 注入开关（用户决策 #4：默认开启）。关闭时仅原生时钟，且互斥门放行旧覆盖层。
 static INJECTION_ENABLED: AtomicBool = AtomicBool::new(true);
@@ -56,16 +58,36 @@ pub fn injection_enabled() -> bool {
 pub fn tap_dll_path() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("lical_clock_tap50.dll");
+            let p = dir.join("lical_clock_tap54.dll");
             if p.exists() {
                 return Some(p);
             }
         }
     }
     let dev = std::path::PathBuf::from(
-        r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap50.dll",
+        r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap54.dll",
     );
     dev.exists().then_some(dev)
+}
+
+/// 注入式时钟样式（S 阶段）。会话外全局持有：设置命令写入，数据线程每 tick 读取
+/// 并组进 c1set（行变化才发送 → 样式变更 ≤1s 生效，无需重启 explorer/会话）。
+#[cfg(windows)]
+static STYLE: Mutex<Option<crate::app_runtime::config::ClockbarStyleConfig>> = Mutex::new(None);
+
+/// 应用样式（设置页命令/启动时从 liConfig 载入）。
+#[cfg(windows)]
+pub fn apply_style(cfg: crate::app_runtime::config::ClockbarStyleConfig) {
+    dbg_log("clockbar: style updated");
+    if let Ok(mut g) = STYLE.lock() {
+        *g = Some(cfg);
+    }
+}
+
+/// 当前样式快照（无配置=None → 数据线程不下发 style 扩展=现行为）。
+#[cfg(windows)]
+pub fn current_style() -> Option<crate::app_runtime::config::ClockbarStyleConfig> {
+    STYLE.lock().ok().and_then(|g| g.clone())
 }
 
 /// 应用注入开关（E0/E6）。开启=启动会话管理器；关闭=优雅拆除会话（tap 断线自动恢复原生时钟）。

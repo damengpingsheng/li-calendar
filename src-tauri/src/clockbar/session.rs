@@ -6,7 +6,7 @@ use super::pipe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const TAP_VER: u32 = 50;
+pub const TAP_VER: u32 = 54;
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 pub const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -76,8 +76,10 @@ pub fn reset_cursor() {
     }
 }
 
-fn is_loaded_v49(l: &str) -> bool {
-    l.contains(r#""t":"loaded""#) && l.contains(r#""ver":49"#)
+/// loaded 谓词（版本匹配；S 修复：原硬编码 "ver":49 对 v50/v51 永不命中，
+/// poke 循环首轮永远失败、靠 15s 重试路径的 pipe 重连兜底——对齐 TAP_VER 常量）。
+fn is_loaded_tap(l: &str) -> bool {
+    l.contains(r#""t":"loaded""#) && l.contains(&format!(r#""ver":{TAP_VER}"#))
 }
 
 /// explorer 进程年龄（秒）；无法判定返回 u64::MAX（不阻塞注入）。
@@ -223,7 +225,7 @@ pub fn hook_inject() -> Result<(), String> {
             let mut res = 0usize;
             let ok = ffi::SendMessageTimeoutW(tray, 0x0000, 0, 0, 2, 2000, &mut res);
             super::dbg_log(&format!("session: poke {poke} send_ret={ok}"));
-            if wait_for(is_loaded_v49, 2_000).is_some() {
+            if wait_for(is_loaded_tap, 2_000).is_some() {
                 ffi::UnhookWindowsHookEx(hhk);
                 super::dbg_log("session: tap loaded, hook removed");
                 return Ok(());
@@ -243,7 +245,7 @@ pub fn ensure_session() -> Result<(), String> {
         // 【E1 实测教训】上一会话的陈旧 loaded 残留在队列会让注入被跳过（探针每次
         // 新进程无此问题）——管道未连接时先清历史再判驻留。
         reset_cursor();
-        if wait_for(is_loaded_v49, 1_500).is_none() {
+        if wait_for(is_loaded_tap, 1_500).is_none() {
             super::dbg_log("session: no resident tap; hook-injecting...");
             hook_inject()?;
         }

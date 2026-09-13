@@ -1,4 +1,24 @@
-// lical_clock_tap — E 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，v49/v50=E）
+// lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
+// v49/v50=E，v51=S 阶段时钟段自定义）
+// v53 变更（S3 GUI 实测驱动，三项）：①hide 键允许空值+host 恒发（会话内重开
+// 最后隐藏段生效）；②Time 前末可见段 right margin=gap（时间左间距/gap 对末段生效）；
+// ③Time/Date 原位快照仅有效时更新（v50 潜伏：二次重建后快照=-1，恢复即孤立 Time）。
+// v52 变更（S1 实测驱动）：unwanted 段先摘除再弃引用（先弃引用=元素残留树里渲染
+// 占位、时间被 Width 钳制裁切——23:15 关天气实测）；新会话（pipe 连接）样式复位；
+// reflow 度量计入可见段间 gap（gap 可配置 40×N，低估会裁掉时间段）。
+// v51 变更（S 阶段，S0 定案：时间段=原生样式不支持自定义）：
+//   ① c1set 新增 "style":{...} 扩展（向后兼容：缺省=现行为）——
+//      "order":"a,b,c,d,time"（显示顺序，五元素各恰一次）；"hide":"weather,..."
+//      （数据段隐藏开关，列出=关、未列=开；time 恒显不接受；支持全关=仅时间段）；"color_<id>":"#RRGGBB"|"theme"
+//      （自定义色优先，theme/缺省=跟随主题）；"size_<id>":倍率（0.5~2.0，作用于
+//      fontscale 之上）；"gap":段间距 px（0~40，缺省 10）。总长预算 700→1200。
+//   ② 空段边距节奏修复（D4 遗留③）：空白文案段或 show 关闭段**不创建元素**
+//      （D4 的 22px vs 10px 节奏不均根因=空格段双边距）；可见段 left margin 统一
+//      =gap（首位可见子项 0；Time 为原生元素零属性写入，其与左邻间距由左邻段 margin 提供）。
+//   ③ reflow 隐藏/恢复优先级改为**当前显示顺序**（自左向右先藏、自右向左先恢复；
+//      时间段永不丢不变）；主题翻转仅对 theme 档段重拷 Time 前景，自定义色段不动。
+//   ④ tick 段成员校验泛化：wanted 段须在场、unwanted 段须缺席，失配走整体重排
+//      （LayoutHpanelChildren，含 v35 自我 REM 抑制窗口）。
 // v49 变更（2026-09-13 E1 实证）：
 //   ① Install 沉降期长预算——E1 第 3 轮实证：宿主可在 explorer 出生数秒内注入，
 //      旧 60 次×0.5s≈30s 预算被沉降期（hr=0x80070490，端口未就绪的预期值）耗尽 →
@@ -1107,10 +1127,15 @@ static void CmdC0(int mode, const char* tag) {
 // 主题翻转可触发；此时 Unadvise+Advise 强制全树重放→重定位→自动重建）。
 // 宿主心跳兜底（§4.2）：pipe 静默 >35s 视同断线，自动恢复。
 struct PanelStyle {
-    double  fontscale = 0.55;   // 段字号 = Time.FontSize * fontscale
+    double  fontscale = 0.55;   // 段字号 = Time.FontSize * fontscale * size_<id>
     double  segmaxw = 170;      // 单段 MaxWidth（逻辑 px），超出省略号截断
     double  capw = 620;         // 自建横板 MaxWidth（显式宽度管理，D3）
     int     input = 1;          // C2 输入拦截 Border 开关
+    int     show[4] = { 1,1,1,1 };    // v51 数据段显示开关（time 恒显）
+    int     order[5] = { 0,1,2,3,4 }; // v51 显示顺序：order[k]=元素（0..3=数据段，4=Time）
+    unsigned colors[4] = { 0,0,0,0 }; // v51 段颜色：0=跟随主题，否则 0x00RRGGBB
+    double  sizes[4] = { 1,1,1,1 };   // v51 段字号倍率（钳制 0.5~2.0）
+    double  gap = 10;                 // v51 段间距 px（钳制 0~40）
 };
 static PanelStyle         g_style;
 static wchar_t            g_segText[4][64];        // 天气 节日 节气 农历（host 下发缓存）
@@ -1130,10 +1155,111 @@ static wfnd::IInspectable g_borderRef{ nullptr };
 static volatile LONG      g_lastRecvTick = 0;      // pipe 最近收到命令的时刻（GetTickCount）
 static volatile LONG      g_lastResyncTick = 0;    // 上次僵尸重同步时刻（限频 30s）
 static volatile LONG      g_lastSizeTick = 0;      // 横板最近一次尺寸变化时刻（v44 稳定门）
-// 隐藏优先级：天气(0)→节日(1)→节气(2)→农历(3)；时间段=原生 Time 永不丢
+// 隐藏优先级：v51 起按当前显示顺序（reflow 自左向右先藏/自右向左先恢复）；时间段=原生 Time 永不丢
 static const char* SEGNAME[4] = { "weather", "festival", "term", "lunar" };
 static void AutoRestoreOnDisconnect(); // 定义于后（B0 恢复序列）
 static void PanelReflow(wux::Controls::StackPanel const& hp); // 定义于后（v41 tick 兜底调用）
+
+// ── v51 段身份/开关/顺序辅助 ──────────────────────────
+// 段 id 字符串 → 元素编号（0..3=数据段，4=Time，-1=未知）
+static int SegIdFromName(const char* n) {
+    for (int i = 0; i < 4; i++) if (!strcmp(n, SEGNAME[i])) return i;
+    if (!strcmp(n, "time")) return 4;
+    return -1;
+}
+// 段文案是否空白（v51：空白段不建元素——D4 节奏修复；host 空段发单空格）
+static bool SegTextBlank(int i) {
+    for (wchar_t* p = g_segText[i]; *p; p++) if (*p != L' ' && *p != L'\t') return false;
+    return true;
+}
+// 段是否应构建在场：show 开 且 文案非空白
+static bool SegWanted(int i) {
+    return g_style.show[i] && !SegTextBlank(i);
+}
+// 段外观（字号/字体/颜色）：字号=Time.FontSize*fontscale*size[i]；颜色=自定义色优先，
+// theme 档（0）拷 Time 前景。仅作用于自建段（时间段原生样式零写入——S0 定案）。
+static void ApplySegLook(wux::Controls::TextBlock const& seg, int i, wux::Controls::TextBlock const& tb) {
+    double sz = g_style.sizes[i] > 0 ? g_style.sizes[i] : 1.0;
+    try { seg.FontSize(tb.FontSize() * g_style.fontscale * sz); } catch (...) {}
+    try { seg.FontFamily(tb.FontFamily()); } catch (...) {}
+    try { seg.FontWeight(tb.FontWeight()); } catch (...) {}
+    try {
+        unsigned c = g_style.colors[i];
+        if (c) {
+            wuxm::SolidColorBrush brush;
+            brush.Color(winrt::Windows::UI::Color{ 255, (BYTE)(c >> 16), (BYTE)(c >> 8), (BYTE)c });
+            seg.Foreground(brush);
+        } else {
+            seg.Foreground(tb.Foreground());
+        }
+    } catch (...) {}
+}
+// v51：按 g_style.order 重建自建横板子项顺序（UI 线程；winRT 调用非引擎调用）。
+// wanted 段依 order 落位，Time 恒在 order 槽位；段 left margin=前面存在任一在场子项
+// 则 gap 否则 0（首位可见子项 0=节奏修复；Time 原生元素零属性写入，其与左邻间距由
+// 左邻段 margin 提供——v50 的「首段 0/其余 10」硬编码退役）。
+// 摘 Time 走 v35 自我 REM 抑制窗口（摘段不触发 tracked-REM，无需抑制）。
+static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp) {
+    auto removeFromParent = [](wux::UIElement const& u) {
+        try {
+            auto curParent = wuxm::VisualTreeHelper::GetParent(u.as<wux::DependencyObject>());
+            if (!curParent) return;
+            if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
+                auto pch = pp.Children();
+                for (uint32_t c = 0; c < pch.Size(); c++) {
+                    if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(u)) { pch.RemoveAt(c); break; }
+                }
+            }
+        } catch (...) {}
+    };
+    auto ch = hp.Children();
+    for (int i = 0; i < 4; i++) {
+        if (!g_seg[i]) continue;
+        if (auto ui = g_seg[i].try_as<wux::UIElement>()) removeFromParent(ui);
+    }
+    auto timeU = g_timeRef ? g_timeRef.try_as<wux::UIElement>() : nullptr;
+    InterlockedExchange(&g_selfReparent, 1);
+    if (timeU) removeFromParent(timeU);   // 首建时在原生 sp，重建时在自建横板
+    for (int k = 0; k < 5; k++) {
+        int e = g_style.order[k];
+        if (e == 4) {
+            if (timeU) ch.Append(timeU);
+        } else if (g_seg[e]) {
+            if (auto ui = g_seg[e].try_as<wux::UIElement>()) ch.Append(ui);
+        }
+    }
+    InterlockedExchange(&g_selfReparent, 0);
+    // 段间距（v53）：order 序中非首位可见段 left=gap（首位=0）；Time 前最后一个
+    // 可见段 right=gap（Time 是原生元素零属性写入——其左间距必须由左邻段的
+    // right margin 提供，v52 实测「八月初三23:25」贴住且 gap 调节对末段↔时间不生效）。
+    {
+        int timeK = -1;
+        for (int k = 0; k < 5; k++) if (g_style.order[k] == 4) { timeK = k; break; }
+        int lastVisibleBeforeTime = -1;
+        for (int k = 0; k < (timeK >= 0 ? timeK : 5); k++) {
+            int e = g_style.order[k];
+            if (e != 4 && g_seg[e]) lastVisibleBeforeTime = k;
+        }
+        for (int k = 0; k < 5 && g_style.order[k] != 4; k++) {
+            int e = g_style.order[k];
+            if (!g_seg[e]) continue;
+            bool prev = false;
+            for (int j = 0; j < k; j++) {
+                int pe = g_style.order[j];
+                if (pe == 4 || g_seg[pe]) { prev = true; break; }
+            }
+            bool lastBeforeTime = (k == lastVisibleBeforeTime) && timeK >= 0;
+            if (auto f = g_seg[e].try_as<wux::FrameworkElement>()) {
+                try {
+                    auto mg = f.Margin();
+                    mg.Left = prev ? g_style.gap : 0.0;
+                    mg.Right = lastBeforeTime ? g_style.gap : 0.0;
+                    f.Margin(mg);
+                } catch (...) {}
+            }
+        }
+    }
+}
 
 // v46 正向判据（UI 线程；winRT 调用非引擎调用）：
 // Time 的现父=自建横板；或 Date 处于摘离态（面板在场且 Date 无父）。
@@ -1218,6 +1344,103 @@ static bool JGetDbl(const char* j, const char* key, double* out) {
     if (end == p || v < 0 || v > 10000) return false;
     *out = v;
     return true;
+}
+
+// ── v51 style 对象解析（扁平键一层；值内禁引号/反斜杠/控制符由 JGetStr 保证）──
+// 截取 "style":{ ... } 的花括号内子串（扁平键 ⇒ 首个 '}' 即对象结束）
+static bool JScopeStyle(const char* j, char* out, size_t nOut) {
+    const char* p = strstr(j, "\"style\":{");
+    if (!p) return false;
+    p += 9;
+    const char* e = strchr(p, '}');
+    if (!e) return false;
+    size_t n = (size_t)(e - p);
+    if (n >= nOut) return false;
+    memcpy(out, p, n);
+    out[n] = 0;
+    return true;
+}
+// "order":"a,b,c,d,time" → order[5]（五元素各恰一次且含 time，否则整键拒绝）
+static bool JGetOrder(const char* s, int* order) {
+    wchar_t w[96];
+    if (!JGetStr(s, "order", w, 96)) return false;
+    char a[128];
+    w2a(w, a, sizeof(a));
+    int val[5], seen = 0;
+    bool used[5] = { false,false,false,false,false };
+    char* ctx = nullptr;
+    for (char* tok = strtok_s(a, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
+        int id = SegIdFromName(tok);
+        if (id < 0 || seen >= 5 || used[id]) return false;
+        used[id] = true;
+        val[seen++] = id;
+    }
+    if (seen != 5 || !used[4]) return false;
+    memcpy(order, val, sizeof val);
+    return true;
+}
+// "hide":"weather,term"|"hide":"" → show[4]（列出的段关、未列=开；空值=全开；
+// time 不接受关；未知 id 整键拒绝。v53 起允许空值且 host 恒发本键——hide 缺省时
+// 旧 show 残留，会话内「把最后一个隐藏段重新打开」无法生效，23:34 实测）。
+static bool JGetHide(const char* s, int* show) {
+    // 与 JGetStr 同口径但允许空串值（模式 "hide":" 共 8 字符，p 必须跨过整个模式）
+    const char* p = strstr(s, "\"hide\":\"");
+    if (!p) return false;
+    p += 8;
+    char val[96]; size_t n = 0;
+    while (*p && *p != '"' && n < sizeof(val) - 1) {
+        if (*p == '\\' || (unsigned char)*p < 0x20) return false;
+        val[n++] = *p++;
+    }
+    if (*p != '"') return false;
+    val[n] = 0;
+    int v[4] = { 1,1,1,1 };
+    if (n > 0) {
+        wchar_t w[96];
+        if (MultiByteToWideChar(CP_UTF8, 0, val, -1, w, (int)sizeof(w)) <= 0) return false;
+        char a[128];
+        w2a(w, a, sizeof(a));
+        char* ctx = nullptr;
+        for (char* tok = strtok_s(a, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
+            int id = SegIdFromName(tok);
+            if (id < 0 || id == 4) return false;
+            v[id] = 0;
+        }
+    }
+    memcpy(show, v, sizeof v);
+    return true;
+}
+// "color_<id>":"#RRGGBB"|"theme" → colors[4]（非法色值忽略该键；theme=0）
+static bool JGetColors(const char* s, unsigned* colors) {
+    static const char* keys[4] = { "color_weather","color_festival","color_term","color_lunar" };
+    bool any = false;
+    for (int i = 0; i < 4; i++) {
+        wchar_t w[24];
+        if (!JGetStr(s, keys[i], w, 24)) continue;
+        char a[32];
+        w2a(w, a, sizeof(a));
+        any = true;
+        if (!strcmp(a, "theme")) { colors[i] = 0; continue; }
+        unsigned r = 0, g = 0, b = 0;
+        if (strlen(a) == 7 && a[0] == '#' &&
+            sscanf_s(a + 1, "%2x%2x%2x", &r, &g, &b) == 3)
+            colors[i] = (r << 16) | (g << 8) | b;
+    }
+    return any;
+}
+// "size_<id>":倍率 → sizes[4]（钳制 0.5~2.0）
+static bool JGetSizes(const char* s, double* sizes) {
+    static const char* keys[4] = { "size_weather","size_festival","size_term","size_lunar" };
+    bool any = false;
+    for (int i = 0; i < 4; i++) {
+        double v;
+        if (!JGetDbl(s, keys[i], &v)) continue;
+        any = true;
+        if (v < 0.5) v = 0.5;
+        if (v > 2.0) v = 2.0;
+        sizes[i] = v;
+    }
+    return any;
 }
 
 static void SendTapEvent(const char* button, double x, double y);
@@ -1361,26 +1584,23 @@ static void PanelTick() {
                 log_line("PANEL tick: re-reparent Time into hpanel");
             }
         }
-        // 段成员校验（在自建横板内；Time 必须在最后——段都在它前面）
+        // v51 段成员校验（泛化）：wanted 段须在场、unwanted 段须缺席；
+        // 失配走整体重排（LayoutHpanelChildren，含 REM 抑制窗口），不逐段插补
         if (hp) {
+            bool needLayout = false;
             auto hpCh = hp.Children();
-            auto timeU = g_timeRef.try_as<wux::UIElement>();
             for (int i = 0; i < 4; i++) {
-                if (!g_seg[i]) continue;
-                auto ui = g_seg[i].try_as<wux::UIElement>();
+                auto ui = g_seg[i] ? g_seg[i].try_as<wux::UIElement>() : nullptr;
                 bool present = false;
-                for (uint32_t c = 0; c < hpCh.Size(); c++)
-                    if (ui && winrt::get_abi(hpCh.GetAt(c)) == winrt::get_abi(ui)) { present = true; break; }
-                if (!present) {
-                    uint32_t at = 0; // 段插到 Time 之前
-                    for (uint32_t c = 0; c < hpCh.Size(); c++) {
-                        if (timeU && winrt::get_abi(hpCh.GetAt(c)) == winrt::get_abi(timeU)) { at = c; break; }
-                    }
-                    if (at > (uint32_t)i) at = (uint32_t)i;
-                    hpCh.InsertAt(at, g_seg[i].try_as<wux::UIElement>());
-                    fixed++;
-                    log_line("PANEL tick: re-insert seg %s at %u", SEGNAME[i], (unsigned)at);
+                for (uint32_t c = 0; ui && c < hpCh.Size(); c++) {
+                    if (winrt::get_abi(hpCh.GetAt(c)) == winrt::get_abi(ui)) { present = true; break; }
                 }
+                if (SegWanted(i) ? !present : present) { needLayout = true; break; }
+            }
+            if (needLayout) {
+                LayoutHpanelChildren(hp);
+                fixed++;
+                log_line("PANEL tick: hpanel relayout (wanted/unwanted mismatch)");
             }
         }
         // border 在场校验（ContainerGrid 内）
@@ -1425,14 +1645,28 @@ static void PanelReflow(wux::Controls::StackPanel const& hp) {
         if (!g_panelOn) return;
         double budget = g_style.capw;
         if (budget <= 10) return;
+        // v51：显示顺序（自左向右）= 隐藏/恢复优先级序（时间段不在序列内，永不丢）
+        int seq[4];
+        int n = 0;
+        for (int k = 0; k < 5; k++) {
+            int e = g_style.order[k];
+            if (e != 4) seq[n++] = e;
+        }
         double sum = 0;
         bool measured = true;
-        for (int i = 0; i < 4; i++) {
-            if (!g_seg[i] || g_segHidden[i]) continue;
-            if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
+        bool anyVisible = false;
+        for (int i = 0; i < n; i++) {
+            int id = seq[i];
+            if (!g_seg[id] || g_segHidden[id]) continue;
+            if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                 double d = f.DesiredSize().Width;
                 if (d <= 0) { measured = false; break; }
+                // v51：可见段之间的 gap 计入需求宽（margin 不计入是 D4 纪律，但 gap
+                // 可配置到 40×N，低估会令 Width 钳制裁掉末尾的时间段；gap 是 host
+                // 下发的确定常数，非引擎度量，不违反「勿信 MaxWidth/actual」本意）
+                if (anyVisible) sum += g_style.gap;
                 sum += d;
+                anyVisible = true;
             }
         }
         if (!measured) return;
@@ -1440,6 +1674,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp) {
             if (auto t = g_timeRef.try_as<wux::FrameworkElement>()) {
                 double td = t.DesiredSize().Width;
                 if (td <= 0) return;
+                if (anyVisible) sum += g_style.gap; // 时间段与左邻可见段的间距
                 sum += td;
             }
         }
@@ -1447,24 +1682,26 @@ static void PanelReflow(wux::Controls::StackPanel const& hp) {
         try { hp.Width(target); } catch (...) {}  // v48：Width 硬钳制（MaxWidth 被环境无视）
         double overflow = sum - budget;
         if (overflow > 2) {
-            for (int i = 0; i < 4; i++) {         // 先隐藏低优先级（天气最先）
-                if (!g_seg[i] || g_segHidden[i]) continue;
-                if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
+            for (int i = 0; i < n; i++) {         // 显示序自左向右：先藏离时间最远的段
+                int id = seq[i];
+                if (!g_seg[id] || g_segHidden[id]) continue;
+                if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                     f.Visibility(wux::Visibility::Collapsed);
-                    g_segHidden[i] = true;
-                    log_line("PANEL reflow: hide %s (sum %.0f > capw %.0f)", SEGNAME[i], sum, budget);
+                    g_segHidden[id] = true;
+                    log_line("PANEL reflow: hide %s (sum %.0f > capw %.0f)", SEGNAME[id], sum, budget);
                     return; // 一次一步，等下一轮布局
                 }
             }
         } else if (overflow < -24) {
             double surplus = -overflow;
-            for (int i = 3; i >= 0; i--) {        // 先恢复高优先级（农历最先）
-                if (!g_seg[i] || !g_segHidden[i]) continue;
-                if (g_segDesired[i] > 0 && g_segDesired[i] > surplus - 8) continue; // 放不下
-                if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
+            for (int i = n - 1; i >= 0; i--) {    // 显示序自右向左：先恢复紧邻时间的段
+                int id = seq[i];
+                if (!g_seg[id] || !g_segHidden[id]) continue;
+                if (g_segDesired[id] > 0 && g_segDesired[id] > surplus - 8) continue; // 放不下
+                if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                     f.Visibility(wux::Visibility::Visible);
-                    g_segHidden[i] = false;
-                    log_line("PANEL reflow: show %s (surplus %.0f, need %.0f)", SEGNAME[i], surplus, g_segDesired[i]);
+                    g_segHidden[id] = false;
+                    log_line("PANEL reflow: show %s (surplus %.0f, need %.0f)", SEGNAME[id], surplus, g_segDesired[id]);
                     return;
                 }
             }
@@ -1511,9 +1748,12 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
     }
 
     // 快照 + 引用（原生属性一律不写——v33 拉锯教训；v46 起 Date 连 Visibility 也不写）
+    // v53：原位快照仅在扫描到有效值时更新——Time/Date 已被摘进横板/摘离的重建轮次
+    // 扫不到（timeIdx=-1），直接覆盖会把恢复位抹成 -1，此后 c1free/AUTO 恢复将把
+    // Time 孤立（原生时钟消失；天气 30min 刷新即触发重建，v50 起潜伏）。
     if (dateIns) g_dateRef = dateIns;
-    g_snapTimeIndex = timeIdx;
-    g_snapDateIndex = dateIdx;
+    if (timeIdx >= 0) g_snapTimeIndex = timeIdx;
+    if (dateIdx >= 0) g_snapDateIndex = dateIdx;
     g_spRef = sp; g_timeRef = tb;
     g_contRef = getObj(hCont);
 
@@ -1548,47 +1788,51 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         hp.MaxWidth(g_style.capw);
     }
 
-    // 4 段（新建或更新文本/样式）
+    // 4 段（v51：wanted 段新建/更新文本与外观；unwanted 段先摘除再弃引用）
     for (int i = 0; i < 4; i++) {
+        if (!SegWanted(i)) {
+            if (g_seg[i]) {
+                // 【v51 实测教训】必须先从横板摘除再弃引用——先弃引用会让
+                // LayoutHpanelChildren 摘不到（g_seg 已空），元素残留在视觉树里
+                // 继续渲染占位，时间被 Width 钳制裁切（23:15 关天气实测）。
+                if (auto ui = g_seg[i].try_as<wux::UIElement>()) {
+                    try {
+                        auto curParent = wuxm::VisualTreeHelper::GetParent(ui.as<wux::DependencyObject>());
+                        if (curParent) {
+                            if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
+                                auto pch = pp.Children();
+                                for (uint32_t c = 0; c < pch.Size(); c++) {
+                                    if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(ui)) { pch.RemoveAt(c); break; }
+                                }
+                            }
+                        }
+                    } catch (...) {}
+                }
+                g_seg[i] = nullptr;
+                g_segHidden[i] = false;
+                g_segDesired[i] = 0;
+            }
+            continue;
+        }
         wux::Controls::TextBlock seg{ nullptr };
         if (g_seg[i]) seg = g_seg[i].try_as<wux::Controls::TextBlock>();
         bool makeNew = !seg;
         if (makeNew) seg = wux::Controls::TextBlock{};
         seg.Text(winrt::hstring(g_segText[i]));
-        try { seg.FontSize(tb.FontSize() * g_style.fontscale); } catch (...) {}
-        try { seg.FontFamily(tb.FontFamily()); } catch (...) {}
-        try { seg.FontWeight(tb.FontWeight()); } catch (...) {}
-        try { seg.Foreground(tb.Foreground()); } catch (...) {}
+        ApplySegLook(seg, i, tb);
         seg.VerticalAlignment(wux::VerticalAlignment::Center);
         seg.TextWrapping(wux::TextWrapping::NoWrap);
         seg.TextTrimming(wux::TextTrimming::CharacterEllipsis);
         seg.MaxWidth(g_style.segmaxw);
-        seg.Margin({ i == 0 ? 0.0 : 10.0, 0, 0, 0 });
         if (makeNew) {
             g_seg[i] = seg;
             g_segHidden[i] = false;
             g_segDesired[i] = 0; // 清陈旧缓存（v44：避免跨会话污染 show 判据）
-            hp.Children().Append(g_seg[i].try_as<wux::UIElement>());
         }
     }
-    // Time reparent 到横板末位（系统 VM 每秒仍按引用写 Text，与父无关）
-    auto tbU = tb.as<wux::UIElement>();
-    {
-        auto curParent = wuxm::VisualTreeHelper::GetParent(tb);
-        if (curParent) {
-            if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
-                auto pch = pp.Children();
-                for (uint32_t c = 0; c < pch.Size(); c++)
-                    if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(tbU)) {
-                        InterlockedExchange(&g_selfReparent, 1); // 自我 REM 抑制窗口开
-                        pch.RemoveAt(c);
-                        InterlockedExchange(&g_selfReparent, 0); // 同步回调已在窗口内消化
-                        break;
-                    }
-            }
-        }
-        hp.Children().Append(tbU);
-    }
+    // 子项顺序+间距统一落位（v51：含 Time reparent——首建时自原生 sp 摘除，
+    // 系统 VM 每秒仍按引用写 Time.Text，与父无关）
+    LayoutHpanelChildren(hp);
     // 横板插到原生面板第 0 位
     {
         auto spCh = sp.Children();
@@ -1604,9 +1848,20 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         char s0[96], s1[96], s2[96], s3[96];
         w2a(g_segText[0], s0, sizeof(s0)); w2a(g_segText[1], s1, sizeof(s1));
         w2a(g_segText[2], s2, sizeof(s2)); w2a(g_segText[3], s3, sizeof(s3));
-        log_line("PANEL %s gen=%u segs=[%s|%s|%s|%s|TIME] scale=%.2f capw=%.0f (timeIdx=%d, native sp untouched)",
-                 rebuildAfterGen ? "rebuild" : "build", gen, s0, s1, s2, s3,
-                 g_style.fontscale, g_style.capw, timeIdx);
+        char ordA[96];
+        {
+            char* p = ordA;
+            for (int k = 0; k < 5; k++) {
+                int e = g_style.order[k];
+                const char* nm = (e == 4) ? "TIME" : SEGNAME[e];
+                if (!g_seg[e] && e != 4) nm = "(off)";
+                p += _snprintf_s(p, (size_t)(ordA + sizeof(ordA) - p), _TRUNCATE, "%s%s",
+                                 k ? "|" : "", nm);
+            }
+        }
+        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f (timeIdx=%d)",
+                 rebuildAfterGen ? "rebuild" : "build", gen, ordA, s0, s1, s2, s3,
+                 g_style.fontscale, g_style.gap, g_style.capw, timeIdx);
     }
 
     // C2 输入拦截 Border（盖住时钟内容区，截获指针输入）
@@ -1684,12 +1939,14 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
             InterlockedExchange(&g_lastSizeTick, (LONG)GetTickCount()); // v44：只记脏，评估交给 tick（稳定门）
         });
         g_themeToken = sp.ActualThemeChanged([](wux::FrameworkElement const&, wfnd::IInspectable const&) {
-            try { // 主题翻转：段前景色跟随 Time 重新取
+            try { // 主题翻转：仅 theme 档段重拷 Time 前景（v51：自定义色段不动）
                 if (auto t = g_timeRef.try_as<wux::Controls::TextBlock>()) {
                     auto fg = t.Foreground();
-                    for (int i = 0; i < 4; i++)
+                    for (int i = 0; i < 4; i++) {
+                        if (g_style.colors[i]) continue;
                         if (auto s = g_seg[i].try_as<wux::Controls::TextBlock>()) s.Foreground(fg);
-                    log_line("PANEL theme changed: foreground re-copied");
+                    }
+                    log_line("PANEL theme changed: theme-follow foreground re-copied");
                 }
             } catch (...) { log_line("PANEL theme EXCEPTION"); }
         });
@@ -1932,6 +2189,10 @@ static DWORD WINAPI pipe_thread(LPVOID) {
         retry = 0;
         InterlockedExchangePointer(&g_pipeH, h);
         log_line("pipe: connected");
+        // v51：新会话样式复位——style 扩展是增量字段语义（hide/order 仅在配置存在时
+        // 下发），g_style 若跨会话残留会把上一会话的 hide/colors 泄漏进新会话
+        //（实测：全关会话后，无 hide 键的新 c1set 段全被残留关掉）。
+        g_style = PanelStyle{};
         send_loaded(h);
         char out[512];
         char buf[1024];
@@ -2052,8 +2313,9 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                 } else if (!strcmp(cmd, "c0add")) {
                     CmdC0(7, "c0add");
                 } else if (!strcmp(cmd, "c1set")) {
-                    // host 下发五段数据+样式（协议 §4.3 骨架的 C 阶段形态）；限界解析
-                    if (strlen(rest) < 2 || strlen(rest) > 700) {
+                    // host 下发五段数据+样式（协议 §4.3 骨架的 C 阶段形态 + v51 style 扩展）；
+                    // 限界解析：总长 ≤1200（v51 放宽，行缓冲 8KB 内），字段逐项校验
+                    if (strlen(rest) < 2 || strlen(rest) > 1200) {
                         send_line("{\"v\":2,\"t\":\"c1set\",\"err\":\"bad_len\"}\n");
                     } else {
                         PanelStyle st = g_style;
@@ -2069,6 +2331,27 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                         for (int i = 0; i < 4; i++) {
                             if (JGetStr(rest, segs[i].key, tmp, 64)) {
                                 wcsncpy_s(g_segText[segs[i].idx], tmp, _TRUNCATE);
+                                any = true;
+                            }
+                        }
+                        // v51 style 对象（一层扁平键；逐键校验，非法键整键拒绝、
+                        // 非法值忽略保留旧值——与平面字段同款防御）
+                        char scope[600];
+                        if (JScopeStyle(rest, scope, sizeof(scope))) {
+                            int ord[5];
+                            if (JGetOrder(scope, ord)) { memcpy(st.order, ord, sizeof ord); any = true; }
+                            int shw[4];
+                            if (JGetHide(scope, shw)) { memcpy(st.show, shw, sizeof shw); any = true; }
+                            unsigned cols[4];
+                            memcpy(cols, st.colors, sizeof cols);
+                            if (JGetColors(scope, cols)) { memcpy(st.colors, cols, sizeof cols); any = true; }
+                            double szs[4];
+                            memcpy(szs, st.sizes, sizeof szs);
+                            if (JGetSizes(scope, szs)) { memcpy(st.sizes, szs, sizeof szs); any = true; }
+                            double dGap;
+                            if (JGetDbl(scope, "gap", &dGap)) {
+                                if (dGap > 40) dGap = 40;
+                                st.gap = dGap;
                                 any = true;
                             }
                         }

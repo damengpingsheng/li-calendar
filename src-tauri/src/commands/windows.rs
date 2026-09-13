@@ -169,6 +169,14 @@ pub async fn set_clockbar_injection_enabled(
     Ok(())
 }
 
+/// 注入式时钟段样式（S 阶段）：host 侧钳制校验后入全局，数据线程下一 tick
+/// 组进 c1set 下发（行变化才发送 → ≤1s 生效，无需重启 explorer/会话）。
+#[tauri::command]
+pub async fn set_clockbar_style(style: crate::app_runtime::config::ClockbarStyleConfig) -> Result<(), String> {
+    crate::clockbar::apply_style(style);
+    Ok(())
+}
+
 /// 获取当前系统时间格式文本。
 ///
 /// * `_state` - 注入的应用状态（未使用）

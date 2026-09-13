@@ -27,6 +27,14 @@ const configWindowsDefaults = {
   taskbarWidgetEnabled: true,
   /** 注入式任务栏时钟（用户决策 #4：默认开启） */
   clockbarInjectionEnabled: true,
+  /** 注入式时钟段样式（D4 现行为=缺省） */
+  clockbarStyle: {
+    order: ['weather', 'festival', 'term', 'lunar', 'time'],
+    show: { weather: true, festival: true, term: true, lunar: true, time: true },
+    colors: {},
+    sizes: {},
+    gap: 10,
+  },
   desktopWindowPosition: null,
   customTrayClockEnabled: true,
   timeFormat: trayClockTimeFormats.HhMm,

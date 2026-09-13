@@ -52,6 +52,20 @@ export interface CalendarFooterVisible {
   footerCountdownVisible: boolean;
 }
 
+/** 注入式时钟段样式（S 阶段；时间段=原生样式不支持自定义，S0 定案） */
+export interface ClockbarStyle {
+  /** 显示顺序（五元素 id 各恰一次，含 time） */
+  order: string[];
+  /** 数据段显示开关（time 恒显） */
+  show: Record<string, boolean>;
+  /** 自定义颜色（"#rrggbb"；缺省=跟随主题） */
+  colors: Record<string, string>;
+  /** 段字号倍率（0.5~2.0，缺省 1.0） */
+  sizes: Record<string, number>;
+  /** 段间距 px（0~40，缺省 10） */
+  gap: number;
+}
+
 export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {
   /** 启用桌面组件 */
   desktopWidgetEnabled: boolean;
@@ -59,6 +73,8 @@ export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {
   taskbarWidgetEnabled: boolean;
   /** 注入式任务栏时钟（与旧覆盖层互斥，默认开启；关闭时仅原生时钟） */
   clockbarInjectionEnabled: boolean;
+  /** 注入式时钟段样式（缺省=现行为） */
+  clockbarStyle: ClockbarStyle;
 }
 
 export interface WindowsDesktop {

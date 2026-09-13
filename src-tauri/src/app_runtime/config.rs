@@ -1,4 +1,4 @@
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use tauri::{AppHandle, Manager};
 
@@ -8,6 +8,30 @@ use tauri::{AppHandle, Manager};
 pub struct PersistedPosition {
     pub x: i32,
     pub y: i32,
+}
+
+/// 注入式任务栏时钟样式（S 阶段，S0 定案：时间段=原生样式不支持自定义）。
+/// 下发链路：liConfig.json → 启动载入/设置命令更新 → data.rs 组进 c1set 的
+/// `style` 对象（host 侧先钳制校验，tap 侧仍自校验——双端防御）。
+#[cfg(windows)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClockbarStyleConfig {
+    /// 显示顺序（五元素 id 各恰一次；缺省=weather,festival,term,lunar,time）。
+    #[serde(default)]
+    pub order: Vec<String>,
+    /// 数据段显示开关（time 恒显；缺省全开）。
+    #[serde(default)]
+    pub show: std::collections::BTreeMap<String, bool>,
+    /// 自定义颜色（"#rrggbb"；缺省=跟随主题，"theme" 同义）。
+    #[serde(default)]
+    pub colors: std::collections::BTreeMap<String, String>,
+    /// 段字号倍率（0.5~2.0，作用于 fontscale 之上；缺省 1.0）。
+    #[serde(default)]
+    pub sizes: std::collections::BTreeMap<String, f64>,
+    /// 段间距 px（0~40，缺省 10）。
+    #[serde(default)]
+    pub gap: Option<f64>,
 }
 
 /// 自 `liConfig.json` 反序列化的功能开关快照。
@@ -23,6 +47,9 @@ pub struct PersistedFeatureConfig {
     /// 是否启用注入式任务栏时钟（仅 Windows；用户决策 #4 默认开启，关闭时仅原生时钟）。
     #[cfg(windows)]
     pub clockbar_injection_enabled: Option<bool>,
+    /// 注入式任务栏时钟样式（仅 Windows；S 阶段，缺省=现行为）。
+    #[cfg(windows)]
+    pub clockbar_style: Option<ClockbarStyleConfig>,
     /// 桌面日历小组件上次保存的物理像素位置（仅 Windows）。
     #[cfg(windows)]
     pub desktop_window_position: Option<PersistedPosition>,

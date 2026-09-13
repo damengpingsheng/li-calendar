@@ -126,6 +126,93 @@ pub fn local_ymd() -> (i32, u32, u32) {
 /// 生产默认样式（D4 定稿：fontscale 0.55 / segmaxw 170 / capw 620 / input 1）。
 pub const DEFAULT_STYLE: &str = "\"fontscale\":0.55,\"segmaxw\":170,\"capw\":620,\"input\":1";
 
+/// S 阶段段 id 与 tap SEGNAME 对齐；time 恒显不参与 show/colors/sizes。
+const SEG_IDS: [&str; 4] = ["weather", "festival", "term", "lunar"];
+
+fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 {
+    v.max(lo).min(hi)
+}
+
+/// #rrggbb（6 位十六进制）校验（tap 侧还会再校验一次——双端防御）。
+fn is_hex6(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7
+        && b[0] == b'#'
+        && b[1..]
+            .iter()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(c) || (b'A'..=b'F').contains(c))
+}
+
+/// v51 style 扩展片段：由 liConfig `clockbarStyle` 构建追加点（`,"style":{...}`）。
+/// host 侧先做校验/钳制（order 合法排列、色值 #rrggbb、sizes/gap 钳制），
+/// 非法字段静默丢弃（tap 缺省=现行为，双保险）。无配置/无有效字段 → 空串。
+pub fn style_ext_json() -> String {
+    let Some(cfg) = super::current_style() else {
+        return String::new();
+    };
+    let mut f: Vec<String> = Vec::new();
+
+    // order：必须是五个已知 id 的合法排列（含 time 恰一次）才下发
+    let mut order: Vec<String> = cfg
+        .order
+        .iter()
+        .filter(|id| {
+            SEG_IDS.contains(&id.as_str()) || id.as_str() == "time"
+        })
+        .cloned()
+        .collect();
+    order.dedup();
+    let mut want_time = false;
+    let mut seg_count = 0usize;
+    for id in &order {
+        if id == "time" {
+            want_time = true;
+        } else {
+            seg_count += 1;
+        }
+    }
+    if want_time && seg_count == SEG_IDS.len() && order.len() == 5 {
+        f.push(format!("\"order\":\"{}\"", order.join(",")));
+    }
+
+    // hide：恒发（v53——tap 空值=全开；缺省会话内残留旧 show，重开最后隐藏段无效）
+    let hidden: Vec<&str> = SEG_IDS
+        .iter()
+        .copied()
+        .filter(|id| !cfg.show.get(*id).copied().unwrap_or(true))
+        .collect();
+    f.push(format!("\"hide\":\"{}\"", hidden.join(",")));
+
+    // colors：仅合法 #rrggbb；"theme"/非法=不下发（=跟随主题）
+    for id in SEG_IDS {
+        if let Some(c) = cfg.colors.get(id) {
+            if is_hex6(c) {
+                f.push(format!("\"color_{id}\":\"{}\"", c.to_lowercase()));
+            }
+        }
+    }
+
+    // sizes：≠1.0 才下发（钳制 0.5~2.0）
+    for id in SEG_IDS {
+        if let Some(v) = cfg.sizes.get(id) {
+            let v = clamp_f64(*v, 0.5, 2.0);
+            if (v - 1.0).abs() > f64::EPSILON {
+                f.push(format!("\"size_{id}\":{v:.2}"));
+            }
+        }
+    }
+
+    // gap：0~40 钳制
+    if let Some(g) = cfg.gap {
+        f.push(format!("\"gap\":{:.0}", clamp_f64(g, 0.0, 40.0)));
+    }
+
+    if f.is_empty() {
+        return String::new();
+    }
+    format!(",\"style\":{{{}}}", f.join(","))
+}
+
 /// 数据线程（每个会话一份；watch 建会话成功后 spawn）：
 /// 1s 粒度日界翻转比对；天气 30min 刷新（失败/无城市一律 `--` 占位，其余段零感知）；
 /// 数据行变化才发 c1set。pipe 写失败即退出（tap 已走 AUTO 恢复，watch 会重建会话）。
@@ -133,7 +220,6 @@ pub fn spawn_data_thread() {
     std::thread::Builder::new()
         .name("clockbar-data".into())
         .spawn(|| {
-            let style = DEFAULT_STYLE.to_string();
             let mut cur_date = local_ymd();
             let mut wx = "--".to_string(); // 降级占位（断网/坏数据同款）
             let mut last_wx = std::time::Instant::now()
@@ -178,6 +264,8 @@ pub fn spawn_data_thread() {
                     }
                 }
                 let dd = compute_day(y, m, d, &wx);
+                // v51：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set
+                let style = format!("{DEFAULT_STYLE}{}", style_ext_json());
                 let line = dd.c1set_json(&style);
                 if line != last_sent {
                     match super::session::send_c1set(&line) {

@@ -114,6 +114,10 @@ pub fn setup_desktop_app(app: &mut tauri::App) -> Result<(), Box<dyn std::error:
         // E0：注入式任务栏时钟（用户决策 #4 默认开启）。先于 spawn_windows_concurrently
         // 启动，使旧覆盖层的互斥门在 overlay 初始化前生效（E6：二选一，不同时操作时钟）。
         let clockbar_injection_enabled = persisted_config.clockbar_injection_enabled.unwrap_or(true);
+        // S：时钟段样式（liConfig clockbarStyle；缺省无配置=现行为）
+        if let Some(st) = persisted_config.clockbar_style.clone() {
+            crate::clockbar::apply_style(st);
+        }
         crate::clockbar::apply_injection(clockbar_injection_enabled);
 
         // E6 试验钩子（F 阶段清理）：标记文件驱动开关切换，等价设置页命令路径。
