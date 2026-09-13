@@ -12,3 +12,6 @@ path = "src/main.rs"
 
 [profile.release]
 opt-level = 1
+
+[dependencies]
+tyme4rs = "=1.5.0"

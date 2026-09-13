@@ -1,25 +1,24 @@
 # 会话续作指引：注入式任务栏时钟第三代（当前进度）
 
-> 更新时间：2026-09-13 凌晨（C 阶段完成） · 用途：新会话窗口快速接续
+> 更新时间：2026-09-13 傍晚（D 阶段完成） · 用途：新会话窗口快速接续
 
-## 0. 当前决策（唯一生效，2026-09-13 凌晨更新）
+## 0. 当前决策（唯一生效，2026-09-13 傍晚更新）
 
-> **C 阶段（静态五段+输入等价性）已完成并通过验收门槛**（两项工具性遗留：低分辨率补测、触摸未测，详见方案 §3 C 小节遗留清单）。下一阶段 = D（数据接入：tyme4rs+天气）。
+> **D 阶段（数据接入）已完成并通过验收门槛**（24 敏感日期对照一致、天气四路降级优雅、真数据样式场景过；期间一次「时钟 VM 停写」宿主事件已恢复、4/4 复现实验未重放、归因未定案随 E 隔夜观察，详见方案 §3「D 阶段实测结果」事件记录）。下一阶段 = E（完整生命周期：explorer 重启重注入 ×5/宿主崩溃自恢复/正常退出全清理/安全卸载/隔夜长稳/**互斥开关**）。
 
-- **生效方案**：`方案-注入式任务栏时钟第三代-2026-09-12.md`（v2 + §3「A/B/C 阶段实测结果」）；
-- **C 阶段关键定案**（详见方案 §3 C 小节）：
-  - **面板结构 = 对原生元素零布局属性写入**：自建横向 StackPanel（4 段+reparent 的原生 TimeInnerTextBlock）插在原生面板第 0 位；Date 隐藏一次性；时间段=系统 VM 等价持有（reparent 不影响按引用写 Text）；**v33 教训：直改原生 Orientation 会与系统每秒回写拉锯，且 01:07:02 explorer AppHangB1 恰在拉锯+主题翻转期间（归因未定案，拉锯=头号嫌疑；v34 重设计后 5+ 次翻转零挂死）**；
-  - **生产通道定案补全**：引擎 CreateInstance 对元素类型 E_UNEXPECTED——结构通道与属性通道双双死刑，winRT 直改（属性+结构插入+reparent）是唯一通道；
-  - **管道血泪两连（B#6 的完整版）**：UI 线程写管道被 pipe 线程阻塞 ReadFile 卡 8.7s（点时钟=任务栏冻 9s）→ tap 事件 UI 线程入队+专用发送线程；tap 侧阻塞 ReadFile 把整个管道实例写 I/O 串行化（4.6s 锁步）→ **tap 读循环也必须 PeekNamedPipe 轮询（v30 只修 host 侧是半成品）**；修后端到端 ~100-180ms；
-  - **输入拦截 = 透明 Border 盖 ContainerGrid 顶层**：系统日历飞出/任务栏右键菜单/时钟「通知设置」飞出/悬停 tooltip 全部结构性抑制——ContextRequested Handled 是右键飞出的确定性抑制（PointerPressed Handled 实测不稳定）；Tapped/RightTapped 抬起触发符合右键 UP 铁律；
-  - **宽度策略（D3）落地**：capw+segmaxw+优先级隐藏（天气→节日→节气→农历）；**血泪连环（v41~v45，用户实测验收期暴露）：MaxWidth 钳平 DesiredSize→度量须用子项期望宽之和；级联期子项未测量→跳过评估；级联期 ActualWidth 滞后→400ms 稳定门；XAML DesiredSize 已含 Margin→求和不得再加边距（幻影溢出恒等于边距和、与 capw/字号无关=定位特征）**；v45 修正后默认零隐藏五段全显；真实约束下的优先级隐藏待用修正度量重测（capw 压到内容宽以下复现）；
-  - 主题跟随（ActualThemeChanged 重拷 Time 前景）实测 ✓；僵尸检测（GetParent==null→Unadvise/Advise 重同步）+心跳兜底（35s）机制就位；
-  - 维护 tick 实测系统会周期性复活 Date 可见性（含全屏进出期每秒一次），tick 每秒纠回；
-- **工件**：`src-tauri/clockbar/`（tap v45 = tap.cpp TAPVER 版本化；host 新增 c0tree/c0ins/c0meas/c0rm/c0add/ctest/c1set/c1free/c1hold/c1tap/c1kill；c1hold=持久会话+5s 心跳，是 C/D 阶段测试的主入口）；脚本：`D:\agents_tmp\c_stage_20260913\`（cshot/cburst 加宽截图、cclick 真实点击、chover 悬停、ctheme/cautohide/ckeys 场景脚本）+ 既有 bshot/bburst/bstress_fs/btheme；证据：`clockbar_tap_b31~b48.log`、`cshot_*.png`、hold*.log；
-- A/B 阶段定案不变（通道=钩子引导进程内初始化；路线 B；七条血泪+血泪#6 完整版全数内置 v48）；
-- **C 阶段补验闭环（2026-09-13 下午，用户 PotPlayer 手测无问题后）**：v48 上全屏×30 面板在场 gen 稳定 ✓、真实约束（capw=100）优先级隐藏时间保住 ✓、B0 硬杀 Date 原位回插 ✓、用户真实全屏手测 ✓——C 阶段全部验收项+补验项闭合，正式进 D；
-- **遗留（D/E 处理）**：①低分辨率补测（修 cres.ps1 [ref] 语义）②DPI 变更触发器随 E 模板压测 ③时钟按钮键盘唤起飞出未拦截 ④触摸未测 ⑤reflow show 路径未单独构造场景 ⑥v33 AppHangB1 一次归因未定案（v34 后未复现）⑦树静默替换+引擎零事件：僵尸机制待自然触发验证 ⑧explorer 重启重注入（watch.rs，E）；注册表时间格式 H:mm 不动；
-- 旧覆盖层 R9.4 仍是部署版（互斥开关 E 阶段接入；C 阶段测试期间 liCalendar.exe 全程退出）。
+- **生效方案**：`方案-注入式任务栏时钟第三代-2026-09-12.md`（v2 + §3「A/B/C/D 阶段实测结果」）；
+- **D 阶段关键定案**（详见方案 §3 D 小节）：
+  - **数据链=tyme4rs `=1.5.0` 锁版本**（探针 crate `src/data.rs`）：农历行 `{月名}{日名}`（tyme「十一月/十二月」→「冬月/腊月」映射对齐前端）、节气行仅节气日、节日行=阳历→农历→补充表（情人节/母亲节/父亲节，tyme 缺）→除夕兜底（tyme 已内置）、清明日节日/节气去重；**24 例对照 lunar-typescript：23 例逐字一致+1 例口径差异已论证（2025-10-06 世界住房日，前端格子实际也显示中秋节）**；调休（tyme LegalHoliday）与 HolidayUtil 班/休一致；
+  - **c1set 空段口径**：发单空格（tap 限界 JSON 拒空串）；空格段 DesiredSize>0 不阻断 reflow；已知小事=空段边距致「天气→农历」22px vs「农历→时间」10px 节奏不均（margin 硬编码 tap，E 调）；
+  - **天气端点现状（前端旧实现已失效的实锤）**：`www.weather.com.cn/data/sk/{id}.html` 301 死链；`wgeo /ip/` 赋值变量是 `id` 非 `cityid`；**D 定案端点=`http://d1.weather.com.cn/weather_index/{id}.html?date=<ts>`（纯 HTTP+必须 Referer: http://www.weather.com.cn/）**，正文 GBK/UTF-8 混杂→只取 ASCII `temp`/`weathercode`+码表映射；IP 定位=wgeo `/ip/?_=<ts>`（带 Referer 纯 HTTP 直返）；城市解析链 env LICAL_CITYID→缓存文件→IP 定位（本机 101010700）；localStorage 迁移评估归 E；
+  - **降级纪律落地**：天气失败一律段显 `--` 占位（DNS/超时/坏数据×2/在会话四路实测），数据线程内阻塞 ≤8s 不触 UI/管道；
+  - probe 新子命令：`ddata`（单日数据+天气探针）/`dverify`（批量对照 TSV）/`dhold <secs> [style]`（**D/E 测试主入口**：真数据会话+日界翻转+天气 30min 刷新+心跳）/`dprops`（只读回读 Time.Text——**VM 停写判别工具**）；纯计算子命令不再抢单实例管道；
+- **C 阶段关键定案**（详见方案 §3 C 小节）：面板结构=对原生元素零布局属性写入（自建横板+Time reparent+Date 摘离）；生产通道=winRT 直改（引擎通道双死刑）；宽度策略最终形态=host 下发 capw 预算+Width 硬钳制（MaxWidth 被环境无视）；输入/tooltip 拦截=透明 Border+ContextRequested Handled；管道双端 Peek 轮询+UI 线程零管道 I/O+tap 事件发送线程；
+- **工件**：`src-tauri/clockbar/`（tap v48 不变；探针 crate 含 tyme4rs/data.rs/weather.rs）；脚本 `D:\agents_tmp\c_stage_20260913\`（cshot/cburst/cclick/chover/ctheme/cautohide/ckeys/bstress_fs）；D 阶段证据 `D:\agents_tmp\d_stage_20260913\`（dates.txt/rust.txt/ts.txt/verify_lunar.mjs/dhold*.log/cityid 缓存）+ cshot_d*/r1~r4* 截图；日志 `clockbar_tap_b48.log`；
+- **【事件】时钟 VM 停写（2026-09-13 16:36 前后，未定案）**：任务栏时钟冻结 16:35 达 12min（dprops 实锤元素 Text 停走，非渲染问题）；onset 早于当日强杀与主题翻转、tap 静默稳态期；无创手段不可逆，explorer 重启恢复；**回放实验 4/4 未重放**；差异点=事件 explorer 自 12:39 注入驻留 ~4h+~10 次会话循环。E 阶段隔夜长稳必观察；复现即用 dprops 判别；
+- A/B 阶段定案不变（通道=钩子引导进程内初始化；路线 B；血泪全集内置 v48）；C 阶段补验闭环维持（2026-09-13 下午）；
+- **遗留（E 处理）**：①时钟 VM 停写归因（隔夜）②真实跨夜日界+天气 30min 周期观察 ③空段边距节奏 ④城市配置生产路径+localStorage 迁移 ⑤低分辨率补测 ⑥DPI 变更触发器随 E 模板压测 ⑦时钟按钮键盘唤起飞出未拦截 ⑧触摸未测 ⑨reflow show 路径未单独构造 ⑩v33 AppHang 归因未定案 ⑪僵尸机制自然触发验证 ⑫explorer 重启重注入（watch.rs，E 本体）；注册表时间格式 H:mm 不动；
+- 旧覆盖层 R9.4 仍是部署版（互斥开关 E 阶段接入；D 阶段测试期间 liCalendar.exe 全程退出，当前 explorer=16:49 新起，未注入，原生时钟）；**PotPlayer 常驻（用户日常使用中，勿自动化勿打扰）**。
 
 ---
 
@@ -32,7 +31,7 @@
 
 ## 1. 一句话现状
 
-第三代注入路线 **C 阶段完成**：五段静态面板（天气|节日|节气|农历|时间，v48 结构=自建横板+Date 摘离+Width 硬钳制+reparent 原生 Time，零原生布局写入）+ 输入/tooltip 等价性全达成。下一阶段 D：数据接入（tyme4rs+天气）。旧覆盖层（R1~R9.4）维持已部署版本不动。
+第三代注入路线 **D 阶段完成**：真数据链（tyme4rs 农历/节气/节日 24 例对照一致 + 天气 d1 端点四路降级优雅）经 c1set 全部跑通，tap v48 零改动。下一阶段 E：完整生命周期（重注入/自恢复/全清理/安全卸载/隔夜长稳/互斥开关）。旧覆盖层（R1~R9.4）维持已部署版本不动，当前 explorer 未注入（原生时钟）。
 
 ## 2. R7~R8 速查（详见总结文档 §3）
 
@@ -75,10 +74,10 @@
 
 ## 4. 下一步（恢复时）
 
-1. **D 阶段（数据接入）**：按方案 §5 D 行——tyme4rs（锁版本+抽查 20 个敏感日期对照 lunar-typescript）接 时间/农历/节气/节日 真数据（替换 c1set 假数据链路），然后天气（weather.com.cn JS 赋值脚本解析，新实现）。数据链：host data.rs → `c1set` 行 JSON → tap（协议已通，v48 实测）。
-2. 开发迭代纪律（A/B/C 血泪全量）：改 DLL 必须 TAPVER 递增 + 重启 explorer 清驻留 + **新鲜 explorer 沉降期 ~4.5min**；批处理纯 ASCII+`/utf-8`；树判别式改动先过 sim.cpp 回放仿真；回调内零引擎调用零锁等待；**UI 线程零管道 I/O**（tap 事件走 tapq 发送线程）；**tap/host 两侧读循环都必须 PeekNamedPipe 轮询**；**对原生元素零布局属性写入**（面板=v34 reparent 结构，勿回退到改 Orientation）；溢出度量用子项期望宽之和（MaxWidth 钳 DesiredSize）。
-3. 构建：`cd src-tauri/clockbar/tap && TAPVER=N cmd //c build_tap.cmd`（DLL；注意 cppwinrt 头需 `#pragma push_macro("GetCurrentTime")` 包裹 + winrt/Windows.Foundation.Collections.h）+ `cmd //c D:\agents_tmp\c_stage_20260913\build_host.cmd`（host，MSVC 环境按项目 AGENTS.md）。测试主入口：`c1hold <secs> <json>`（持久会话+心跳）；场景脚本 cshot/cclick/chover/ctheme/cautohide/ckeys（会话目录）；B 阶段子命令 btest/bkill/bstress/bwatch/brapid 保留可用。
-4. E~F 阶段见方案 §5；C 遗留清单（低分辨率补测等 7 项）见方案 §3 C 小节。
+1. **E 阶段（完整生命周期）**：按方案 §5 E 行——explorer 重启重注入 ×5（watch.rs）；宿主崩溃自恢复（30s 内）；正常退出全清理（含注册表时间格式恢复）；安全卸载证明（D8 终点）；**隔夜长稳观察**（含 D 遗留：时钟 VM 停写事件复现监测——dprops 判别、真实跨夜日界翻转、天气 30min 周期触发）；**互斥开关**接入（注入时钟与旧覆盖层二选一）。
+2. 开发迭代纪律（A/B/C/D 血泪全量）：改 DLL 必须 TAPVER 递增 + 重启 explorer 清驻留 + **新鲜 explorer 沉降期 ~4.5min**；批处理纯 ASCII+`/utf-8`；树判别式改动先过 sim.cpp 回放仿真；回调内零引擎调用零锁等待；**UI 线程零管道 I/O**；**tap/host 两侧读循环都必须 PeekNamedPipe 轮询**；**对原生元素零布局属性写入**；溢出度量用子项期望宽之和（勿再加边距、勿信 MaxWidth）；**explorer 优雅关闭优先**（taskkill 无 /F + 10s 宽限，无效才 /F；注意 16:49 实测：优雅信号未退、/F 后 Winlogon 未自动拉起 shell，需手动 `start explorer.exe`）；**合并迭代禁无谓重启**（D 阶段全程改 host 侧零重启是模板形态）。
+3. 构建：D 阶段起主入口=探针 crate `cd src-tauri/clockbar && cmd //c D:\agents_tmp\c_stage_20260913\build_host.cmd`（含 tyme4rs 依赖，首次构建需 cargo fetch）；测试主入口 `dhold <secs> [style-json]`；对照工具 `dverify dates.txt` + `node D:\agents_tmp\d_stage_20260913\verify_lunar.mjs`（createRequire 锚定项目 node_modules）；诊断 `ddata`/`dprops`；天气测试钩子=env `LICAL_WX_HOST`（覆盖连接目标）/`LICAL_CITYID`/`LICAL_WX_DEBUG=1`。tap 侧构建仍 `cd src-tauri/clockbar/tap && TAPVER=N cmd //c build_tap.cmd`（本次未动，v48 驻留已随 16:49 explorer 重启消失，重注入直接跑 dhold 即可）。
+4. F 阶段见方案 §5；C/D 遗留清单见方案 §3 对应小节。
 
 ## 5. 关键环境事实（新会话必读）
 
