@@ -1392,22 +1392,14 @@ static void PanelTick() {
 }
 
 // 宽度策略（D3）：溢出→按优先级隐藏段；富余→按优先级恢复段。
-// v42 实测修正：MaxWidth 会钳平 DesiredSize，「desired−actual」测不到上限截断；
-// 正确度量 = 可见子项期望宽之和（含 Time 与段间距） − 横板实际宽。
-// v43 实测再修正：构建布局级联中子项 DesiredSize 尚为 0，求和只剩边距 → 幻影溢出
-// 把全部段隐藏且无法自愈（实测 40/40/30/20 恒定、与 capw/字号无关）。故任何可见
-// 子项未测量（desired≤0）时本轮放弃评估，交给后续 SizeChanged/tick。
+// v47/v48 实测定案：本机系统 XAML 对横板 MaxWidth 度量与排布均不兑现（实测
+// maxw=100 而 act=189.7）——宽度预算必须用 host 下发的 capw（显式管理），并用
+// Width（硬约束）做视觉钳制；DesiredSize 度量在级联期可能为 0（跳过评估）。
 static void PanelReflow(wux::Controls::StackPanel const& hp) {
     try {
         if (!g_panelOn) return;
-        // v44：布局稳定门——级联期（新建/每次隐藏都会触发多轮布局）ActualWidth 滞后于
-        // 内容收窄，逐轮评估必然连环误判（v43 实测 act 102→75→54 递减、溢出恒 +40）。
-        // 只在 400ms 无尺寸变化后评估；SizeChanged 仅记脏标记。
-        LONG now = (LONG)GetTickCount(), last = g_lastSizeTick;
-        LONG dt = now - last; if (dt < 0) dt = -dt;
-        if (g_lastSizeTick != 0 && dt < 400) return;
-        double actual = hp.ActualWidth();
-        if (actual <= 0) return;
+        double budget = g_style.capw;
+        if (budget <= 10) return;
         double sum = 0;
         bool measured = true;
         for (int i = 0; i < 4; i++) {
@@ -1426,14 +1418,16 @@ static void PanelReflow(wux::Controls::StackPanel const& hp) {
                 sum += td;
             }
         }
-        double overflow = sum - actual;
+        double target = sum > budget ? budget : sum;
+        try { hp.Width(target); } catch (...) {}  // v48：Width 硬钳制（MaxWidth 被环境无视）
+        double overflow = sum - budget;
         if (overflow > 2) {
             for (int i = 0; i < 4; i++) {         // 先隐藏低优先级（天气最先）
                 if (!g_seg[i] || g_segHidden[i]) continue;
                 if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
                     f.Visibility(wux::Visibility::Collapsed);
                     g_segHidden[i] = true;
-                    log_line("PANEL reflow: hide %s (overflow %.0f, sum %.0f act %.0f)", SEGNAME[i], overflow, sum, actual);
+                    log_line("PANEL reflow: hide %s (sum %.0f > capw %.0f)", SEGNAME[i], sum, budget);
                     return; // 一次一步，等下一轮布局
                 }
             }
