@@ -145,7 +145,9 @@ fn is_hex6(s: &str) -> bool {
 
 /// v51 style 扩展片段：由 liConfig `clockbarStyle` 构建追加点（`,"style":{...}`）。
 /// host 侧先做校验/钳制（order 合法排列、色值 #rrggbb、sizes/gap 钳制），
-/// 非法字段静默丢弃（tap 缺省=现行为，双保险）。无配置/无有效字段 → 空串。
+/// 非法字段静默丢弃（tap 缺省=现行为，双保险）。无配置 → 空串（tap 会话复位兜底）。
+/// v55 定式：配置存在时**全量恒发**（hide/rows/colors/sizes/gap 缺省值也发）——
+/// 「增量字段+缺省不发」必致会话内残留（hide/show/colors/sizes 四次同型实测）。
 pub fn style_ext_json() -> String {
     let Some(cfg) = super::current_style() else {
         return String::new();
@@ -175,7 +177,7 @@ pub fn style_ext_json() -> String {
         f.push(format!("\"order\":\"{}\"", order.join(",")));
     }
 
-    // hide：恒发（v53——tap 空值=全开；缺省会话内残留旧 show，重开最后隐藏段无效）
+    // hide 恒发（v53——tap 空值=全开）
     let hidden: Vec<&str> = SEG_IDS
         .iter()
         .copied()
@@ -183,29 +185,40 @@ pub fn style_ext_json() -> String {
         .collect();
     f.push(format!("\"hide\":\"{}\"", hidden.join(",")));
 
-    // colors：仅合法 #rrggbb；"theme"/非法=不下发（=跟随主题）
+    // rows 恒发（v55 行归属：1=时间行，2=日期行；缺省 weather/festival/term→1，lunar→2）
     for id in SEG_IDS {
-        if let Some(c) = cfg.colors.get(id) {
-            if is_hex6(c) {
+        let d = if id == "lunar" { 2 } else { 1 };
+        let r = match cfg.rows.get(id) {
+            Some(&v) if v == 2 => 2,
+            _ => d,
+        };
+        f.push(format!("\"row_{id}\":{r}"));
+    }
+
+    // colors 恒发（v55——"theme" 兜底，消会话内残留；同 hide 教训定式）
+    for id in SEG_IDS {
+        match cfg.colors.get(id) {
+            Some(c) if is_hex6(c) => {
                 f.push(format!("\"color_{id}\":\"{}\"", c.to_lowercase()));
             }
+            _ => f.push(format!("\"color_{id}\":\"theme\"")),
         }
     }
 
-    // sizes：≠1.0 才下发（钳制 0.5~2.0）
+    // sizes 恒发（v55——缺省 1.00；钳制 0.5~2.0）
     for id in SEG_IDS {
-        if let Some(v) = cfg.sizes.get(id) {
-            let v = clamp_f64(*v, 0.5, 2.0);
-            if (v - 1.0).abs() > f64::EPSILON {
-                f.push(format!("\"size_{id}\":{v:.2}"));
-            }
-        }
+        let v = match cfg.sizes.get(id) {
+            Some(&v) if v.is_finite() => clamp_f64(v, 0.5, 2.0),
+            _ => 1.0,
+        };
+        f.push(format!("\"size_{id}\":{v:.2}"));
     }
 
-    // gap：0~40 钳制
-    if let Some(g) = cfg.gap {
-        f.push(format!("\"gap\":{:.0}", clamp_f64(g, 0.0, 40.0)));
-    }
+    // gap：0~40 钳制（恒发，缺省 10）
+    f.push(format!(
+        "\"gap\":{:.0}",
+        cfg.gap.map(|g| clamp_f64(g, 0.0, 40.0)).unwrap_or(10.0)
+    ));
 
     if f.is_empty() {
         return String::new();

@@ -27,12 +27,13 @@ const configWindowsDefaults = {
   taskbarWidgetEnabled: true,
   /** 注入式任务栏时钟（用户决策 #4：默认开启） */
   clockbarInjectionEnabled: true,
-  /** 注入式时钟段样式（D4 现行为=缺省） */
+  /** 注入式时钟段样式（D4 现行为=缺省；v55 农历默认在日期行） */
   clockbarStyle: {
     order: ['weather', 'festival', 'term', 'lunar', 'time'],
     show: { weather: true, festival: true, term: true, lunar: true, time: true },
     colors: {},
     sizes: {},
+    rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
     gap: 10,
   },
   desktopWindowPosition: null,

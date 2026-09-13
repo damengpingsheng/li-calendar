@@ -62,6 +62,8 @@ export interface ClockbarStyle {
   colors: Record<string, string>;
   /** 段字号倍率（0.5~2.0，缺省 1.0） */
   sizes: Record<string, number>;
+  /** 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2） */
+  rows: Record<string, number>;
   /** 段间距 px（0~40，缺省 10） */
   gap: number;
 }

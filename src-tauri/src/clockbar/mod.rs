@@ -58,14 +58,14 @@ pub fn injection_enabled() -> bool {
 pub fn tap_dll_path() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("lical_clock_tap54.dll");
+            let p = dir.join("lical_clock_tap55.dll");
             if p.exists() {
                 return Some(p);
             }
         }
     }
     let dev = std::path::PathBuf::from(
-        r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap54.dll",
+        r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap55.dll",
     );
     dev.exists().then_some(dev)
 }

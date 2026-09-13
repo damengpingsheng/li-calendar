@@ -29,6 +29,9 @@ pub struct ClockbarStyleConfig {
     /// 段字号倍率（0.5~2.0，作用于 fontscale 之上；缺省 1.0）。
     #[serde(default)]
     pub sizes: std::collections::BTreeMap<String, f64>,
+    /// 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2）。
+    #[serde(default)]
+    pub rows: std::collections::BTreeMap<String, i32>,
     /// 段间距 px（0~40，缺省 10）。
     #[serde(default)]
     pub gap: Option<f64>,

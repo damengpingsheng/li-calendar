@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { Button, ColorPicker, Divider, Form, Slider, Switch, Tag, Tooltip } from 'antd';
+import { Button, ColorPicker, Divider, Form, Select, Slider, Switch, Tag, Tooltip } from 'antd';
 import React, { useEffect, useState } from 'react';
 import { syncValuesConfig } from '../../../sync/base/syncValuesConfig.ts';
 import { useConfigSync } from '../../../sync/configStore.ts';
@@ -15,12 +15,13 @@ const SEG_LABELS: Record<string, string> = {
   time: '时间',
 };
 
-/** 与 configStore 默认值一致的兜底样式（D4 现行为） */
+/** 与 configStore 默认值一致的兜底样式（D4 现行为；v55 农历默认在日期行） */
 const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   order: ['weather', 'festival', 'term', 'lunar', 'time'],
   show: { weather: true, festival: true, term: true, lunar: true, time: true },
   colors: {},
   sizes: {},
+  rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
   gap: 10,
 };
 
@@ -33,11 +34,17 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
   const order = Array.isArray(r.order)
     ? r.order.filter((id) => known.includes(id))
     : [];
+  const rows: Record<string, number> = {};
+  for (const id of ['weather', 'festival', 'term', 'lunar']) {
+    const v = r.rows?.[id];
+    rows[id] = v === 2 ? 2 : id === 'lunar' ? 2 : 1;
+  }
   return {
     order: order.length === 5 ? order : [...d.order],
     show: { ...d.show, ...(r.show ?? {}) },
     colors: { ...(r.colors ?? {}) },
     sizes: { ...(r.sizes ?? {}) },
+    rows,
     gap: typeof r.gap === 'number' ? Math.min(40, Math.max(0, r.gap)) : d.gap,
   };
 }
@@ -189,6 +196,7 @@ const WidgetShowForm: React.FC = () => {
             const shown = clockbarStyle.show[id] ?? true;
             const color = clockbarStyle.colors[id];
             const size = clockbarStyle.sizes[id] ?? 1;
+            const row = id === 'lunar' ? (clockbarStyle.rows[id] ?? 2) : (clockbarStyle.rows[id] ?? 1);
             return (
               <div key={id} style={rowStyle}>
                 <span style={{ width: 64, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
@@ -229,6 +237,22 @@ const WidgetShowForm: React.FC = () => {
                         void updateStyle({ ...clockbarStyle, show });
                       }}
                     />
+                    <Tooltip title="段落所在行：时间行与时间同行，日期行与系统原生日期同行">
+                      <Select
+                        size="small"
+                        value={row === 2 ? 2 : 1}
+                        disabled={!shown}
+                        onChange={(v) => {
+                          const rows = { ...clockbarStyle.rows, [id]: v };
+                          void updateStyle({ ...clockbarStyle, rows });
+                        }}
+                        options={[
+                          { value: 1, label: '时间行' },
+                          { value: 2, label: '日期行' },
+                        ]}
+                        style={{ width: 84 }}
+                      />
+                    </Tooltip>
                     <Tooltip title={color ? '自定义颜色（点击色块修改）' : '跟随主题（点击选择颜色）'}>
                       <ColorPicker
                         size="small"
@@ -272,7 +296,10 @@ const WidgetShowForm: React.FC = () => {
             );
           })}
           <div style={{ padding: '2px 12px 0', color: '#999', fontSize: 12 }}>
-            顺序即任务栏时钟上的从左到右排列；自定义颜色优先于主题，点「跟随主题」恢复自动配色。
+            顺序即任务栏时钟上的从左到右排列；「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行；自定义颜色优先于主题，点「跟随主题」恢复自动配色。
+          </div>
+          <div style={{ padding: '2px 12px 0', color: '#999', fontSize: 12 }}>
+            日期行首位恒为系统原生日期（如「周一 2026-9-14」，含星期几），其余段落按上方顺序追加其后。
           </div>
         </div>
       )}
