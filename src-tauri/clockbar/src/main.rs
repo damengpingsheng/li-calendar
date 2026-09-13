@@ -7,9 +7,17 @@
 //   bkill                    B0：settext2 后硬杀自身，验证 tap 断线自动恢复
 //   bstress <secs>           修改态驻留观察（外部脚本同时打全屏压力/主题切换）
 //   bwatch <secs>            纯观察模式（不改文本），记录 ready/lost/gen 事件
+//   ddata [y m d]            D 阶段：打印某日 tyme4rs 四段数据+天气实况探针
+//   dverify <file>           D 阶段：批量打印 y-m-d|lunar|term|festival（对照 lunar-typescript）
+//   dhold <secs> [style]     D 阶段主测试：真数据会话（日界翻转+天气 30min 刷新）
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
+
+mod data;
+mod weather;
+
+use tyme4rs::tyme::Culture; // LegalHoliday/月名/节气名 get_name()
 
 type H = *mut core::ffi::c_void;
 type MsgQ = Arc<Mutex<Vec<String>>>;
@@ -273,6 +281,18 @@ fn chrono_lite() -> String {
     }
 }
 
+/// 本地日期 (年, 月, 日)（日界翻转判定用）
+fn local_ymd() -> (i32, u32, u32) {
+    unsafe {
+        #[repr(C)]
+        struct ST { y: u16, mo: u16, dow: u16, d: u16, h: u16, mi: u16, s: u16, ms: u16 }
+        extern "system" { fn GetLocalTime(st: *mut ST); }
+        let mut st = ST { y: 0, mo: 0, dow: 0, d: 0, h: 0, mi: 0, s: 0, ms: 0 };
+        GetLocalTime(&mut st);
+        (st.y as i32, st.mo as u32, st.d as u32)
+    }
+}
+
 /// B 会话建立：pipe 服务端已在 main 建立；等 loaded（若 1.5s 内无则钩子注入全新 explorer），
 /// 然后 advise → 等 ready（时钟链定位）。
 /// 注意：ready 在 Advise 重放时即刻发出，而 tap 的 advise ack 固定 Sleep(200) 后才发——
@@ -373,7 +393,11 @@ fn hook_inject(msgs: &MsgQ) -> Result<H, String> {
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("help");
-    let msgs = pipe_server();
+    // 纯计算类子命令不需要 pipe（且不与驻留会话抢单实例管道 gle=231）
+    let msgs = match cmd {
+        "ddata" | "dverify" => Arc::new(Mutex::new(Vec::new())),
+        _ => pipe_server(),
+    };
 
     match cmd {
         "cycle" => {
@@ -609,6 +633,136 @@ fn main() {
                 Some(l) => println!("[probe] {l}"),
                 None => { eprintln!("[probe] no {cmd} ack"); std::process::exit(1); }
             }
+        }
+        "dprops" => {
+            // D 诊断：建立会话后只读回 Time 元素属性链（GPVC，含 Text 当前值）。
+            // 用于判别「时间显示冻结」是 VM 停写（Text 停在旧值）还是渲染层冻结
+            // （Text 是新值而屏幕旧值）。零写入。
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            b_props(&msgs);
+        }
+        "ddata" => {
+            // 打印某日 tyme4rs 四段数据（默认今天）+ 天气实况探针
+            let (y, m, d) = match (args.get(2), args.get(3), args.get(4)) {
+                (Some(y), Some(m), Some(d)) => (
+                    y.parse().unwrap_or(0), m.parse().unwrap_or(0), d.parse().unwrap_or(0)),
+                _ => local_ymd(),
+            };
+            let dd = data::compute_day(y, m, d, "");
+            println!("date  : {y}-{m:02}-{d:02}");
+            println!("lunar : {}", dd.lunar);
+            println!("term  : |{}|", dd.term.trim());
+            println!("fest  : |{}|", dd.festival.trim());
+            let city = weather::resolve_cityid();
+            println!("city  : {city}");
+            match weather::fetch_now(&city) {
+                Ok(w) => println!("wx    : {} (temp={} text={})", w.display(), w.temp, w.text),
+                Err(e) => println!("wx    : ERR {e}"),
+            }
+        }
+        "dverify" => {
+            // 批量打印敏感日期数据（TSV：y-m-d|lunar|term|festival），供与
+            // 前端 lunar-typescript 脚本输出 diff 对照（D 阶段验收门槛 1）
+            let file = args.get(2).cloned().unwrap_or_default();
+            let dates: Vec<(i32, u32, u32)> = if file.is_empty() {
+                eprintln!("usage: dverify <dates file, lines 'y,m,d'>");
+                std::process::exit(1);
+            } else {
+                let txt = std::fs::read_to_string(&file).unwrap_or_default();
+                txt.lines()
+                    .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+                    .filter_map(|l| {
+                        let p: Vec<&str> = l.split(',').map(|s| s.trim()).collect();
+                        Some((p.first()?.parse().ok()?, p.get(1)?.parse().ok()?, p.get(2)?.parse().ok()?))
+                    })
+                    .collect()
+            };
+            for (y, m, d) in dates {
+                let solar = tyme4rs::tyme::solar::SolarDay::from_ymd(y as isize, m as usize, d as usize);
+                // 第四列=法定假日/调休（tyme LegalHoliday，注入时钟不显示，仅供对照
+                // lunar-typescript HolidayUtil 的调休数据）
+                let hol = tyme4rs::tyme::holiday::LegalHoliday::from_ymd(y as isize, m as usize, d as usize);
+                let hol_text = hol
+                    .map(|h| format!("{}{}", if h.is_work() { "班" } else { "休" }, h.get_name()))
+                    .unwrap_or_default();
+                println!("{y}-{m:02}-{d:02}|{}|{}|{}|{}",
+                    data::lunar_text(&solar), data::term_text(&solar), data::festival_text(&solar), hol_text);
+            }
+        }
+        "dhold" => {
+            // D 阶段主测试会话：真数据（tyme4rs+天气）c1set 下发 + 日界翻转 +
+            // 天气 30min 刷新 + 心跳保持。面板断开时自动恢复（B0 语义）。
+            // 可选 args[3]=style JSON 片段（D4 定稿用，如 '"fontscale":0.55,...'）。
+            let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(600);
+            let style = args.get(3).cloned().unwrap_or_else(|| {
+                "\"fontscale\":0.55,\"segmaxw\":170,\"capw\":620,\"input\":1".into()
+            });
+            if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
+            println!("[probe] DHOLD starting data chain (weather placeholder first, real wx after fetch)");
+            let tx2 = std::thread::spawn(move || {
+                let mut cur_date = local_ymd();
+                let mut wx = "--".to_string(); // 降级占位（断网/坏数据同款）
+                let mut last_wx = std::time::Instant::now() - std::time::Duration::from_secs(1800);
+                let mut last_sent = String::new();
+                loop {
+                    let (y, m, d) = local_ymd();
+                    if (y, m, d) != cur_date {
+                        println!("[{0}][data] DAY ROLLOVER {1}-{2:02}-{3:02} -> {y}-{m:02}-{d:02}",
+                            chrono_lite(), cur_date.0, cur_date.1, cur_date.2);
+                        cur_date = (y, m, d);
+                    }
+                    if last_wx.elapsed() >= std::time::Duration::from_secs(30 * 60) {
+                        last_wx = std::time::Instant::now();
+                        let city = weather::resolve_cityid();
+                        if city.is_empty() {
+                            eprintln!("[data] weather: no cityid — degraded to placeholder");
+                            wx = "--".into();
+                        } else {
+                            match weather::fetch_now(&city) {
+                                Ok(w) => {
+                                    let disp = w.display();
+                                    if disp.is_empty() { wx = "--".into(); } else { wx = disp; }
+                                    println!("[{}][data] weather refreshed: {wx}", chrono_lite());
+                                }
+                                Err(e) => {
+                                    eprintln!("[data] weather fetch failed ({e}) — degraded to placeholder");
+                                    wx = "--".into();
+                                }
+                            }
+                        }
+                    }
+                    let dd = data::compute_day(y, m, d, &wx);
+                    let line = dd.c1set_json(&style);
+                    if line != last_sent {
+                        if !pipe_write(format!("c1set {line}").as_bytes()) {
+                            eprintln!("[data] c1set write failed (pipe gone)");
+                            break;
+                        }
+                        last_sent = line;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1000));
+                }
+            });
+            let _ = tx2;
+            println!("[probe] DHOLD holding session for {secs}s (t0={})", chrono_lite());
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            let mut last_ping = std::time::Instant::now() - std::time::Duration::from_secs(10);
+            let mut seen = 0usize;
+            while std::time::Instant::now() < deadline {
+                let lines: Vec<String> = {
+                    let Ok(q) = msgs.lock() else { break };
+                    if seen < q.len() { let l = q[seen..].to_vec(); seen = q.len(); l } else { Vec::new() }
+                };
+                for l in lines {
+                    println!("[{}][hold] tap: {}", chrono_lite(), l);
+                }
+                if last_ping.elapsed() >= std::time::Duration::from_secs(5) {
+                    pipe_write(b"ping");
+                    last_ping = std::time::Instant::now();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            println!("[probe] DHOLD done; exiting (disconnect triggers tap auto-restore)");
         }
         "c1kill" => {
             // B0 面板路径：c1set 建面板后硬杀自身——验证 tap 断线自动摘面板+恢复原生
