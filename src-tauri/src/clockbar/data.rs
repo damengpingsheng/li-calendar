@@ -123,8 +123,9 @@ pub fn local_ymd() -> (i32, u32, u32) {
     (st.year as i32, st.month as u32, st.day as u32)
 }
 
-/// 生产默认样式（D4 定稿：fontscale 0.55 / segmaxw 170 / capw 620 / input 1）。
-pub const DEFAULT_STYLE: &str = "\"fontscale\":0.55,\"segmaxw\":170,\"capw\":620,\"input\":1";
+/// 生产默认样式（v56：fontscale 1.0=段字号与所在行系统文本对齐（行感知基准，
+/// 见 tap v56 注）；segmaxw 170 / capw 620 / input 1 为 D4 定稿）。
+pub const DEFAULT_STYLE: &str = "\"fontscale\":1.0,\"segmaxw\":170,\"capw\":620,\"input\":1";
 
 /// S 阶段段 id 与 tap SEGNAME 对齐；time 恒显不参与 show/colors/sizes。
 const SEG_IDS: [&str; 4] = ["weather", "festival", "term", "lunar"];

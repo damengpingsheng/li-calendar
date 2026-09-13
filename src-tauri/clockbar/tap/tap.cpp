@@ -1,5 +1,8 @@
 // lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
 // v49/v50=E，v51=S 阶段时钟段自定义）
+// v56 变更（用户实测驱动：自定义段字体明显小于系统文本）：段字号行感知对齐——
+//   时间行段基准=Time.FontSize、日期行段基准=原生 Date.FontSize（只读，与所在行
+//   系统文本同尺寸），fontscale 全局倍率缺省 0.55→1.0（host DEFAULT_STYLE 同步）。
 // v55 变更（用户澄清信息架构驱动：农历/日期=补充而非替代，保留原生时间+日期+星期）：
 //   ① Date 不再摘离——原生日期行回归第二行（v46 的摘离是「藏它」时代的解；显示它时
 //      系统写 Visibility 与我们同向，拉锯不存在）。Date 文本/可见性/配色全系统管理零写入；
@@ -1156,6 +1159,7 @@ static wfnd::IInspectable g_hpanelRef{ nullptr };   // 自建横板（含 4 段+
 static wfnd::IInspectable g_hpanel2Ref{ nullptr };  // v55 第二行横板（Date+日期行段）
 static wfnd::IInspectable g_dateWrapRef{ nullptr }; // v55 Date 的自建包装 Border（对齐用，零写 Date 属性）
 static wfnd::IInspectable g_timeRef{ nullptr };     // 原生 Time（被 reparent，VM 持续写其 Text）
+static double g_dateFontSize = 0;                   // v56 原生 Date 字号（只读；0=未知→回退 Time 字号）
 static wfnd::IInspectable g_spRef{ nullptr }, g_dateRef{ nullptr }, g_contRef{ nullptr };
 static double             g_segDesired[4] = { 0,0,0,0 };
 static bool               g_segHidden[4] = { false,false,false,false };
@@ -1189,11 +1193,15 @@ static bool SegTextBlank(int i) {
 static bool SegWanted(int i) {
     return g_style.show[i] && !SegTextBlank(i);
 }
-// 段外观（字号/字体/颜色）：字号=Time.FontSize*fontscale*size[i]；颜色=自定义色优先，
-// theme 档（0）拷 Time 前景。仅作用于自建段（时间段原生样式零写入——S0 定案）。
+// 段外观（字号/字体/颜色）。字号（v56 行感知对齐）：时间行段基准=Time.FontSize、
+// 日期行段基准=原生 Date.FontSize（各与所在行的系统文本对齐，用户实测 0.55 倍明显
+// 偏小后定案）；再乘 fontscale（全局倍率，缺省 1.0）与 size[i]（段倍率）。
+// 颜色=自定义色优先，theme 档（0）拷 Time 前景。仅作用于自建段（原生元素零写入）。
 static void ApplySegLook(wux::Controls::TextBlock const& seg, int i, wux::Controls::TextBlock const& tb) {
     double sz = g_style.sizes[i] > 0 ? g_style.sizes[i] : 1.0;
-    try { seg.FontSize(tb.FontSize() * g_style.fontscale * sz); } catch (...) {}
+    double base = tb.FontSize();
+    if (g_style.rows[i] == 2 && g_dateFontSize > 0) base = g_dateFontSize;
+    try { seg.FontSize(base * g_style.fontscale * sz); } catch (...) {}
     try { seg.FontFamily(tb.FontFamily()); } catch (...) {}
     try { seg.FontWeight(tb.FontWeight()); } catch (...) {}
     try {
@@ -1960,6 +1968,15 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                 log_line("PANEL build: Date wrapped (native date row kept, idx %d)", g_snapDateIndex);
             }
         }
+        // v56：只读原生 Date 字号（日期行段基准，与系统日期文本对齐）；只读不写
+        if (g_dateRef) {
+            if (auto d = g_dateRef.try_as<wux::Controls::TextBlock>()) {
+                try {
+                    double dfs = d.FontSize();
+                    if (dfs > 0) g_dateFontSize = dfs;
+                } catch (...) {}
+            }
+        }
     }
 
     // 4 段（v51：wanted 段新建/更新文本与外观；unwanted 段先摘除再弃引用）
@@ -2043,9 +2060,9 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                                  k ? "|" : "", item);
             }
         }
-        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f (timeIdx=%d dateIdx=%d)",
+        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f timeFS=%.0f dateFS=%.1f (timeIdx=%d dateIdx=%d)",
                  rebuildAfterGen ? "rebuild" : "build", gen, ordA, s0, s1, s2, s3,
-                 g_style.fontscale, g_style.gap, g_style.capw, timeIdx, dateIdx);
+                 g_style.fontscale, g_style.gap, g_style.capw, tb.FontSize(), g_dateFontSize, timeIdx, dateIdx);
     }
 
     // C2 输入拦截 Border（盖住时钟内容区，截获指针输入）
