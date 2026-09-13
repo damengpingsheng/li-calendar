@@ -41,11 +41,11 @@ type InitXamlDiagEx = unsafe extern "system" fn(
     wszTAPDllName: *const u16, tapClsid: *const u8, wszInitializationData: *const u16,
 ) -> i32;
 
-const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b46"; // 与 tap.cpp TAPVER 版本化一致
+const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b48"; // 与 tap.cpp TAPVER 版本化一致
 const SDK_DLL: &str = r"D:\environment\WindowsKits\10\bin\x64\XamlDiagnostics\xamldiagnostics.dll";
 const WUX_DLL: &str = "Windows.UI.Xaml.dll"; // 系统目录，POC 证实其导出 InitializeXamlDiagnosticsEx
-const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap46.dll";
-const TAP_VER: &str = "46";
+const TAP_DLL: &str = r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap48.dll";
+const TAP_VER: &str = "48";
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -640,6 +640,14 @@ fn main() {
                 match wait_for(&msgs, |l| l.contains(r#""t":"c1set""#), 15_000) {
                     Some(l) => println!("[probe] {l}"),
                     None => { eprintln!("[probe] no c1set ack"); std::process::exit(1); }
+                }
+                // args[4]=="diag"：c1set 后 5s 自动跟一次 c0tree（读回横板实时属性）
+                if args.get(4).map(|s| s.as_str()) == Some("diag") {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    if pipe_write(b"c0tree") {
+                        let _ = wait_for(&msgs, |l| l.contains(r#""t":"c0tree""#), 15_000);
+                        println!("[probe] c0tree done — see tap log");
+                    }
                 }
             }
             println!("[probe] C1HOLD holding session for {secs}s (t0={})", chrono_lite());

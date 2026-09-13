@@ -15,7 +15,7 @@
   - **宽度策略（D3）落地**：capw+segmaxw+优先级隐藏（天气→节日→节气→农历）；**血泪连环（v41~v45，用户实测验收期暴露）：MaxWidth 钳平 DesiredSize→度量须用子项期望宽之和；级联期子项未测量→跳过评估；级联期 ActualWidth 滞后→400ms 稳定门；XAML DesiredSize 已含 Margin→求和不得再加边距（幻影溢出恒等于边距和、与 capw/字号无关=定位特征）**；v45 修正后默认零隐藏五段全显；真实约束下的优先级隐藏待用修正度量重测（capw 压到内容宽以下复现）；
   - 主题跟随（ActualThemeChanged 重拷 Time 前景）实测 ✓；僵尸检测（GetParent==null→Unadvise/Advise 重同步）+心跳兜底（35s）机制就位；
   - 维护 tick 实测系统会周期性复活 Date 可见性（含全屏进出期每秒一次），tick 每秒纠回；
-- **工件**：`src-tauri/clockbar/`（tap v45 = tap.cpp TAPVER 版本化；host 新增 c0tree/c0ins/c0meas/c0rm/c0add/ctest/c1set/c1free/c1hold/c1tap/c1kill；c1hold=持久会话+5s 心跳，是 C/D 阶段测试的主入口）；脚本：`D:\agents_tmp\c_stage_20260913\`（cshot/cburst 加宽截图、cclick 真实点击、chover 悬停、ctheme/cautohide/ckeys 场景脚本）+ 既有 bshot/bburst/bstress_fs/btheme；证据：`clockbar_tap_b31~b46.log`、`cshot_*.png`、hold*.log；
+- **工件**：`src-tauri/clockbar/`（tap v45 = tap.cpp TAPVER 版本化；host 新增 c0tree/c0ins/c0meas/c0rm/c0add/ctest/c1set/c1free/c1hold/c1tap/c1kill；c1hold=持久会话+5s 心跳，是 C/D 阶段测试的主入口）；脚本：`D:\agents_tmp\c_stage_20260913\`（cshot/cburst 加宽截图、cclick 真实点击、chover 悬停、ctheme/cautohide/ckeys 场景脚本）+ 既有 bshot/bburst/bstress_fs/btheme；证据：`clockbar_tap_b31~b48.log`、`cshot_*.png`、hold*.log；
 - A/B 阶段定案不变（通道=钩子引导进程内初始化；路线 B；七条血泪+血泪#6 完整版全数内置 v45）；
 - **遗留（D/E 处理）**：①低分辨率补测（修 cres.ps1 [ref] 语义）②DPI 变更触发器随 E 模板压测 ③时钟按钮键盘唤起飞出未拦截 ④触摸未测 ⑤reflow show 路径未单独构造场景 ⑥v33 AppHangB1 一次归因未定案（v34 后未复现）⑦树静默替换+引擎零事件：僵尸机制待自然触发验证 ⑧explorer 重启重注入（watch.rs，E）；注册表时间格式 H:mm 不动；
 - 旧覆盖层 R9.4 仍是部署版（互斥开关 E 阶段接入；C 阶段测试期间 liCalendar.exe 全程退出）。
@@ -31,7 +31,7 @@
 
 ## 1. 一句话现状
 
-第三代注入路线 **C 阶段完成**：五段静态面板（天气|节日|节气|农历|时间，v46 结构=自建横板+Date 摘离+reparent 原生 Time，零原生布局写入）+ 输入/tooltip 等价性全达成。下一阶段 D：数据接入（tyme4rs+天气）。旧覆盖层（R1~R9.4）维持已部署版本不动。
+第三代注入路线 **C 阶段完成**：五段静态面板（天气|节日|节气|农历|时间，v48 结构=自建横板+Date 摘离+Width 硬钳制+reparent 原生 Time，零原生布局写入）+ 输入/tooltip 等价性全达成。下一阶段 D：数据接入（tyme4rs+天气）。旧覆盖层（R1~R9.4）维持已部署版本不动。
 
 ## 2. R7~R8 速查（详见总结文档 §3）
 
@@ -74,7 +74,7 @@
 
 ## 4. 下一步（恢复时）
 
-1. **D 阶段（数据接入）**：按方案 §5 D 行——tyme4rs（锁版本+抽查 20 个敏感日期对照 lunar-typescript）接 时间/农历/节气/节日 真数据（替换 c1set 假数据链路），然后天气（weather.com.cn JS 赋值脚本解析，新实现）。数据链：host data.rs → `c1set` 行 JSON → tap（协议已通，v46 实测）。
+1. **D 阶段（数据接入）**：按方案 §5 D 行——tyme4rs（锁版本+抽查 20 个敏感日期对照 lunar-typescript）接 时间/农历/节气/节日 真数据（替换 c1set 假数据链路），然后天气（weather.com.cn JS 赋值脚本解析，新实现）。数据链：host data.rs → `c1set` 行 JSON → tap（协议已通，v48 实测）。
 2. 开发迭代纪律（A/B/C 血泪全量）：改 DLL 必须 TAPVER 递增 + 重启 explorer 清驻留 + **新鲜 explorer 沉降期 ~4.5min**；批处理纯 ASCII+`/utf-8`；树判别式改动先过 sim.cpp 回放仿真；回调内零引擎调用零锁等待；**UI 线程零管道 I/O**（tap 事件走 tapq 发送线程）；**tap/host 两侧读循环都必须 PeekNamedPipe 轮询**；**对原生元素零布局属性写入**（面板=v34 reparent 结构，勿回退到改 Orientation）；溢出度量用子项期望宽之和（MaxWidth 钳 DesiredSize）。
 3. 构建：`cd src-tauri/clockbar/tap && TAPVER=N cmd //c build_tap.cmd`（DLL；注意 cppwinrt 头需 `#pragma push_macro("GetCurrentTime")` 包裹 + winrt/Windows.Foundation.Collections.h）+ `cmd //c D:\agents_tmp\c_stage_20260913\build_host.cmd`（host，MSVC 环境按项目 AGENTS.md）。测试主入口：`c1hold <secs> <json>`（持久会话+心跳）；场景脚本 cshot/cclick/chover/ctheme/cautohide/ckeys（会话目录）；B 阶段子命令 btest/bkill/bstress/bwatch/brapid 保留可用。
 4. E~F 阶段见方案 §5；C 遗留清单（低分辨率补测等 7 项）见方案 §3 C 小节。
