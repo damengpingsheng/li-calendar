@@ -16,7 +16,8 @@
   - 主题跟随（ActualThemeChanged 重拷 Time 前景）实测 ✓；僵尸检测（GetParent==null→Unadvise/Advise 重同步）+心跳兜底（35s）机制就位；
   - 维护 tick 实测系统会周期性复活 Date 可见性（含全屏进出期每秒一次），tick 每秒纠回；
 - **工件**：`src-tauri/clockbar/`（tap v45 = tap.cpp TAPVER 版本化；host 新增 c0tree/c0ins/c0meas/c0rm/c0add/ctest/c1set/c1free/c1hold/c1tap/c1kill；c1hold=持久会话+5s 心跳，是 C/D 阶段测试的主入口）；脚本：`D:\agents_tmp\c_stage_20260913\`（cshot/cburst 加宽截图、cclick 真实点击、chover 悬停、ctheme/cautohide/ckeys 场景脚本）+ 既有 bshot/bburst/bstress_fs/btheme；证据：`clockbar_tap_b31~b48.log`、`cshot_*.png`、hold*.log；
-- A/B 阶段定案不变（通道=钩子引导进程内初始化；路线 B；七条血泪+血泪#6 完整版全数内置 v45）；
+- A/B 阶段定案不变（通道=钩子引导进程内初始化；路线 B；七条血泪+血泪#6 完整版全数内置 v48）；
+- **C 阶段补验闭环（2026-09-13 下午，用户 PotPlayer 手测无问题后）**：v48 上全屏×30 面板在场 gen 稳定 ✓、真实约束（capw=100）优先级隐藏时间保住 ✓、B0 硬杀 Date 原位回插 ✓、用户真实全屏手测 ✓——C 阶段全部验收项+补验项闭合，正式进 D；
 - **遗留（D/E 处理）**：①低分辨率补测（修 cres.ps1 [ref] 语义）②DPI 变更触发器随 E 模板压测 ③时钟按钮键盘唤起飞出未拦截 ④触摸未测 ⑤reflow show 路径未单独构造场景 ⑥v33 AppHangB1 一次归因未定案（v34 后未复现）⑦树静默替换+引擎零事件：僵尸机制待自然触发验证 ⑧explorer 重启重注入（watch.rs，E）；注册表时间格式 H:mm 不动；
 - 旧覆盖层 R9.4 仍是部署版（互斥开关 E 阶段接入；C 阶段测试期间 liCalendar.exe 全程退出）。
 
