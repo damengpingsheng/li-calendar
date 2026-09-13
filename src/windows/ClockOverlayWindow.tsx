@@ -8,10 +8,13 @@ import { fetchWeatherText } from '../http/weather';
 
 dayjs.locale('zh-cn');
 
-/** 覆盖层外观（后端实采任务栏底色 + 对比前景色，hex）。 */
+/** 覆盖层外观（后端实采任务栏底色 + 对比前景色，hex）。seq 为后端推送序号；
+ *  bgLeft 为渐变左端（R8.5：任务栏底色横向渐变，双端复现）。 */
 interface ClockOverlayAppearance {
   bg: string;
   fg: string;
+  seq?: number;
+  bgLeft?: string;
 }
 
 /**
@@ -36,9 +39,18 @@ function ClockOverlayWindow(): React.JSX.Element {
   useEffect(() => {
     const timer = setInterval(() => setNow(dayjs()), 1000);
     const media = window.matchMedia('(prefers-color-scheme: dark)');
+    // R8 seq 单调守卫：后端事件与初始 invoke 响应可能乱序到达（响应晚于事件），
+    // 序号低于已应用的值时丢弃，避免新色被旧值覆盖
+    let appliedSeq = 0;
+    const applyAppearance = (next: ClockOverlayAppearance) => {
+      const s = next.seq ?? 0;
+      if (s < appliedSeq) return;
+      appliedSeq = s;
+      setAppearance(next);
+    };
     const loadAppearance = () => {
       invoke<ClockOverlayAppearance>('clock_overlay_appearance')
-        .then(setAppearance)
+        .then(applyAppearance)
         .catch(() => {});
     };
     const onChange = (event: MediaQueryListEvent) => {
@@ -48,14 +60,20 @@ function ClockOverlayWindow(): React.JSX.Element {
     loadAppearance();
     media.addEventListener('change', onChange);
     // R7.5：后端在遮盖展开/收缩后重采样，色变时推送（任务栏底色随亚克力
-    // /壁纸动态变化，静态采样会留色差——遮盖边界全程可见）
-    const unlisten = listen<ClockOverlayAppearance>('clock-appearance', (event) => {
-      setAppearance(event.payload);
+    // /壁纸动态变化，静态采样会留色差——遮盖边界全程可见）。
+    // R8.5：attach 即刻的首针事件可能早于本 listen 注册（webview 加载竞态），
+    // 注册完成后必须重拉一次 invoke，否则错过即永缺（后续 d<2 不再推送）。
+    let dispose: (() => void) | undefined;
+    void listen<ClockOverlayAppearance>('clock-appearance', (event) => {
+      applyAppearance(event.payload);
+    }).then((fn) => {
+      dispose = fn;
+      loadAppearance();
     });
     return () => {
       clearInterval(timer);
       media.removeEventListener('change', onChange);
-      void unlisten.then((fn) => fn());
+      dispose?.();
     };
   }, []);
 
@@ -66,7 +84,10 @@ function ClockOverlayWindow(): React.JSX.Element {
   // 必须真的改动像素——1px 点在两个几乎相同的颜色间切换（不可感知）。
   const [keepaliveTick, setKeepaliveTick] = useState(0);
   useEffect(() => {
-    const keepalive = setInterval(() => setKeepaliveTick((t) => t + 1), 200);
+    // R8.9：200ms→100ms——退出瞬态的几何抖动会让 WebView 表面短暂呈现
+    // 透明帧（原生时钟透出，录屏 f10 帧实证），更密的强制重绘把透明帧
+    // 时长减半
+    const keepalive = setInterval(() => setKeepaliveTick((t) => t + 1), 100);
     return () => clearInterval(keepalive);
   }, []);
   const keepaliveColor = keepaliveTick % 2 === 0 ? 'rgba(0,0,0,0.004)' : 'rgba(0,0,0,0.008)';
@@ -92,7 +113,19 @@ function ClockOverlayWindow(): React.JSX.Element {
   const weekText = now.format('dddd');
 
   const color = appearance?.fg ?? (isDark ? '#ffffff' : '#1a1a1a');
-  const backgroundColor = appearance?.bg ?? (isDark ? '#202020' : '#f3f3f3');
+  const flatBackground = appearance?.bg ?? (isDark ? '#202020' : '#f3f3f3');
+  const bgLeft = appearance?.bgLeft;
+  // R8.5/R9.0：任务栏底色存在横向渐变（壁纸透出）——双端采样（左列=窗口左
+  // 邻、右列=右邻）+ 渐变 100% 映射。R9.0 平移式遮盖后**窗口尺寸恒定**
+  // （遮盖=等宽平移，零 resize），100% 映射不再随窗口宽度重映射——
+  // R8.8 的屏幕坐标锚定（198px/right -8px）随之废弃（且其 CSS 像素换算
+  // 在 175% DPI 下本就不准）。
+  const hasGradient = !!bgLeft && bgLeft !== flatBackground;
+  const background: React.CSSProperties = hasGradient
+    ? {
+        backgroundImage: `linear-gradient(90deg, ${bgLeft}, ${flatBackground})`,
+      }
+    : { backgroundColor: flatBackground };
   const fontFamily =
     "'Microsoft YaHei UI','Microsoft YaHei','Segoe UI',system-ui,sans-serif";
 
@@ -103,7 +136,7 @@ function ClockOverlayWindow(): React.JSX.Element {
         height: '100vh',
         width: '100vw',
         boxSizing: 'border-box',
-        backgroundColor,
+        ...background,
         display: 'flex',
         flexDirection: 'column',
         justifyContent: 'center',

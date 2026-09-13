@@ -17,11 +17,17 @@ pub use windows::relocate_clock_overlay_endorsed;
 #[cfg(windows)]
 pub use windows::clock_overlay_appearance_colors;
 #[cfg(windows)]
+pub use windows::clock_overlay_appearance_seq;
+#[cfg(windows)]
 pub use windows::clock_overlay_note_probe;
 #[cfg(windows)]
 pub use windows::clock_overlay_reprobe_interval_ms;
 #[cfg(windows)]
 pub use windows::ensure_clock_overlay_attached;
+#[cfg(windows)]
+pub use windows::hide_cover_sliver;
+#[cfg(windows)]
+pub use windows::overlay_diag_dump;
 #[cfg(windows)]
 pub use windows::update_clock_overlay_visibility;
 #[cfg(windows)]
