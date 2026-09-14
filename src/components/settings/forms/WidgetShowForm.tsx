@@ -235,7 +235,16 @@ const WidgetShowForm: React.FC = () => {
             const row = id === 'lunar' ? (clockbarStyle.rows[id] ?? 2) : (clockbarStyle.rows[id] ?? 1);
             return (
               <div key={id} style={rowStyle}>
-                <span style={{ width: 64, display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+                <span
+                  style={{
+                    width: 96,
+                    flexShrink: 0,
+                    display: 'inline-flex',
+                    alignItems: 'center',
+                    gap: 4,
+                    whiteSpace: 'nowrap',
+                  }}
+                >
                   <Button
                     size="small"
                     type="text"
