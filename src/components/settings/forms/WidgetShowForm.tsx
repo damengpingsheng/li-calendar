@@ -209,6 +209,7 @@ const WidgetShowForm: React.FC = () => {
       </Form>
 
       {isWindows && (
+        <>
         <ClockbarStyleErrorBoundary>
         <div style={{ marginTop: 8 }}>
           <Divider plain style={{ margin: '8px 0' }}>
@@ -343,14 +344,16 @@ const WidgetShowForm: React.FC = () => {
               </div>
             );
           })}
-          <div style={{ padding: '2px 12px 0', color: '#999', fontSize: 12 }}>
-            顺序即任务栏时钟上的从左到右排列；「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行；自定义颜色优先于主题，点「跟随主题」恢复自动配色。
-          </div>
-          <div style={{ padding: '2px 12px 0', color: '#999', fontSize: 12 }}>
-            日期行首位恒为系统原生日期（如「周一 2026-9-14」，含星期几），其余段落按上方顺序追加其后。
+          <div style={{ padding: '6px 12px 0', color: '#999', fontSize: 12, lineHeight: 1.9 }}>
+            <div>顺序即任务栏时钟上的从左到右排列。</div>
+            <div>「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行。</div>
+            <div>日期行首位恒为系统原生日期（如「周一 2026-9-14」，含星期几），其余段落按上方顺序追加其后。</div>
+            <div>自定义颜色优先于主题，点「跟随主题」恢复自动配色。</div>
           </div>
         </div>
         </ClockbarStyleErrorBoundary>
+        <Divider style={{ margin: '20px 0 4px' }} />
+        </>
       )}
     </div>
   );
