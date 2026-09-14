@@ -352,7 +352,7 @@ const WidgetShowForm: React.FC = () => {
           </div>
         </div>
         </ClockbarStyleErrorBoundary>
-        <Divider style={{ margin: '20px 0 4px' }} />
+        <Divider style={{ margin: '36px 0 12px' }} />
         </>
       )}
     </div>
