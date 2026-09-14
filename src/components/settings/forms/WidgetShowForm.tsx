@@ -1,10 +1,38 @@
 import { invoke } from '@tauri-apps/api/core';
 import { Button, ColorPicker, Divider, Form, Select, Slider, Switch, Tag, Tooltip } from 'antd';
-import React, { useEffect, useState } from 'react';
+import React, { Component, useEffect, useState } from 'react';
 import { syncValuesConfig } from '../../../sync/base/syncValuesConfig.ts';
 import { useConfigSync } from '../../../sync/configStore.ts';
 import type { ClockbarStyle } from '../../../sync/type/configTypes.ts';
 import { isDesktop, isWindows } from '../../../utils/platform.ts';
+
+/** 时钟段样式分组的错误边界：渲染异常时显示错误信息而不是白屏整页 */
+class ClockbarStyleErrorBoundary extends Component<{ children: React.ReactNode }, { error: Error | null }> {
+  state = { error: null as Error | null };
+  static getDerivedStateFromError(error: Error) {
+    return { error };
+  }
+  componentDidCatch(error: Error) {
+    console.error('时钟段样式分组渲染异常:', error);
+  }
+  render() {
+    if (this.state.error) {
+      return (
+        <div style={{ padding: 12, color: '#c00', fontSize: 12 }}>
+          时钟段样式面板渲染异常：{this.state.error.message}
+          <Button
+            size="small"
+            type="link"
+            onClick={() => this.setState({ error: null })}
+          >
+            重试
+          </Button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 /** 段 id → 中文名（与后端 SEG_IDS/time 对齐） */
 const SEG_LABELS: Record<string, string> = {
@@ -69,8 +97,9 @@ const WidgetShowForm: React.FC = () => {
     return null;
   }
 
-  /** 统一提交：后端命令即时生效（数据线程 ≤1s 下发）+ liConfig 持久化 */
-  const updateStyle = async (next: ClockbarStyle): Promise<void> => {
+  /** 统一提交：后端命令即时生效（数据线程 ≤1s 下发）+ liConfig 持久化。
+   * 仅离散操作（开关/选择/取色完成）调用；滑条拖动走 preview+onChangeComplete */
+  const commitStyle = async (next: ClockbarStyle): Promise<void> => {
     setClockbarStyle(next);
     try {
       await invoke('set_clockbar_style', { style: next });
@@ -78,6 +107,11 @@ const WidgetShowForm: React.FC = () => {
       console.error('设置时钟段样式失败:', err);
     }
     await syncValuesConfig({ clockbarStyle: next });
+  };
+  /** 滑条拖动中的本地预览：只更新 state，不触发 invoke/持久化/跨窗口广播
+   * （v58：拖动中高频提交曾致 262 次洪泛+设置页白屏） */
+  const previewStyle = (next: ClockbarStyle): void => {
+    setClockbarStyle(next);
   };
 
   // 处理桌面组件开关变化
@@ -122,7 +156,7 @@ const WidgetShowForm: React.FC = () => {
     if (target < 0 || target >= clockbarStyle.order.length) return;
     const order = [...clockbarStyle.order];
     [order[idx], order[target]] = [order[target], order[idx]];
-    void updateStyle({ ...clockbarStyle, order });
+    void commitStyle({ ...clockbarStyle, order });
   };
 
   const rowStyle: React.CSSProperties = {
@@ -175,6 +209,7 @@ const WidgetShowForm: React.FC = () => {
       </Form>
 
       {isWindows && (
+        <ClockbarStyleErrorBoundary>
         <div style={{ marginTop: 8 }}>
           <Divider plain style={{ margin: '8px 0' }}>
             时钟段样式（注入式时钟开启时生效）
@@ -186,7 +221,8 @@ const WidgetShowForm: React.FC = () => {
               max={40}
               step={1}
               value={clockbarStyle.gap}
-              onChange={(v) => void updateStyle({ ...clockbarStyle, gap: v })}
+              onChange={(v) => previewStyle({ ...clockbarStyle, gap: v })}
+              onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap: v })}
               style={{ width: 160 }}
               tooltip={{ formatter: (v) => `${v}px` }}
             />
@@ -234,7 +270,7 @@ const WidgetShowForm: React.FC = () => {
                       unCheckedChildren="隐"
                       onChange={(checked) => {
                         const show = { ...clockbarStyle.show, [id]: checked };
-                        void updateStyle({ ...clockbarStyle, show });
+                        void commitStyle({ ...clockbarStyle, show });
                       }}
                     />
                     <Tooltip title="段落所在行：时间行与时间同行，日期行与系统原生日期同行">
@@ -244,7 +280,7 @@ const WidgetShowForm: React.FC = () => {
                         disabled={!shown}
                         onChange={(v) => {
                           const rows = { ...clockbarStyle.rows, [id]: v };
-                          void updateStyle({ ...clockbarStyle, rows });
+                          void commitStyle({ ...clockbarStyle, rows });
                         }}
                         options={[
                           { value: 1, label: '时间行' },
@@ -260,7 +296,7 @@ const WidgetShowForm: React.FC = () => {
                         value={color ?? '#808080'}
                         onChangeComplete={(c) => {
                           const colors = { ...clockbarStyle.colors, [id]: c.toHexString() };
-                          void updateStyle({ ...clockbarStyle, colors });
+                          void commitStyle({ ...clockbarStyle, colors });
                         }}
                       />
                     </Tooltip>
@@ -271,7 +307,7 @@ const WidgetShowForm: React.FC = () => {
                         onClick={() => {
                           const colors = { ...clockbarStyle.colors };
                           delete colors[id];
-                          void updateStyle({ ...clockbarStyle, colors });
+                          void commitStyle({ ...clockbarStyle, colors });
                         }}
                       >
                         跟随主题
@@ -285,7 +321,11 @@ const WidgetShowForm: React.FC = () => {
                       disabled={!shown}
                       onChange={(v) => {
                         const sizes = { ...clockbarStyle.sizes, [id]: v };
-                        void updateStyle({ ...clockbarStyle, sizes });
+                        previewStyle({ ...clockbarStyle, sizes });
+                      }}
+                      onChangeComplete={(v) => {
+                        const sizes = { ...clockbarStyle.sizes, [id]: v };
+                        void commitStyle({ ...clockbarStyle, sizes });
                       }}
                       style={segSliderStyle}
                       tooltip={{ formatter: (v) => `${v?.toFixed(2)}×` }}
@@ -302,6 +342,7 @@ const WidgetShowForm: React.FC = () => {
             日期行首位恒为系统原生日期（如「周一 2026-9-14」，含星期几），其余段落按上方顺序追加其后。
           </div>
         </div>
+        </ClockbarStyleErrorBoundary>
       )}
     </div>
   );
