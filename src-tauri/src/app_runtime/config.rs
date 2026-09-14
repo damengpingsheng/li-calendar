@@ -32,9 +32,12 @@ pub struct ClockbarStyleConfig {
     /// 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2）。
     #[serde(default)]
     pub rows: std::collections::BTreeMap<String, i32>,
-    /// 段间距 px（0~40，缺省 10）。
+    /// 段间距 px（0~40，缺省 10；时间行）。
     #[serde(default)]
     pub gap: Option<f64>,
+    /// 日期行段间距 px（0~40，缺省 10；与时间行分开调节）。
+    #[serde(default)]
+    pub gap2: Option<f64>,
 }
 
 /// 自 `liConfig.json` 反序列化的功能开关快照。

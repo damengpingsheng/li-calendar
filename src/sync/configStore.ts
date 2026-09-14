@@ -35,6 +35,7 @@ const configWindowsDefaults = {
     sizes: {},
     rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
     gap: 10,
+    gap2: 10,
   },
   desktopWindowPosition: null,
   customTrayClockEnabled: true,

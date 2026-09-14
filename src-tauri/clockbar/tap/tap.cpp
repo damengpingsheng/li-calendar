@@ -1,5 +1,7 @@
 // lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
 // v49/v50=E，v51=S 阶段时钟段自定义）
+// v57 变更（用户需求）：段间距按行拆分——gap=时间行、gap2=日期行（c1set "gap2"），
+//   reflow 日期行度量同步用 gap2；两行密度不同（日期行文本更宽）独立调节更合理。
 // v56 变更（用户实测驱动：自定义段字体明显小于系统文本）：段字号行感知对齐——
 //   时间行段基准=Time.FontSize、日期行段基准=原生 Date.FontSize（只读，与所在行
 //   系统文本同尺寸），fontscale 全局倍率缺省 0.55→1.0（host DEFAULT_STYLE 同步）。
@@ -1148,7 +1150,8 @@ struct PanelStyle {
     int     order[5] = { 0,1,2,3,4 }; // v51 显示顺序：order[k]=元素（0..3=数据段，4=Time）
     unsigned colors[4] = { 0,0,0,0 }; // v51 段颜色：0=跟随主题，否则 0x00RRGGBB
     double  sizes[4] = { 1,1,1,1 };   // v51 段字号倍率（钳制 0.5~2.0）
-    double  gap = 10;                 // v51 段间距 px（钳制 0~40）
+    double  gap = 10;                 // v51 段间距 px（钳制 0~40；时间行）
+    double  gap2 = 10;                // v57 日期行段间距 px（钳制 0~40；与 gap 分开调节）
     int     rows[4] = { 1,1,1,2 };    // v55 段行归属：1=时间行，2=日期行（缺省农历在日期行）
 };
 static PanelStyle         g_style;
@@ -1273,8 +1276,9 @@ static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp,
         }
     }
     InterlockedExchange(&g_selfReparent, 0);
-    // 段间距（v53/v55）：每行内非首位段 left=gap；时间行 Time 前最后段 right=gap；
-    // 日期行 Date 恒在首位 ⇒ 行内段恒有左邻（left=gap），无 right 需求。
+    // 段间距（v53/v55/v57）：按行独立——时间行用 gap、日期行用 gap2。每行内非首位
+    // 段 left=行间距；时间行 Time 前最后段 right=gap（Time 原生零属性写入）；
+    // 日期行 Date 恒在首位 ⇒ 行内段恒有左邻（left=gap2），无 right 需求。
     {
         int timeK = -1;
         for (int k = 0; k < 5; k++) if (g_style.order[k] == 4) { timeK = k; break; }
@@ -1287,6 +1291,7 @@ static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp,
             int e = g_style.order[k];
             if (e == 4 || !g_seg[e]) continue;
             bool row1 = g_style.rows[e] == 1;
+            double rowGap = row1 ? g_style.gap : g_style.gap2;
             bool prev = false;
             for (int j = 0; j < k; j++) {
                 int pe = g_style.order[j];
@@ -1297,7 +1302,7 @@ static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp,
             if (auto f = g_seg[e].try_as<wux::FrameworkElement>()) {
                 try {
                     auto mg = f.Margin();
-                    mg.Left = prev ? g_style.gap : 0.0;
+                    mg.Left = prev ? rowGap : 0.0;
                     mg.Right = lastBeforeTime ? g_style.gap : 0.0;
                     f.Margin(mg);
                 } catch (...) {}
@@ -1808,7 +1813,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                 double d = f.DesiredSize().Width;
                 if (d <= 0) return; // 未就绪，跳过本轮日期行评估
-                if (any2) sum2 += g_style.gap;
+                if (any2) sum2 += g_style.gap2;
                 sum2 += d;
                 any2 = true;
             }
@@ -1817,7 +1822,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             if (auto w = g_dateWrapRef.try_as<wux::FrameworkElement>()) {
                 double dw = w.DesiredSize().Width;
                 if (dw <= 0) return;
-                if (any2) sum2 += g_style.gap;
+                if (any2) sum2 += g_style.gap2;
                 sum2 += dw;
             }
         }
@@ -2063,6 +2068,7 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f timeFS=%.0f dateFS=%.1f (timeIdx=%d dateIdx=%d)",
                  rebuildAfterGen ? "rebuild" : "build", gen, ordA, s0, s1, s2, s3,
                  g_style.fontscale, g_style.gap, g_style.capw, tb.FontSize(), g_dateFontSize, timeIdx, dateIdx);
+        log_line("PANEL gaps: row1=%.0f row2=%.0f", g_style.gap, g_style.gap2);
     }
 
     // C2 输入拦截 Border（盖住时钟内容区，截获指针输入）
@@ -2575,6 +2581,12 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                             if (JGetDbl(scope, "gap", &dGap)) {
                                 if (dGap > 40) dGap = 40;
                                 st.gap = dGap;
+                                any = true;
+                            }
+                            double dGap2;
+                            if (JGetDbl(scope, "gap2", &dGap2)) {
+                                if (dGap2 > 40) dGap2 = 40;
+                                st.gap2 = dGap2;
                                 any = true;
                             }
                         }

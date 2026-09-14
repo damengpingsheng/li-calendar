@@ -215,10 +215,14 @@ pub fn style_ext_json() -> String {
         f.push(format!("\"size_{id}\":{v:.2}"));
     }
 
-    // gap：0~40 钳制（恒发，缺省 10）
+    // gap/gap2：0~40 钳制（恒发，缺省 10；gap=时间行，gap2=日期行——v57 分开调节）
     f.push(format!(
         "\"gap\":{:.0}",
         cfg.gap.map(|g| clamp_f64(g, 0.0, 40.0)).unwrap_or(10.0)
+    ));
+    f.push(format!(
+        "\"gap2\":{:.0}",
+        cfg.gap2.map(|g| clamp_f64(g, 0.0, 40.0)).unwrap_or(10.0)
     ));
 
     if f.is_empty() {

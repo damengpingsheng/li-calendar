@@ -64,8 +64,10 @@ export interface ClockbarStyle {
   sizes: Record<string, number>;
   /** 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2） */
   rows: Record<string, number>;
-  /** 段间距 px（0~40，缺省 10） */
+  /** 段间距 px（0~40，缺省 10；时间行） */
   gap: number;
+  /** 日期行段间距 px（0~40，缺省 10；与时间行分开调节） */
+  gap2: number;
 }
 
 export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {

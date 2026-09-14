@@ -51,6 +51,7 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   sizes: {},
   rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
   gap: 10,
+  gap2: 10,
 };
 
 /** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段） */
@@ -74,6 +75,7 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     sizes: { ...(r.sizes ?? {}) },
     rows,
     gap: typeof r.gap === 'number' ? Math.min(40, Math.max(0, r.gap)) : d.gap,
+    gap2: typeof r.gap2 === 'number' ? Math.min(40, Math.max(0, r.gap2)) : d.gap2,
   };
 }
 
@@ -216,7 +218,7 @@ const WidgetShowForm: React.FC = () => {
             时钟段样式（注入式时钟开启时生效）
           </Divider>
           <div style={rowStyle}>
-            <span style={{ width: 64 }}>段间距</span>
+            <span style={{ width: 96 }}>时间行间距</span>
             <Slider
               min={0}
               max={40}
@@ -224,6 +226,19 @@ const WidgetShowForm: React.FC = () => {
               value={clockbarStyle.gap}
               onChange={(v) => previewStyle({ ...clockbarStyle, gap: v })}
               onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap: v })}
+              style={{ width: 160 }}
+              tooltip={{ formatter: (v) => `${v}px` }}
+            />
+          </div>
+          <div style={rowStyle}>
+            <span style={{ width: 96 }}>日期行间距</span>
+            <Slider
+              min={0}
+              max={40}
+              step={1}
+              value={clockbarStyle.gap2}
+              onChange={(v) => previewStyle({ ...clockbarStyle, gap2: v })}
+              onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap2: v })}
               style={{ width: 160 }}
               tooltip={{ formatter: (v) => `${v}px` }}
             />
