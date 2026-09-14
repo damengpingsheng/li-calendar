@@ -229,7 +229,10 @@ pub fn style_ext_json() -> String {
 
 /// 数据线程（每个会话一份；watch 建会话成功后 spawn）：
 /// 1s 粒度日界翻转比对；天气 30min 刷新（失败/无城市一律 `--` 占位，其余段零感知）；
-/// 数据行变化才发 c1set。pipe 写失败即退出（tap 已走 AUTO 恢复，watch 会重建会话）。
+/// 数据行变化才发 c1set。pipe 写失败不再退出（v57）：休眠唤醒时 tap 心跳兜底 AUTO
+/// 会断/重连管道实例，写失败可能只是重连窗口——退避重试，等待 watch 的 REINIT
+/// 信号或管道自愈；天气 fetch 失败 60s 快速重试（唤醒后网络栈就绪前 DNS 会失败，
+/// 干等 30min 不可接受）。
 pub fn spawn_data_thread() {
     std::thread::Builder::new()
         .name("clockbar-data".into())
@@ -239,9 +242,17 @@ pub fn spawn_data_thread() {
             let mut last_wx = std::time::Instant::now()
                 - std::time::Duration::from_secs(30 * 60);
             let mut last_sent = String::new();
+            let mut write_retry: u32 = 0;
             loop {
                 if super::STOP.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
+                }
+                // v57：tap AUTO 恢复信号（watch 置位）→ 强制重发当前行重建面板+立即刷天气
+                if super::DATA_REINIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    super::dbg_log("data: REINIT — resend current row + immediate weather refresh");
+                    last_sent.clear();
+                    last_wx = std::time::Instant::now()
+                        - std::time::Duration::from_secs(30 * 60);
                 }
                 let (y, m, d) = local_ymd();
                 if (y, m, d) != cur_date {
@@ -273,23 +284,36 @@ pub fn spawn_data_thread() {
                                     "data: weather fetch failed ({e}) — degraded to placeholder"
                                 ));
                                 wx = "--".into();
+                                // v57：失败 60s 快速重试一次（唤醒后网络栈就绪慢），
+                                // 不干等 30min——把基准回拨到「29min 前」
+                                last_wx = std::time::Instant::now()
+                                    - std::time::Duration::from_secs(29 * 60);
                             }
                         }
                     }
                 }
                 let dd = compute_day(y, m, d, &wx);
-                // v51：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set
+                // v57：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set
                 let style = format!("{DEFAULT_STYLE}{}", style_ext_json());
                 let line = dd.c1set_json(&style);
-                if line != last_sent {
+                if line != last_sent || write_retry > 0 {
                     match super::session::send_c1set(&line) {
                         Some(ack) => {
                             last_sent = line;
+                            write_retry = 0;
                             super::dbg_log(&format!("data: c1set ack {ack}"));
                         }
                         None => {
-                            super::dbg_log("data: c1set write failed (pipe gone)");
-                            return;
+                            // v57：写失败（休眠唤醒断管重连窗口）退避重试，不退出——
+                            // 旧设计在此 return，data 链死亡且 watch 心跳无感=天气永停 --
+                            write_retry += 1;
+                            if write_retry <= 5 || write_retry % 30 == 1 {
+                                super::dbg_log(&format!(
+                                    "data: c1set write failed (retry #{write_retry})"
+                                ));
+                            }
+                            std::thread::sleep(std::time::Duration::from_secs(2));
+                            continue;
                         }
                     }
                 }

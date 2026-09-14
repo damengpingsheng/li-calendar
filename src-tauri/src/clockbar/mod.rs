@@ -36,6 +36,11 @@ static STARTED: AtomicBool = AtomicBool::new(false);
 /// 会话线程停止令牌（shutdown 时置位，watch/data 线程检测后退出）。
 pub(crate) static STOP: AtomicBool = AtomicBool::new(false);
 
+/// 数据链重初始化标志（v57 休眠唤醒修复）：tap 侧 AUTO 恢复（心跳兜底或断管重连）
+/// 会摘面板并清 panelWanted，而 watch 心跳在新管道实例上正常=watch 无感；data 线程
+/// 检测到本标志后清 last_sent（强制重发当前行重建面板）并立即刷新天气。
+pub(crate) static DATA_REINIT: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn dbg_log(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()

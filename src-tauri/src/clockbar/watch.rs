@@ -58,8 +58,25 @@ fn watch_loop() {
                 Err(_) => Vec::new(),
             };
             seen += new_lines.len();
+            let mut reinit = false;
             for l in &new_lines {
                 super::dbg_log(&format!("tap: {l}"));
+                // v57 休眠唤醒修复：tap 侧 AUTO 恢复（心跳兜底 GetTickCount 含休眠时长
+                // 必然命中，或断管重连 loaded）摘了面板，而 ping 在新管道实例上正常=
+                // watch 无感。监听 rstres(trig=auto) / 会话中 loaded → REINIT 数据链。
+                if l.contains(r#""t":"rstres""#) && l.contains(r#""trig":"auto""#) {
+                    reinit = true;
+                }
+                if session_active && l.contains(r#""t":"loaded""#) {
+                    reinit = true;
+                }
+            }
+            if reinit && session_active {
+                super::DATA_REINIT.store(true, Ordering::Relaxed);
+                // 重发 advise（tap AUTO 时自行 Unadvise 了；幂等）→ tap 重发 ready
+                if super::pipe::pipe_write(b"advise") {
+                    super::dbg_log("watch: tap AUTO detected — re-advise + DATA_REINIT");
+                }
             }
         }
         let pid = explorer_pid();
