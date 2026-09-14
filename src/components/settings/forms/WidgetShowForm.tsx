@@ -273,10 +273,9 @@ const WidgetShowForm: React.FC = () => {
                 ) : (
                   <>
                     <Switch
-                      size="small"
                       checked={shown}
-                      checkedChildren="显"
-                      unCheckedChildren="隐"
+                      checkedChildren="显示"
+                      unCheckedChildren="隐藏"
                       onChange={(checked) => {
                         const show = { ...clockbarStyle.show, [id]: checked };
                         void commitStyle({ ...clockbarStyle, show });
