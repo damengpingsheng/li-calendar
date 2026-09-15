@@ -68,6 +68,10 @@ export interface ClockbarStyle {
   gap: number;
   /** 日期行段间距 px（0~40，缺省 10；与时间行分开调节） */
   gap2: number;
+  /** 时间行水平对齐（0=靠左 1=居中 2=靠右） */
+  halignTime: 0 | 1 | 2;
+  /** 日期行水平对齐（0=靠左 1=居中 2=靠右） */
+  halignDate: 0 | 1 | 2;
 }
 
 export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {

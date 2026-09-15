@@ -38,6 +38,12 @@ pub struct ClockbarStyleConfig {
     /// 日期行段间距 px（0~40，缺省 10；与时间行分开调节）。
     #[serde(default)]
     pub gap2: Option<f64>,
+    /// 时间行水平对齐（0=靠左缺省 1=居中 2=靠右）。
+    #[serde(default)]
+    pub halign_time: Option<i32>,
+    /// 日期行水平对齐（0=靠左缺省 1=居中 2=靠右）。
+    #[serde(default)]
+    pub halign_date: Option<i32>,
 }
 
 /// 自 `liConfig.json` 反序列化的功能开关快照。

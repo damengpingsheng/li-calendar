@@ -1,5 +1,8 @@
 // lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
 // v49/v50=E，v51=S 阶段时钟段自定义）
+// v58 变更（用户想看居中效果驱动）：行水平对齐可配——halign[2]（0=左缺省/1=居中/2=右），
+//   c1set "align1"/"align2"，作用于自建横板（合法写入对象）；时间数字右侧空白=
+//   系统内边距+两行宽度差（日期行更宽撑宽容器、窄行左聚留白），对齐可配后用户可消除。
 // v57 变更（用户需求）：段间距按行拆分——gap=时间行、gap2=日期行（c1set "gap2"），
 //   reflow 日期行度量同步用 gap2；两行密度不同（日期行文本更宽）独立调节更合理。
 // v56 变更（用户实测驱动：自定义段字体明显小于系统文本）：段字号行感知对齐——
@@ -1153,6 +1156,7 @@ struct PanelStyle {
     double  gap = 10;                 // v51 段间距 px（钳制 0~40；时间行）
     double  gap2 = 10;                // v57 日期行段间距 px（钳制 0~40；与 gap 分开调节）
     int     rows[4] = { 1,1,1,2 };    // v55 段行归属：1=时间行，2=日期行（缺省农历在日期行）
+    int     halign[2] = { 0,0 };      // v58 行水平对齐：0=左(缺省/现状) 1=居中 2=右（作用于自建横板）
 };
 static PanelStyle         g_style;
 static wchar_t            g_segText[4][64];        // 天气 节日 节气 农历（host 下发缓存）
@@ -1922,6 +1926,15 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         hp = g_hpanelRef.try_as<wux::Controls::StackPanel>();
         hp.MaxWidth(g_style.capw);
     }
+    // v58 行水平对齐（自建横板可写；0=左/Stretch 现状 1=居中 2=右）
+    {
+        auto haFor = [](int v) -> wux::HorizontalAlignment {
+            return v == 1 ? wux::HorizontalAlignment::Center
+                 : v == 2 ? wux::HorizontalAlignment::Right
+                 : wux::HorizontalAlignment::Left;
+        };
+        try { hp.HorizontalAlignment(haFor(g_style.halign[0])); } catch (...) {}
+    }
     // v55 第二行横板 + Date 包装（对齐由我们自己的 Border 承担，零写 Date 属性）
     wux::Controls::StackPanel hp2{ nullptr };
     if (g_hpanel2Ref) {
@@ -1934,6 +1947,9 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         hp2.MaxWidth(g_style.capw);
         g_hpanel2Ref = hp2;
     }
+    try { hp2.HorizontalAlignment(g_style.halign[1] == 1 ? wux::HorizontalAlignment::Center
+        : g_style.halign[1] == 2 ? wux::HorizontalAlignment::Right
+        : wux::HorizontalAlignment::Left); } catch (...) {}
     {
         bool dateWrapped = false;
         if (g_dateWrapRef) {
@@ -2587,6 +2603,16 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                             if (JGetDbl(scope, "gap2", &dGap2)) {
                                 if (dGap2 > 40) dGap2 = 40;
                                 st.gap2 = dGap2;
+                                any = true;
+                            }
+                            double dA1;
+                            if (JGetDbl(scope, "align1", &dA1)) {
+                                st.halign[0] = dA1 < 0.5 ? 0 : (dA1 < 1.5 ? 1 : 2);
+                                any = true;
+                            }
+                            double dA2;
+                            if (JGetDbl(scope, "align2", &dA2)) {
+                                st.halign[1] = dA2 < 0.5 ? 0 : (dA2 < 1.5 ? 1 : 2);
                                 any = true;
                             }
                         }

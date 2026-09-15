@@ -52,6 +52,8 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
   gap: 10,
   gap2: 10,
+  halignTime: 0,
+  halignDate: 0,
 };
 
 /** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段） */
@@ -76,6 +78,8 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     rows,
     gap: typeof r.gap === 'number' ? Math.min(40, Math.max(0, r.gap)) : d.gap,
     gap2: typeof r.gap2 === 'number' ? Math.min(40, Math.max(0, r.gap2)) : d.gap2,
+    halignTime: r.halignTime === 1 || r.halignTime === 2 ? r.halignTime : 0,
+    halignDate: r.halignDate === 1 || r.halignDate === 2 ? r.halignDate : 0,
   };
 }
 
@@ -229,6 +233,19 @@ const WidgetShowForm: React.FC = () => {
               style={{ width: 160 }}
               tooltip={{ formatter: (v) => `${v}px` }}
             />
+            <Tooltip title="整行在时钟区内的水平对齐（时间数字右侧的空白受此影响）">
+              <Select
+                size="small"
+                value={clockbarStyle.halignTime}
+                onChange={(v) => void commitStyle({ ...clockbarStyle, halignTime: v })}
+                options={[
+                  { value: 0, label: '靠左' },
+                  { value: 1, label: '居中' },
+                  { value: 2, label: '靠右' },
+                ]}
+                style={{ width: 76 }}
+              />
+            </Tooltip>
           </div>
           <div style={rowStyle}>
             <span style={{ width: 96 }}>日期行间距</span>
@@ -242,6 +259,19 @@ const WidgetShowForm: React.FC = () => {
               style={{ width: 160 }}
               tooltip={{ formatter: (v) => `${v}px` }}
             />
+            <Tooltip title="整行在时钟区内的水平对齐">
+              <Select
+                size="small"
+                value={clockbarStyle.halignDate}
+                onChange={(v) => void commitStyle({ ...clockbarStyle, halignDate: v })}
+                options={[
+                  { value: 0, label: '靠左' },
+                  { value: 1, label: '居中' },
+                  { value: 2, label: '靠右' },
+                ]}
+                style={{ width: 76 }}
+              />
+            </Tooltip>
           </div>
           {clockbarStyle.order.map((id, idx) => {
             const isTime = id === 'time';

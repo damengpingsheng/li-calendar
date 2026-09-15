@@ -225,6 +225,16 @@ pub fn style_ext_json() -> String {
         cfg.gap2.map(|g| clamp_f64(g, 0.0, 40.0)).unwrap_or(10.0)
     ));
 
+    // align1/align2：行水平对齐（0=靠左缺省 1=居中 2=靠右——v58，时间数字右侧
+    // 空白=系统内边距+两行宽度差，对齐可配让用户消除窄行右侧留白）
+    let ha = |v: Option<i32>| match v {
+        Some(1) => 1,
+        Some(2) => 2,
+        _ => 0,
+    };
+    f.push(format!("\"align1\":{}", ha(cfg.halign_time)));
+    f.push(format!("\"align2\":{}", ha(cfg.halign_date)));
+
     if f.is_empty() {
         return String::new();
     }
