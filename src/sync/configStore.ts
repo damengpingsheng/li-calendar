@@ -27,7 +27,7 @@ const configWindowsDefaults = {
   taskbarWidgetEnabled: true,
   /** 注入式任务栏时钟（用户决策 #4：默认开启） */
   clockbarInjectionEnabled: true,
-  /** 注入式时钟段样式（D4 现行为=缺省；v55 农历默认在日期行） */
+  /** 注入式时钟段样式（D4 现行为=缺省；v55 农历默认在日期行；v60 天气段增强缺省=图标彩色+文字+无城区名，城区名默认取 IP 定位一致的「昌平」） */
   clockbarStyle: {
     order: ['weather', 'festival', 'term', 'lunar', 'time'],
     show: { weather: true, festival: true, term: true, lunar: true, time: true },
@@ -38,6 +38,10 @@ const configWindowsDefaults = {
     gap2: 10,
     halignTime: 0,
     halignDate: 0,
+    weatherCity: '昌平',
+    weatherEmoji: true,
+    weatherEmojiColor: true,
+    weatherText: true,
   },
   desktopWindowPosition: null,
   customTrayClockEnabled: true,

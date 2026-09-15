@@ -44,6 +44,19 @@ pub struct ClockbarStyleConfig {
     /// 日期行水平对齐（0=靠左缺省 1=居中 2=靠右）。
     #[serde(default)]
     pub halign_date: Option<i32>,
+    /// 天气段城区名（T 阶段：手动配置，拼在天气段最前；空/缺省=不显示）。
+    #[serde(default)]
+    pub weather_city: Option<String>,
+    /// 天气段 emoji 图标开关（T 阶段：缺省开）。
+    #[serde(default)]
+    pub weather_emoji: Option<bool>,
+    /// emoji 变体（缺省 true=彩色 U+FE0F；false=黑白 U+FE0E——2026-09-16 实测仅
+    /// ☁ 等有文本字形者真黑白，无文本字形回落彩色，任务栏渲染零方框）。
+    #[serde(default)]
+    pub weather_emoji_color: Option<bool>,
+    /// 天气现象文字开关（T 阶段：缺省开；关=只显图标+温度）。
+    #[serde(default)]
+    pub weather_text: Option<bool>,
 }
 
 /// 自 `liConfig.json` 反序列化的功能开关快照。

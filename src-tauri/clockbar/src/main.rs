@@ -785,7 +785,12 @@ fn main() {
             // C1/C2 主测试会话：建立会话→下发数据→保持在线 secs 秒（面板在断开时才自动
             // 恢复=B0 语义，故场景测试期间本进程必须驻留）。期间其他验证用 PowerShell 并行。
             let secs: u64 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(600);
-            let json = args.get(3).cloned().unwrap_or_default();
+            // T 阶段 emoji 实测：argv 过 PowerShell/native 边界会被 ANSI 代码页（GBK）mangle，
+            // json 参数传 "@env" 时改读环境变量 PROBE_C1JSON（进程环境块 UTF-16，无损）。
+            let json = match args.get(3).map(|s| s.as_str()) {
+                Some("@env") => std::env::var("PROBE_C1JSON").unwrap_or_default(),
+                _ => args.get(3).cloned().unwrap_or_default(),
+            };
             if let Err(e) = ensure_session(&msgs) { eprintln!("[probe] SESSION FAILED: {e}"); std::process::exit(1); }
             if !json.is_empty() {
                 let mut line = String::from("c1set ");

@@ -252,11 +252,15 @@ pub fn spawn_data_thread() {
         .name("clockbar-data".into())
         .spawn(|| {
             let mut cur_date = local_ymd();
-            let mut wx = "--".to_string(); // 降级占位（断网/坏数据同款）
+            // T 阶段：保存 WeatherNow 对象（非展示串），每 tick 按当前配置重算展示
+            // （城区名/emoji/现象文字配置变更 ≤1s 生效，无需等 30min 刷新）；None=从未
+            // 成功获取（显示 -- 占位）
+            let mut wx: Option<super::weather::WeatherNow> = None;
             let mut last_wx = std::time::Instant::now()
                 - std::time::Duration::from_secs(30 * 60);
             let mut last_sent = String::new();
             let mut write_retry: u32 = 0;
+            let mut just_refreshed = false;
             loop {
                 if super::STOP.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -278,19 +282,15 @@ pub fn spawn_data_thread() {
                 }
                 if last_wx.elapsed() >= std::time::Duration::from_secs(30 * 60) {
                     last_wx = std::time::Instant::now();
+                    just_refreshed = true;
                     let city = super::weather::resolve_cityid();
                     if city.is_empty() {
                         super::dbg_log("data: weather no cityid — keep last good value");
                     } else {
                         match super::weather::fetch_now(&city) {
                             Ok(w) => {
-                                let disp = w.display();
-                                if disp.is_empty() {
-                                    super::dbg_log("data: weather bad data — keep last good value");
-                                } else {
-                                    wx = disp;
-                                }
-                                super::dbg_log(&format!("data: weather refreshed: {wx}"));
+                                wx = Some(w);
+                                super::dbg_log("data: weather refreshed");
                             }
                             Err(e) => {
                                 // v59：失败保留上次成功值（温度变化慢，陈旧值远比 -- 有用；
@@ -305,7 +305,18 @@ pub fn spawn_data_thread() {
                         }
                     }
                 }
-                let dd = compute_day(y, m, d, &wx);
+                let dd = {
+                    // T 阶段：展示串按当前 liConfig 每 tick 重算（含 emoji/城区名/现象文字）
+                    let cfg = super::current_style();
+                    let opts = super::weather::DisplayOpts::from_config(cfg.as_ref());
+                    let wx_disp = super::weather::format_now(wx.as_ref(), &opts);
+                    if just_refreshed {
+                        // 刷新当轮日志带展示串（含 emoji），确认映射与配置生效
+                        just_refreshed = false;
+                        super::dbg_log(&format!("data: weather display: {wx_disp}"));
+                    }
+                    compute_day(y, m, d, &wx_disp)
+                };
                 // v57：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set
                 let style = format!("{DEFAULT_STYLE}{}", style_ext_json());
                 let line = dd.c1set_json(&style);

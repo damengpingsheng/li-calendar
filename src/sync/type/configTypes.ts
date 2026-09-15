@@ -72,6 +72,14 @@ export interface ClockbarStyle {
   halignTime: 0 | 1 | 2;
   /** 日期行水平对齐（0=靠左 1=居中 2=靠右） */
   halignDate: 0 | 1 | 2;
+  /** 天气段城区名（手动配置，拼在天气段最前；空=不显示） */
+  weatherCity: string;
+  /** 天气段 emoji 图标开关（缺省开） */
+  weatherEmoji: boolean;
+  /** emoji 变体（true=彩色 U+FE0F 缺省 / false=黑白 U+FE0E；实测仅部分字形真黑白） */
+  weatherEmojiColor: boolean;
+  /** 天气现象文字开关（缺省开） */
+  weatherText: boolean;
 }
 
 export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {

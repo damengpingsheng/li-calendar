@@ -18,30 +18,126 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-/// 实况数据（temp 原样字符串，text=天气名）
+/// 实况数据（temp 原样字符串，text=天气名，code=weathercode 整数——emoji 码表用）
 pub struct WeatherNow {
     pub temp: String,
     pub text: String,
+    /// weathercode 整数（"d13"/"n7" 去昼夜前缀后的数值；解析失败=u32::MAX→无 emoji）
+    pub code: u32,
+}
+
+/// 天气段展示选项（T 阶段定案：城区名+emoji 图标+现象文字，全部可配）。
+#[derive(Clone, Debug)]
+pub struct DisplayOpts {
+    /// 城区名（手动配置，拼在天气段最前；空=不拼）
+    pub city: String,
+    /// emoji 图标开关（缺省开）
+    pub emoji: bool,
+    /// emoji 变体：true=彩色 U+FE0F（缺省）/ false=黑白 U+FE0E
+    /// （2026-09-16 任务栏实测：仅 ☁ 等有文本字形者真黑白，无文本字形回落彩色）
+    pub emoji_color: bool,
+    /// 现象文字开关（缺省开；关=只显图标+温度）
+    pub show_text: bool,
+}
+
+impl Default for DisplayOpts {
+    fn default() -> Self {
+        DisplayOpts { city: String::new(), emoji: true, emoji_color: true, show_text: true }
+    }
+}
+
+impl DisplayOpts {
+    /// 从 liConfig `clockbarStyle` 快照构建（字段缺省=图标彩色开、文字开、无城区名）。
+    /// 城区名做 tap 限界解析安全清洗（值内禁引号/反斜杠/控制符）并限长 16 字符。
+    pub fn from_config(cfg: Option<&crate::app_runtime::config::ClockbarStyleConfig>) -> Self {
+        let mut o = DisplayOpts::default();
+        let Some(cfg) = cfg else { return o };
+        if let Some(c) = &cfg.weather_city {
+            o.city = sanitize_seg(c, 16);
+        }
+        if let Some(v) = cfg.weather_emoji {
+            o.emoji = v;
+        }
+        if let Some(v) = cfg.weather_emoji_color {
+            o.emoji_color = v;
+        }
+        if let Some(v) = cfg.weather_text {
+            o.show_text = v;
+        }
+        o
+    }
+}
+
+/// tap c1set 值安全清洗：剔除引号/反斜杠/控制符（tap 限界 JSON 解析不认转义），
+/// 限长 max_chars 字符。城区名等用户输入拼进天气段前必过。
+fn sanitize_seg(s: &str, max_chars: usize) -> String {
+    s.chars()
+        .filter(|c| {
+            !matches!(c, '"' | '\\') && *c >= ' ' && *c != '\u{7f}'
+        })
+        .take(max_chars)
+        .collect()
 }
 
 impl WeatherNow {
-    /// 任务栏天气段展示文案（与前端 ClockOverlayWindow 旧口径一致：`26℃ 晴`）
+    /// 旧口径展示文案（`26℃ 晴`，无城区名/图标）——保留给探针/兼容场景。
     pub fn display(&self) -> String {
-        let t = self.temp.trim();
-        let w = self.text.trim();
-        let mut s = String::new();
-        if !t.is_empty() {
-            s.push_str(t);
-            s.push('℃');
-        }
-        if !w.is_empty() {
-            if !s.is_empty() {
-                s.push(' ');
-            }
-            s.push_str(w);
-        }
-        s
+        format_now(Some(self), &DisplayOpts { emoji: false, ..DisplayOpts::default() })
     }
+}
+
+/// 天气码 → emoji 基字符（T 待办定案 8+1 类粒度；未收录=空串→不拼图标）。
+/// 变体符由 format_now 按彩色/黑白开关追加（U+FE0F/U+FE0E）。
+fn weather_code_emoji(num: u32) -> &'static str {
+    match num {
+        0 => "\u{1F31E}",                        // 晴 🌞
+        1 => "\u{26C5}",                         // 多云 ⛅
+        2 => "\u{2601}",                         // 阴 ☁
+        3 => "\u{1F326}",                        // 阵雨 🌦
+        4 | 5 => "\u{26C8}",                     // 雷阵雨/伴冰雹 ⛈
+        6 | 13..=17 | 26..=28 => "\u{1F328}",    // 雪系（含雨夹雪）🌨
+        7..=12 | 19 | 21..=25 => "\u{1F327}",    // 雨系（含冻雨）🌧
+        18 | 53 => "\u{1F32B}",                  // 雾/霾 🌫
+        20 | 29..=31 => "\u{1F32A}",             // 沙尘暴/浮尘/扬沙/强沙尘暴 🌪
+        _ => "",
+    }
+}
+
+/// 任务栏天气段展示文案（T 阶段）：`[城区名 ][emoji ]温度℃[ 现象]`。
+/// 从未成功获取（w=None）恒为占位符 "--"（降级态保持最小，不拼图标/城区名）。
+/// 每次天气刷新后由数据线程按当前配置重算——配置变更随下一 tick 上屏（≤1s）。
+pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
+    let Some(w) = w else {
+        return "--".to_string();
+    };
+    let t = w.temp.trim();
+    if t.is_empty() {
+        return "--".to_string();
+    }
+    let mut s = String::new();
+    let city = o.city.trim();
+    if !city.is_empty() {
+        s.push_str(city);
+        s.push(' ');
+    }
+    if o.emoji {
+        let e = weather_code_emoji(w.code);
+        if !e.is_empty() {
+            s.push_str(e);
+            s.push(if o.emoji_color { '\u{FE0F}' } else { '\u{FE0E}' });
+            s.push(' ');
+        }
+    }
+    s.push_str(t);
+    s.push('℃');
+    if o.show_text {
+        let txt = w.text.trim();
+        if !txt.is_empty() {
+            s.push(' ');
+            s.push_str(txt);
+        }
+    }
+    sanitize_seg(&s, 60)
 }
 
 /// 天气代码表（weather.com.cn 通用码表；d1 接口 weathercode 形如 d00/n13，
@@ -223,7 +319,7 @@ pub fn fetch_now(cityid: &str) -> Result<WeatherNow, String> {
         u32::MAX
     };
     let text = weather_code_name(num).to_string();
-    Ok(WeatherNow { temp, text })
+    Ok(WeatherNow { temp, text, code: num })
 }
 
 /// 城市缓存文件（生产路径：exe 同目录）。首跑 IP 定位成功后写入。

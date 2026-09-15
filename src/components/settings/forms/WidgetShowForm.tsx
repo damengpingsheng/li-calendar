@@ -1,5 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
-import { Button, ColorPicker, Divider, Form, Select, Slider, Switch, Tag, Tooltip } from 'antd';
+import { Button, ColorPicker, Divider, Form, Input, Select, Slider, Switch, Tag, Tooltip } from 'antd';
 import React, { Component, useEffect, useState } from 'react';
 import { syncValuesConfig } from '../../../sync/base/syncValuesConfig.ts';
 import { useConfigSync } from '../../../sync/configStore.ts';
@@ -43,7 +43,7 @@ const SEG_LABELS: Record<string, string> = {
   time: '时间',
 };
 
-/** 与 configStore 默认值一致的兜底样式（D4 现行为；v55 农历默认在日期行） */
+/** 与 configStore 默认值一致的兜底样式（D4 现行为；v55 农历默认在日期行；v60 天气段增强） */
 const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   order: ['weather', 'festival', 'term', 'lunar', 'time'],
   show: { weather: true, festival: true, term: true, lunar: true, time: true },
@@ -54,6 +54,10 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   gap2: 10,
   halignTime: 0,
   halignDate: 0,
+  weatherCity: '昌平',
+  weatherEmoji: true,
+  weatherEmojiColor: true,
+  weatherText: true,
 };
 
 /** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段） */
@@ -80,6 +84,11 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     gap2: typeof r.gap2 === 'number' ? Math.min(40, Math.max(0, r.gap2)) : d.gap2,
     halignTime: r.halignTime === 1 || r.halignTime === 2 ? r.halignTime : 0,
     halignDate: r.halignDate === 1 || r.halignDate === 2 ? r.halignDate : 0,
+    // v60 天气段增强（后端还会再清洗/钳制一次——双端防御）
+    weatherCity: typeof r.weatherCity === 'string' ? r.weatherCity.slice(0, 16) : d.weatherCity,
+    weatherEmoji: r.weatherEmoji !== false,
+    weatherEmojiColor: r.weatherEmojiColor !== false,
+    weatherText: r.weatherText !== false,
   };
 }
 
@@ -98,6 +107,18 @@ const WidgetShowForm: React.FC = () => {
   useEffect(() => {
     if (config?.clockbarStyle) setClockbarStyle(normalizeStyle(config.clockbarStyle));
   }, [config?.clockbarStyle]);
+
+  /** 城区名输入草稿（失焦/回车才提交，避免逐键 invoke 洪泛） */
+  const [cityDraft, setCityDraft] = useState<string>(clockbarStyle.weatherCity);
+  useEffect(() => {
+    setCityDraft(clockbarStyle.weatherCity);
+  }, [clockbarStyle.weatherCity]);
+  const commitCity = (): void => {
+    const v = cityDraft.trim().slice(0, 16);
+    if (v !== clockbarStyle.weatherCity) {
+      void commitStyle({ ...clockbarStyle, weatherCity: v });
+    }
+  };
 
   if (!isDesktop) {
     return null;
@@ -389,6 +410,55 @@ const WidgetShowForm: React.FC = () => {
               </div>
             );
           })}
+          <Divider plain style={{ margin: '12px 0 4px' }}>
+            天气段增强
+          </Divider>
+          <div style={rowStyle}>
+            <span style={{ width: 96 }}>城区名</span>
+            <Input
+              size="small"
+              style={{ width: 130 }}
+              maxLength={16}
+              value={cityDraft}
+              placeholder="留空不显示"
+              onChange={(e) => setCityDraft(e.target.value)}
+              onBlur={commitCity}
+              onPressEnter={commitCity}
+            />
+            <span style={{ whiteSpace: 'nowrap' }}>现象文字</span>
+            <Switch
+              size="small"
+              checked={clockbarStyle.weatherText}
+              checkedChildren="显示"
+              unCheckedChildren="隐藏"
+              onChange={(checked) => void commitStyle({ ...clockbarStyle, weatherText: checked })}
+            />
+          </div>
+          <div style={rowStyle}>
+            <span style={{ width: 96 }}>天气图标</span>
+            <Tooltip title="Unicode emoji 拼进天气段（🌞⛅☁🌦⛈🌧🌨🌫🌪 按天气码映射）。黑白=文本字形 U+FE0E——2026-09-16 任务栏实测：仅 ☁ 等有文本字形者真黑白，其余回落彩色（Windows 字体 fallback）。">
+              <Select
+                size="small"
+                value={!clockbarStyle.weatherEmoji ? 'off' : clockbarStyle.weatherEmojiColor ? 'color' : 'mono'}
+                onChange={(v) =>
+                  void commitStyle({
+                    ...clockbarStyle,
+                    weatherEmoji: v !== 'off',
+                    weatherEmojiColor: v === 'color',
+                  })
+                }
+                options={[
+                  { value: 'color', label: '彩色' },
+                  { value: 'mono', label: '黑白' },
+                  { value: 'off', label: '关闭' },
+                ]}
+                style={{ width: 76 }}
+              />
+            </Tooltip>
+            <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
+              示例：昌平 ⛈ 26.1℃ 雷阵雨
+            </span>
+          </div>
           <div style={{ padding: '6px 12px 0', color: '#999', fontSize: 12, lineHeight: 1.9 }}>
             <div>顺序即任务栏时钟上的从左到右排列。</div>
             <div>「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行。</div>
