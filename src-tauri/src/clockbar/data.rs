@@ -232,11 +232,11 @@ pub fn style_ext_json() -> String {
 }
 
 /// 数据线程（每个会话一份；watch 建会话成功后 spawn）：
-/// 1s 粒度日界翻转比对；天气 30min 刷新（失败/无城市一律 `--` 占位，其余段零感知）；
-/// 数据行变化才发 c1set。pipe 写失败不再退出（v57）：休眠唤醒时 tap 心跳兜底 AUTO
-/// 会断/重连管道实例，写失败可能只是重连窗口——退避重试，等待 watch 的 REINIT
-/// 信号或管道自愈；天气 fetch 失败 60s 快速重试（唤醒后网络栈就绪前 DNS 会失败，
-/// 干等 30min 不可接受）。
+/// 1s 粒度日界翻转比对；天气 30min 刷新。v59：fetch 失败/无城市/坏数据一律
+/// **保留上次成功值**（温度变化慢，陈旧值远比 -- 有用；从未成功过才维持 --）；
+/// 失败 30s 快速重试（唤醒后网络栈就绪典型 10~60s）。
+/// pipe 写失败不再退出（v57）：休眠唤醒时 tap 心跳兜底 AUTO 会断/重连管道实例，
+/// 写失败可能只是重连窗口——退避重试，等待 watch 的 REINIT 信号或管道自愈。
 pub fn spawn_data_thread() {
     std::thread::Builder::new()
         .name("clockbar-data".into())
@@ -270,28 +270,27 @@ pub fn spawn_data_thread() {
                     last_wx = std::time::Instant::now();
                     let city = super::weather::resolve_cityid();
                     if city.is_empty() {
-                        super::dbg_log("data: weather no cityid — degraded to placeholder");
-                        wx = "--".into();
+                        super::dbg_log("data: weather no cityid — keep last good value");
                     } else {
                         match super::weather::fetch_now(&city) {
                             Ok(w) => {
                                 let disp = w.display();
                                 if disp.is_empty() {
-                                    wx = "--".into();
+                                    super::dbg_log("data: weather bad data — keep last good value");
                                 } else {
                                     wx = disp;
                                 }
                                 super::dbg_log(&format!("data: weather refreshed: {wx}"));
                             }
                             Err(e) => {
+                                // v59：失败保留上次成功值（温度变化慢，陈旧值远比 -- 有用；
+                                // 从未成功过才维持 -- 占位）。60s→30s 快速重试（唤醒后网络
+                                // 栈就绪典型 10~60s，日志实证 22:29:57 失败→22:30:58 恢复）
                                 super::dbg_log(&format!(
-                                    "data: weather fetch failed ({e}) — degraded to placeholder"
+                                    "data: weather fetch failed ({e}) — keep last good value"
                                 ));
-                                wx = "--".into();
-                                // v57：失败 60s 快速重试一次（唤醒后网络栈就绪慢），
-                                // 不干等 30min——把基准回拨到「29min 前」
                                 last_wx = std::time::Instant::now()
-                                    - std::time::Duration::from_secs(29 * 60);
+                                    - std::time::Duration::from_secs(29 * 60 + 30);
                             }
                         }
                     }
