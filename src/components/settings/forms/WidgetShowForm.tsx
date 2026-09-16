@@ -58,6 +58,7 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   weatherEmoji: true,
   weatherEmojiColor: true,
   weatherText: true,
+  weatherWind: true,
 };
 
 /** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段） */
@@ -89,6 +90,7 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     weatherEmoji: r.weatherEmoji !== false,
     weatherEmojiColor: r.weatherEmojiColor !== false,
     weatherText: r.weatherText !== false,
+    weatherWind: r.weatherWind !== false,
   };
 }
 
@@ -432,6 +434,16 @@ const WidgetShowForm: React.FC = () => {
               checkedChildren="显示"
               unCheckedChildren="隐藏"
               onChange={(checked) => void commitStyle({ ...clockbarStyle, weatherText: checked })}
+            />
+            <Tooltip title="风向风级（高德数据源，如「东北风3~4级」），拼在现象文字后">
+              <span style={{ whiteSpace: 'nowrap' }}>风向风级</span>
+            </Tooltip>
+            <Switch
+              size="small"
+              checked={clockbarStyle.weatherWind}
+              checkedChildren="显示"
+              unCheckedChildren="隐藏"
+              onChange={(checked) => void commitStyle({ ...clockbarStyle, weatherWind: checked })}
             />
           </div>
           <div style={rowStyle}>

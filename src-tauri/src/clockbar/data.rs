@@ -124,8 +124,9 @@ pub fn local_ymd() -> (i32, u32, u32) {
 }
 
 /// 生产默认样式（v56：fontscale 1.0=段字号与所在行系统文本对齐（行感知基准，
-/// 见 tap v56 注）；segmaxw 170 / capw 620 / input 1 为 D4 定稿）。
-pub const DEFAULT_STYLE: &str = "\"fontscale\":1.0,\"segmaxw\":170,\"capw\":620,\"input\":1";
+/// 见 tap v56 注）；segmaxw 220（v61：天气段加城区名/风向风级后 170 截断「东北
+/// 风1~3级」实测，放宽单段预算，capw 总预算+优先级隐藏仍护底）/ capw 620 / input 1）。
+pub const DEFAULT_STYLE: &str = "\"fontscale\":1.0,\"segmaxw\":220,\"capw\":620,\"input\":1";
 
 /// S 阶段段 id 与 tap SEGNAME 对齐；time 恒显不参与 show/colors/sizes。
 const SEG_IDS: [&str; 4] = ["weather", "festival", "term", "lunar"];
@@ -283,25 +284,22 @@ pub fn spawn_data_thread() {
                 if last_wx.elapsed() >= std::time::Duration::from_secs(30 * 60) {
                     last_wx = std::time::Instant::now();
                     just_refreshed = true;
-                    let city = super::weather::resolve_cityid();
-                    if city.is_empty() {
-                        super::dbg_log("data: weather no cityid — keep last good value");
-                    } else {
-                        match super::weather::fetch_now(&city) {
-                            Ok(w) => {
-                                wx = Some(w);
-                                super::dbg_log("data: weather refreshed");
-                            }
-                            Err(e) => {
-                                // v59：失败保留上次成功值（温度变化慢，陈旧值远比 -- 有用；
-                                // 从未成功过才维持 -- 占位）。60s→30s 快速重试（唤醒后网络
-                                // 栈就绪典型 10~60s，日志实证 22:29:57 失败→22:30:58 恢复）
-                                super::dbg_log(&format!(
-                                    "data: weather fetch failed ({e}) — keep last good value"
-                                ));
-                                last_wx = std::time::Instant::now()
-                                    - std::time::Duration::from_secs(29 * 60 + 30);
-                            }
+                    // v61：高德源优先（GAODE_WEATHER_API 在场，含风向风级/湿度），
+                    // 失败自动回退中国天气网旧链路——调度在 weather::fetch_now_any
+                    match super::weather::fetch_now_any() {
+                        Ok(w) => {
+                            wx = Some(w);
+                            super::dbg_log("data: weather refreshed");
+                        }
+                        Err(e) => {
+                            // v59：失败保留上次成功值（温度变化慢，陈旧值远比 -- 有用；
+                            // 从未成功过才维持 -- 占位）。60s→30s 快速重试（唤醒后网络
+                            // 栈就绪典型 10~60s，日志实证 22:29:57 失败→22:30:58 恢复）
+                            super::dbg_log(&format!(
+                                "data: weather fetch failed ({e}) — keep last good value"
+                            ));
+                            last_wx = std::time::Instant::now()
+                                - std::time::Duration::from_secs(29 * 60 + 30);
                         }
                     }
                 }

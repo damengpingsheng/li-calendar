@@ -18,12 +18,15 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-/// 实况数据（temp 原样字符串，text=天气名，code=weathercode 整数——emoji 码表用）
+/// 实况数据（temp 原样字符串，text=天气名，code=weathercode 整数——emoji 码表用，
+/// wind=风向风级展示串如「东北风3~4级」，空=无风信息）
 pub struct WeatherNow {
     pub temp: String,
     pub text: String,
     /// weathercode 整数（"d13"/"n7" 去昼夜前缀后的数值；解析失败=u32::MAX→无 emoji）
     pub code: u32,
+    /// 风向风级展示串（高德源；中国天气网源无此数据=空串）
+    pub wind: String,
 }
 
 /// 天气段展示选项（T 阶段定案：城区名+emoji 图标+现象文字，全部可配）。
@@ -36,13 +39,21 @@ pub struct DisplayOpts {
     /// emoji 变体：true=彩色 U+FE0F（缺省）/ false=黑白 U+FE0E
     /// （2026-09-16 任务栏实测：仅 ☁ 等有文本字形者真黑白，无文本字形回落彩色）
     pub emoji_color: bool,
-    /// 现象文字开关（缺省开；关=只显图标+温度）
+    /// 天气现象文字开关（缺省开；关=只显图标+温度）
     pub show_text: bool,
+    /// 风向风级开关（缺省开；仅高德源有数据，关=不拼「东北风3~4级」）
+    pub show_wind: bool,
 }
 
 impl Default for DisplayOpts {
     fn default() -> Self {
-        DisplayOpts { city: String::new(), emoji: true, emoji_color: true, show_text: true }
+        DisplayOpts {
+            city: String::new(),
+            emoji: true,
+            emoji_color: true,
+            show_text: true,
+            show_wind: true,
+        }
     }
 }
 
@@ -63,6 +74,9 @@ impl DisplayOpts {
         }
         if let Some(v) = cfg.weather_text {
             o.show_text = v;
+        }
+        if let Some(v) = cfg.weather_wind {
+            o.show_wind = v;
         }
         o
     }
@@ -103,6 +117,62 @@ fn weather_code_emoji(num: u32) -> &'static str {
     }
 }
 
+/// 高德 weather 中文现象 → 码号（复用 emoji 码表；高德返回中文与 weather_code_name
+/// 同名词表）。未收录 → u32::MAX（无 emoji，文字照显）。
+fn amap_text_code(text: &str) -> u32 {
+    match text {
+        "晴" => 0,
+        "多云" => 1,
+        "阴" => 2,
+        "阵雨" => 3,
+        "雷阵雨" => 4,
+        "雷阵雨并伴有冰雹" | "雷阵雨伴有冰雹" => 5,
+        "雨夹雪" => 6,
+        "小雨" => 7,
+        "中雨" => 8,
+        "大雨" => 9,
+        "暴雨" => 10,
+        "大暴雨" => 11,
+        "特大暴雨" => 12,
+        "阵雪" => 13,
+        "小雪" => 14,
+        "中雪" => 15,
+        "大雪" => 16,
+        "暴雪" => 17,
+        "雾" => 18,
+        "冻雨" => 19,
+        "沙尘暴" => 20,
+        "小雨-中雨" => 21,
+        "中雨-大雨" => 22,
+        "大雨-暴雨" => 23,
+        "暴雨-大暴雨" => 24,
+        "大暴雨-特大暴雨" => 25,
+        "小雪-中雪" => 26,
+        "中雪-大雪" => 27,
+        "大雪-暴雪" => 28,
+        "浮尘" => 29,
+        "扬沙" => 30,
+        "强沙尘暴" => 31,
+        "霾" => 53,
+        _ => u32::MAX,
+    }
+}
+
+/// 风级口径归一：高德 windpower 形如 "≤3"/"3~4"/"3-4"；"≤3" 归一为 "1~3"，
+/// 其余把 "-" 归一为 "~"；拼展示串「东北风1~3级」（无风向则只显级数）。
+fn format_wind(dir: &str, power: &str) -> String {
+    let d = dir.trim();
+    let p = power.trim().replace("≤3", "1~3").replace('-', "~");
+    if p.is_empty() {
+        return String::new();
+    }
+    if d.is_empty() || d == "无风向" {
+        format!("{p}级")
+    } else {
+        format!("{d}风{p}级")
+    }
+}
+
 /// 任务栏天气段展示文案（T 阶段）：`[城区名 ][emoji ]温度℃[ 现象]`。
 /// 从未成功获取（w=None）恒为占位符 "--"（降级态保持最小，不拼图标/城区名）。
 /// 每次天气刷新后由数据线程按当前配置重算——配置变更随下一 tick 上屏（≤1s）。
@@ -135,6 +205,13 @@ pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
         if !txt.is_empty() {
             s.push(' ');
             s.push_str(txt);
+        }
+    }
+    if o.show_wind {
+        let wind = w.wind.trim();
+        if !wind.is_empty() {
+            s.push(' ');
+            s.push_str(wind);
         }
     }
     sanitize_seg(&s, 60)
@@ -319,7 +396,65 @@ pub fn fetch_now(cityid: &str) -> Result<WeatherNow, String> {
         u32::MAX
     };
     let text = weather_code_name(num).to_string();
-    Ok(WeatherNow { temp, text, code: num })
+    Ok(WeatherNow { temp, text, code: num, wind: String::new() })
+}
+
+/// 高德天气实况（restapi.amap.com/v3/weather/weatherInfo，HTTP 直连零新依赖，
+/// UTF-8 JSON：lives[0] 的 weather/temperature/winddirection/windpower/humidity）。
+/// 有风向风级、湿度，是中国天气网链路的升级数据源（2026-09-16 定案）。
+pub fn fetch_now_amap(key: &str, adcode: &str) -> Result<WeatherNow, String> {
+    if key.len() != 32 || !key.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("bad amap key len {}", key.len()));
+    }
+    if adcode.len() != 6 || !adcode.bytes().all(|b| b.is_ascii_digit()) {
+        return Err(format!("bad amap adcode '{adcode}'"));
+    }
+    let body = http_get(
+        "restapi.amap.com",
+        &format!("/v3/weather/weatherInfo?city={adcode}&key={key}"),
+        "http://restapi.amap.com/",
+        Duration::from_secs(8),
+    )?;
+    // 限界提取（同 json_str 口径，无转义 JSON——高德返回无内嵌引号的中文字段）
+    let status = json_str(&body, "status").ok_or("amap: no status")?;
+    if status != "1" {
+        let info = json_str(&body, "info").unwrap_or_default();
+        return Err(format!("amap: status={status} info={info}"));
+    }
+    let temp = json_str(&body, "temperature").ok_or("amap: no temperature")?;
+    if temp.is_empty() {
+        return Err("amap: empty temperature".into());
+    }
+    let text = json_str(&body, "weather").unwrap_or_default();
+    let wind = format_wind(
+        &json_str(&body, "winddirection").unwrap_or_default(),
+        &json_str(&body, "windpower").unwrap_or_default(),
+    );
+    Ok(WeatherNow { temp, code: amap_text_code(&text), text, wind })
+}
+
+/// 数据源调度（T 阶段换源定案）：环境变量 GAODE_WEATHER_API（32 位高德 Web服务 key）
+/// 在场 → 高德源（adcode=LICAL_AMAP_CITY 覆盖，缺省 110114=昌平区）；高德失败回退
+/// 中国天气网旧链路（cityid 解析链不变）。两者都失败返回拼接错误。
+pub fn fetch_now_any() -> Result<WeatherNow, String> {
+    let key = std::env::var("GAODE_WEATHER_API").unwrap_or_default();
+    let adcode = std::env::var("LICAL_AMAP_CITY").unwrap_or_else(|_| "110114".into());
+    if !key.is_empty() {
+        match fetch_now_amap(&key, &adcode) {
+            Ok(w) => return Ok(w),
+            Err(e) => {
+                let fb = fetch_now(&resolve_cityid());
+                return match fb {
+                    Ok(w) => {
+                        super::dbg_log("weather: amap failed, fell back to weathercn");
+                        Ok(w)
+                    }
+                    Err(e2) => Err(format!("amap: {e}; weathercn: {e2}")),
+                };
+            }
+        }
+    }
+    fetch_now(&resolve_cityid())
 }
 
 /// 城市缓存文件（生产路径：exe 同目录）。首跑 IP 定位成功后写入。

@@ -57,6 +57,9 @@ pub struct ClockbarStyleConfig {
     /// 天气现象文字开关（T 阶段：缺省开；关=只显图标+温度）。
     #[serde(default)]
     pub weather_text: Option<bool>,
+    /// 风向风级开关（v61 高德源：缺省开；关=不拼「东北风3~4级」）。
+    #[serde(default)]
+    pub weather_wind: Option<bool>,
 }
 
 /// 自 `liConfig.json` 反序列化的功能开关快照。

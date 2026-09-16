@@ -42,6 +42,7 @@ const configWindowsDefaults = {
     weatherEmoji: true,
     weatherEmojiColor: true,
     weatherText: true,
+    weatherWind: true,
   },
   desktopWindowPosition: null,
   customTrayClockEnabled: true,

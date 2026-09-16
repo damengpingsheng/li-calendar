@@ -80,6 +80,8 @@ export interface ClockbarStyle {
   weatherEmojiColor: boolean;
   /** 天气现象文字开关（缺省开） */
   weatherText: boolean;
+  /** 风向风级开关（高德数据源；缺省开） */
+  weatherWind: boolean;
 }
 
 export interface ConfigWindows extends WindowsDesktop, WindowsTaskbar {
