@@ -59,20 +59,48 @@ pub fn term_text(solar: &SolarDay) -> String {
     }
 }
 
-/// 第 n 个星期日（w=该月 1 日的星期索引，0=周日）；母亲节=5 月第 2 个周日，
-/// 父亲节=6 月第 3 个周日（lunar-typescript 节日表有、tyme 无，此处补齐——
-/// 2026-06-21 父亲节对照实测暴露）。
-fn nth_sunday(first_weekday: usize, n: usize) -> usize {
-    1 + (7 - first_weekday) % 7 + (n - 1) * 7
+/// 西方节日名单（v63 用户定案：任务栏节日段不显示西方节日、也不作倒计时目标）。
+/// tyme 节日表本无西方节日（D 阶段实证），此表防御 D 阶段补充表类的外部来源。
+fn is_western_festival(name: &str) -> bool {
+    matches!(
+        name,
+        "情人节"
+            | "白色情人节"
+            | "愚人节"
+            | "复活节"
+            | "母亲节"
+            | "父亲节"
+            | "感恩节"
+            | "万圣节"
+            | "平安夜"
+            | "圣诞节"
+    )
 }
 
-/// 节日行：阳历节日 → 农历节日 → 补充节日（情人节/母亲节/父亲节，tyme 节日表
-/// 无而前端 lunar-typescript 有）→ 「除夕」兜底（tyme 已内置，保险）。
-/// 清明日节日段与节气段同源重复（tyme 报「清明节」、节气段已显示「清明」，
-/// 与前端「格子只显示节气」口径一致），此时节日段留空。
-pub fn festival_text(solar: &SolarDay) -> String {
-    let term = term_text(solar);
-    let mut f = if let Some(x) = solar.get_festival() {
+/// 倒计时目标白名单（v63：中国传统节日+法定节日，名称=tyme 节日表实查）。
+/// 妇女节/植树节/青年节/儿童节/建党节/建军节/教师节/中元节/龙头节/冬至节等
+/// 当天仍可显示名，但不倒数（非节假日口径）。
+fn is_countdown_target(name: &str) -> bool {
+    matches!(
+        name,
+        "元旦"
+            | "除夕"
+            | "春节"
+            | "元宵节"
+            | "清明节"
+            | "劳动节"
+            | "端午节"
+            | "七夕节"
+            | "中秋节"
+            | "重阳节"
+            | "国庆节"
+            | "腊八节"
+    )
+}
+
+/// 当日节日原始名（阳历节日→农历节日→「除夕」兜底；不去重不过滤）。
+fn festival_raw(solar: &SolarDay) -> String {
+    let f = if let Some(x) = solar.get_festival() {
         x.get_name()
     } else {
         let ld = solar.get_lunar_day();
@@ -82,19 +110,6 @@ pub fn festival_text(solar: &SolarDay) -> String {
             String::new()
         }
     };
-    if f.is_empty() {
-        let (m, d) = (solar.get_month(), solar.get_day());
-        let first = SolarDay::from_ymd(solar.get_year(), m, 1);
-        f = match (m, d) {
-            (2, 14) => "情人节".to_string(),
-            (5, dd) if dd == nth_sunday(first.get_week().get_index(), 2) => "母亲节".to_string(),
-            (6, dd) if dd == nth_sunday(first.get_week().get_index(), 3) => "父亲节".to_string(),
-            _ => String::new(),
-        };
-    }
-    if !term.is_empty() && f == format!("{term}节") {
-        return String::new();
-    }
     if f.is_empty() {
         let ld = solar.get_lunar_day();
         let nd = ld.next(1);
@@ -106,12 +121,47 @@ pub fn festival_text(solar: &SolarDay) -> String {
     f
 }
 
-/// 计算某日四段数据（weather 由调用方传入，可为占位符 "--"）。
-pub fn compute_day(y: i32, m: u32, d: u32, weather: &str) -> DayData {
+/// 节日行（任务栏节日段当日名）：西方节日不显示（v63）；清明日与节气段同源
+/// 去重返回空（tyme 报「清明节」、节气段已显示「清明」）。D 阶段的西方节日
+/// 补充表（情人节/母亲节/父亲节）按用户定案整体移除。
+pub fn festival_text(solar: &SolarDay) -> String {
+    let f = festival_raw(solar);
+    if f.is_empty() || is_western_festival(&f) {
+        return String::new();
+    }
+    let term = term_text(solar);
+    if !term.is_empty() && f == format!("{term}节") {
+        return String::new();
+    }
+    f
+}
+
+/// 节日段文本（v63 用户定案）：当天有中国节日（传统+法定+纪念日）→ 节日名；
+/// 否则 → 正向逐日扫描 tyme 节日表，距最近一个白名单目标（中国传统节日/法定
+/// 节日，≤400 天必中）显示「距春节10天」。清明日在白名单内但当日名去重给节气
+/// 段，扫描用 festival_raw（不去重）保证「距清明节N天」可达。
+pub fn festival_segment_text(y: i32, m: u32, d: u32) -> String {
+    let solar = SolarDay::from_ymd(y as isize, m as usize, d as usize);
+    let today = festival_text(&solar);
+    if !today.is_empty() {
+        return today;
+    }
+    for i in 1..=400usize {
+        let f = festival_raw(&solar.next(i as isize));
+        if is_countdown_target(&f) {
+            return format!("距{f}{i}天");
+        }
+    }
+    String::new()
+}
+
+/// 计算某日数据（weather=天气段文本；festival_seg=节日段文本（v63 含倒计时，
+/// 由调用方按日缓存后传入——倒计时需正向扫描多日，不能每秒重算））。
+pub fn compute_day(y: i32, m: u32, d: u32, weather: &str, festival_seg: &str) -> DayData {
     let solar = SolarDay::from_ymd(y as isize, m as usize, d as usize);
     DayData {
         weather: weather.to_string(),
-        festival: DayData::seg_or_blank(festival_text(&solar)),
+        festival: DayData::seg_or_blank(festival_seg.to_string()),
         term: DayData::seg_or_blank(term_text(&solar)),
         lunar: lunar_text(&solar),
     }
@@ -262,6 +312,9 @@ pub fn spawn_data_thread() {
             let mut last_sent = String::new();
             let mut write_retry: u32 = 0;
             let mut just_refreshed = false;
+            // v63 节日段（倒计时/当日名）按日缓存——正向扫描多日不能每秒重算
+            let mut fest_date = (0i32, 0u32, 0u32);
+            let mut fest_seg = String::new();
             loop {
                 if super::STOP.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -280,6 +333,13 @@ pub fn spawn_data_thread() {
                         cur_date.0, cur_date.1, cur_date.2
                     ));
                     cur_date = (y, m, d);
+                }
+                if (y, m, d) != fest_date {
+                    fest_seg = festival_segment_text(y, m, d);
+                    fest_date = (y, m, d);
+                    if !fest_seg.is_empty() {
+                        super::dbg_log(&format!("data: festival segment: {fest_seg}"));
+                    }
                 }
                 if last_wx.elapsed() >= std::time::Duration::from_secs(30 * 60) {
                     last_wx = std::time::Instant::now();
@@ -313,7 +373,7 @@ pub fn spawn_data_thread() {
                         just_refreshed = false;
                         super::dbg_log(&format!("data: weather display: {wx_disp}"));
                     }
-                    compute_day(y, m, d, &wx_disp)
+                    compute_day(y, m, d, &wx_disp, &fest_seg)
                 };
                 // v57：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set
                 let style = format!("{DEFAULT_STYLE}{}", style_ext_json());
@@ -343,4 +403,41 @@ pub fn spawn_data_thread() {
             }
         })
         .ok();
+}
+
+#[cfg(test)]
+mod festival_v63_tests {
+    use super::*;
+
+    /// v63 节日段语义锁定：当日名（中国节日）/西方节日不显示/倒计时格式/清明去重。
+    /// 期望值=2026-09-16 实测 tyme4rs 1.5.0 输出（名称以 tyme 节日表为准）。
+    #[test]
+    fn festival_segments_2026() {
+        let cases: [(i32, u32, u32, &str); 15] = [
+            (2026, 1, 1, "元旦"),
+            (2026, 2, 14, "距除夕2天"),   // 情人节：西方不显示→倒数除夕
+            (2026, 2, 16, "除夕"),
+            (2026, 2, 17, "春节"),
+            (2026, 2, 18, "距元宵节13天"), // 春节次日
+            (2026, 3, 8, "妇女节"),       // 纪念日当天显示、非倒计时目标
+            (2026, 4, 5, "距劳动节26天"),  // 清明日：节日段去重给节气段
+            (2026, 4, 4, "距清明节1天"),   // 前一日：raw 扫描可达清明
+            (2026, 5, 1, "劳动节"),
+            (2026, 5, 10, "距端午节40天"), // 母亲节：西方不显示
+            (2026, 6, 19, "端午节"),
+            (2026, 9, 16, "距中秋节9天"),
+            (2026, 9, 25, "中秋节"),
+            (2026, 10, 1, "国庆节"),
+            (2026, 12, 25, "距元旦7天"), // 圣诞：西方不显示
+        ];
+        for (y, m, d, want) in cases {
+            assert_eq!(festival_segment_text(y, m, d), want, "{y}-{m:02}-{d:02}");
+        }
+        // 西方节日过滤与清明去重（当日名口径）
+        let valentine = SolarDay::from_ymd(2026, 2, 14);
+        assert_eq!(festival_text(&valentine), "");
+        let qm = SolarDay::from_ymd(2026, 4, 5);
+        assert_eq!(festival_text(&qm), "");
+        assert_eq!(festival_raw(&qm), "清明节");
+    }
 }
