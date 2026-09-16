@@ -72,8 +72,10 @@ export interface ClockbarStyle {
   halignTime: 0 | 1 | 2;
   /** 日期行水平对齐（0=靠左 1=居中 2=靠右） */
   halignDate: 0 | 1 | 2;
-  /** 天气段城区名（手动配置，拼在天气段最前；空=不显示） */
+  /** 天气段城区名（手动配置，拼在天气段最前；空=自动跟随 adcode 对应城区名） */
   weatherCity: string;
+  /** 高德 adcode（留空=IP 自动定位，直辖市只到市级；填 6 位=锁定区县级） */
+  weatherAdcode: string;
   /** 天气段 emoji 图标开关（缺省开） */
   weatherEmoji: boolean;
   /** emoji 变体（true=彩色 U+FE0F 缺省 / false=黑白 U+FE0E；实测仅部分字形真黑白） */

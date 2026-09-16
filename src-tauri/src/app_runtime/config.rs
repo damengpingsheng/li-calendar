@@ -44,9 +44,15 @@ pub struct ClockbarStyleConfig {
     /// 日期行水平对齐（0=靠左缺省 1=居中 2=靠右）。
     #[serde(default)]
     pub halign_date: Option<i32>,
-    /// 天气段城区名（T 阶段：手动配置，拼在天气段最前；空/缺省=不显示）。
+    /// 天气段城区名（T 阶段：手动配置，拼在天气段最前；空/缺省=自动跟随 adcode
+    /// 对应城区名（高德响应自带，剥「市/区/县」后缀））。
     #[serde(default)]
     pub weather_city: Option<String>,
+    /// 高德 adcode（v62：留空=LICAL_AMAP_CITY env>7 天缓存>/v3/ip 自动定位；
+    /// 填 6 位数字=锁定区县级精度——家庭宽带 IP 的区县定位各家库互相矛盾，
+    /// 自动定位对直辖市只到市级，2026-09-16 实测）。
+    #[serde(default)]
+    pub weather_adcode: Option<String>,
     /// 天气段 emoji 图标开关（T 阶段：缺省开）。
     #[serde(default)]
     pub weather_emoji: Option<bool>,

@@ -54,7 +54,8 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   gap2: 10,
   halignTime: 0,
   halignDate: 0,
-  weatherCity: '昌平',
+  weatherCity: '',
+  weatherAdcode: '',
   weatherEmoji: true,
   weatherEmojiColor: true,
   weatherText: true,
@@ -85,8 +86,10 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     gap2: typeof r.gap2 === 'number' ? Math.min(40, Math.max(0, r.gap2)) : d.gap2,
     halignTime: r.halignTime === 1 || r.halignTime === 2 ? r.halignTime : 0,
     halignDate: r.halignDate === 1 || r.halignDate === 2 ? r.halignDate : 0,
-    // v60 天气段增强（后端还会再清洗/钳制一次——双端防御）
+    // v60 天气段增强（后端还会再清洗/钳制一次——双端防御）；v62 城区名留空=自动跟随
     weatherCity: typeof r.weatherCity === 'string' ? r.weatherCity.slice(0, 16) : d.weatherCity,
+    weatherAdcode:
+      typeof r.weatherAdcode === 'string' ? r.weatherAdcode.replace(/\D/g, '').slice(0, 6) : d.weatherAdcode,
     weatherEmoji: r.weatherEmoji !== false,
     weatherEmojiColor: r.weatherEmojiColor !== false,
     weatherText: r.weatherText !== false,
@@ -119,6 +122,17 @@ const WidgetShowForm: React.FC = () => {
     const v = cityDraft.trim().slice(0, 16);
     if (v !== clockbarStyle.weatherCity) {
       void commitStyle({ ...clockbarStyle, weatherCity: v });
+    }
+  };
+  /** 城区 adcode 草稿（留空=IP 自动定位；6 位数字=锁定区县级） */
+  const [adcodeDraft, setAdcodeDraft] = useState<string>(clockbarStyle.weatherAdcode);
+  useEffect(() => {
+    setAdcodeDraft(clockbarStyle.weatherAdcode);
+  }, [clockbarStyle.weatherAdcode]);
+  const commitAdcode = (): void => {
+    const v = adcodeDraft.replace(/\D/g, '').slice(0, 6);
+    if (v !== clockbarStyle.weatherAdcode) {
+      void commitStyle({ ...clockbarStyle, weatherAdcode: v });
     }
   };
 
@@ -417,16 +431,30 @@ const WidgetShowForm: React.FC = () => {
           </Divider>
           <div style={rowStyle}>
             <span style={{ width: 96 }}>城区名</span>
-            <Input
-              size="small"
-              style={{ width: 130 }}
-              maxLength={16}
-              value={cityDraft}
-              placeholder="留空不显示"
-              onChange={(e) => setCityDraft(e.target.value)}
-              onBlur={commitCity}
-              onPressEnter={commitCity}
-            />
+            <Tooltip title="城区名留空=自动跟随定位的城区（高德响应自带，剥「市/区/县」后缀）；填写则固定显示所填文本">
+              <Input
+                size="small"
+                style={{ width: 110 }}
+                maxLength={16}
+                value={cityDraft}
+                placeholder="留空=自动"
+                onChange={(e) => setCityDraft(e.target.value)}
+                onBlur={commitCity}
+                onPressEnter={commitCity}
+              />
+            </Tooltip>
+            <Tooltip title="高德行政区划码：留空=按 IP 自动定位（直辖市只到市级）；填 6 位锁定区县级（如 110114=昌平区）。改后下一分钟内生效">
+              <Input
+                size="small"
+                style={{ width: 96 }}
+                maxLength={6}
+                value={adcodeDraft}
+                placeholder="adcode"
+                onChange={(e) => setAdcodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                onBlur={commitAdcode}
+                onPressEnter={commitAdcode}
+              />
+            </Tooltip>
             <span style={{ whiteSpace: 'nowrap' }}>现象文字</span>
             <Switch
               size="small"

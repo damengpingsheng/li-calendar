@@ -19,7 +19,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 /// 实况数据（temp 原样字符串，text=天气名，code=weathercode 整数——emoji 码表用，
-/// wind=风向风级展示串如「东北风3~4级」，空=无风信息）
+/// wind=风向风级展示串如「东北风3~4级」，city_auto=响应自带城区名「昌平区」剥后缀）
 pub struct WeatherNow {
     pub temp: String,
     pub text: String,
@@ -27,6 +27,9 @@ pub struct WeatherNow {
     pub code: u32,
     /// 风向风级展示串（高德源；中国天气网源无此数据=空串）
     pub wind: String,
+    /// 城区名自动跟随（高德 weatherInfo lives[0].city 剥「市/区/县」后缀；
+    /// liConfig weatherCity 非空时被手动值覆盖，中国天气网源=空）
+    pub city_auto: String,
 }
 
 /// 天气段展示选项（T 阶段定案：城区名+emoji 图标+现象文字，全部可配）。
@@ -185,7 +188,7 @@ pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
         return "--".to_string();
     }
     let mut s = String::new();
-    let city = o.city.trim();
+    let city = if o.city.is_empty() { w.city_auto.trim() } else { o.city.trim() };
     if !city.is_empty() {
         s.push_str(city);
         s.push(' ');
@@ -396,7 +399,7 @@ pub fn fetch_now(cityid: &str) -> Result<WeatherNow, String> {
         u32::MAX
     };
     let text = weather_code_name(num).to_string();
-    Ok(WeatherNow { temp, text, code: num, wind: String::new() })
+    Ok(WeatherNow { temp, text, code: num, wind: String::new(), city_auto: String::new() })
 }
 
 /// 高德天气实况（restapi.amap.com/v3/weather/weatherInfo，HTTP 直连零新依赖，
@@ -430,17 +433,127 @@ pub fn fetch_now_amap(key: &str, adcode: &str) -> Result<WeatherNow, String> {
         &json_str(&body, "winddirection").unwrap_or_default(),
         &json_str(&body, "windpower").unwrap_or_default(),
     );
-    Ok(WeatherNow { temp, code: amap_text_code(&text), text, wind })
+    // 城区名自动跟随：lives[0].city（如「昌平区」「北京市」）剥一层 市/区/县 后缀
+    let raw_city = json_str(&body, "city").unwrap_or_default();
+    let city_auto = strip_city_suffix(&raw_city);
+    Ok(WeatherNow { temp, code: amap_text_code(&text), text, wind, city_auto })
 }
 
-/// 数据源调度（T 阶段换源定案）：环境变量 GAODE_WEATHER_API（32 位高德 Web服务 key）
-/// 在场 → 高德源（adcode=LICAL_AMAP_CITY 覆盖，缺省 110114=昌平区）；高德失败回退
-/// 中国天气网旧链路（cityid 解析链不变）。两者都失败返回拼接错误。
+/// 城区名剥一层尾缀（「昌平区」→昌平、「北京市」→北京）；剥完为空则原样返回。
+fn strip_city_suffix(name: &str) -> String {
+    let n = name.trim();
+    if n.is_empty() {
+        return String::new();
+    }
+    let stripped = n
+        .strip_suffix('市')
+        .or_else(|| n.strip_suffix('区'))
+        .or_else(|| n.strip_suffix('县'))
+        .unwrap_or(n);
+    if stripped.is_empty() { n.to_string() } else { stripped.to_string() }
+}
+
+/// amap adcode 缓存文件（exe 同目录）。内容两行：`adcode` + 定位时的 unix 天数
+/// （7 天复验——搬家后最迟一周自动跟随新 IP；删文件立即重定位）。
+fn amap_cache_path() -> std::path::PathBuf {
+    let exe = std::env::current_exe().ok();
+    let dir = exe
+        .as_ref()
+        .and_then(|p| p.parent())
+        .map(|d| d.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    dir.join("clockbar_amap_adcode.txt")
+}
+
+fn unix_days() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() / 86400)
+        .unwrap_or(0)
+}
+
+fn valid_adcode(s: &str) -> bool {
+    s.len() == 6 && s.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// 高德 /v3/ip 自动定位（HTTP 直连）。成功返回 adcode 并写缓存。
+/// 2026-09-16 实测：直辖市只到市级（北京→110000「北京市」），非直辖市通常区级；
+/// 各免费 IP 库对家庭宽带区县判定互相矛盾（高德=北京市/ipip=北京市/wgeo=怀柔），
+/// 区县级精度请用 liConfig weatherAdcode 或 LICAL_AMAP_CITY 锁定。
+fn locate_amap_adcode(key: &str) -> Result<String, String> {
+    let body = http_get(
+        "restapi.amap.com",
+        &format!("/v3/ip?key={key}"),
+        "http://restapi.amap.com/",
+        Duration::from_secs(8),
+    )?;
+    let status = json_str(&body, "status").ok_or("ip: no status")?;
+    if status != "1" {
+        return Err(format!("ip: status={status}"));
+    }
+    let adcode = json_str(&body, "adcode").ok_or("ip: no adcode")?;
+    if !valid_adcode(&adcode) {
+        return Err(format!("ip: bad adcode '{adcode}'"));
+    }
+    let p = amap_cache_path();
+    if let Some(dir) = p.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(&p, format!("{adcode}\n{}", unix_days()));
+    super::dbg_log(&format!("weather: amap ip-located adcode {adcode} -> cache"));
+    Ok(adcode)
+}
+
+/// 高德 adcode 解析链（v62 全自动）：
+/// ① env `LICAL_AMAP_CITY`（测试/临时覆盖）
+/// ② liConfig `weatherAdcode`（设置页锁定区县级精度；6 位数字才认）
+/// ③ 缓存文件（≤7 天直接用；>7 天复验）
+/// ④ /v3/ip 自动定位（成功写缓存）
+/// ⑤ 缓存过期但定位失败 → 陈旧值兜底 → 都没有才 Err（调用方回退中国天气网链路）。
+fn resolve_amap_adcode(key: &str) -> Result<String, String> {
+    if let Ok(a) = std::env::var("LICAL_AMAP_CITY") {
+        if valid_adcode(&a) {
+            return Ok(a);
+        }
+    }
+    let cfg = super::current_style();
+    if let Some(c) = cfg.as_ref().and_then(|c| c.weather_adcode.as_deref()) {
+        let c = c.trim();
+        if valid_adcode(c) {
+            return Ok(c.to_string());
+        }
+    }
+    let cache = amap_cache_path();
+    let cached = std::fs::read_to_string(&cache).ok();
+    if let Some(content) = &cached {
+        let mut lines = content.lines();
+        let ad = lines.next().unwrap_or("").trim();
+        let day: u64 = lines.next().unwrap_or("0").trim().parse().unwrap_or(0);
+        if valid_adcode(ad) && unix_days().saturating_sub(day) < 7 {
+            return Ok(ad.to_string());
+        }
+    }
+    match locate_amap_adcode(key) {
+        Ok(a) => Ok(a),
+        Err(e) => match cached.and_then(|c| {
+            c.lines().next().map(|s| s.trim().to_string()).filter(|s| valid_adcode(s))
+        }) {
+            Some(stale) => {
+                super::dbg_log(&format!("weather: ip locate failed ({e}), stale cache {stale}"));
+                Ok(stale)
+            }
+            None => Err(e),
+        },
+    }
+}
+
+/// 数据源调度（T 阶段换源定案 + v62 全自动行政区划）：环境变量 GAODE_WEATHER_API
+/// （32 位高德 Web服务 key）在场 → 高德源（adcode 四层解析链见 resolve_amap_adcode）；
+/// 高德失败回退中国天气网旧链路（cityid 解析链不变）。两者都失败返回拼接错误。
 pub fn fetch_now_any() -> Result<WeatherNow, String> {
     let key = std::env::var("GAODE_WEATHER_API").unwrap_or_default();
-    let adcode = std::env::var("LICAL_AMAP_CITY").unwrap_or_else(|_| "110114".into());
     if !key.is_empty() {
-        match fetch_now_amap(&key, &adcode) {
+        match resolve_amap_adcode(&key).and_then(|ad| fetch_now_amap(&key, &ad)) {
             Ok(w) => return Ok(w),
             Err(e) => {
                 let fb = fetch_now(&resolve_cityid());
