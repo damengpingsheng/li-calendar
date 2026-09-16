@@ -20,7 +20,7 @@
   - **【E5 晨检产出】VM 停写复发**（21:04 冻结于 20:46）：**零会话扰动环境**——会话循环归因推翻，共同点只剩 tap 驻留+reparent；处置=explorer 重启恢复；归 F 长稳观察；**跨夜日界翻转已补验**（00:03 初三→初四 ✓）；
   - **session.rs 顺手修复**：loaded 谓词硬编码 "ver":49 永不命中（对齐 TAP_VER）；
 - **工件**：tap v56（TAPVER 56；b51~b55 迭代版本）；部署=`D:\Program Files\li-calendar\`（liCalendar.exe + lical_clock_tap56.dll，旧版留存回滚）；证据 `D:\agents_tmp\s_stage_20260913\`（s1_*/s3_*/s4_*/s5_* 截图+日志）+ `clockbar_tap_b51~56.log`；
-- **测试基线现状**（2026-09-16 23:26 部署后）：liCalendar 运行中（注入开、explorer 5824、tap v58 驻留；双行：昌平 ⛅ 20℃ 多云 西北风1~3级 距中秋节9天 + 23:26 / 周三 2026-09-16+八月初六；liConfig：gap=22/gap2=10、双行居中、weatherCity=空（自动跟随）、weatherAdcode=110114（锁定昌平区）、emoji 黑白（用户自切）+文字/风向风级开）；高德 key=用户作用域环境变量 GAODE_WEATHER_API（**部署重启须显式注入**：Start-Process 继承启动者 shell 的陈旧进程环境，见方案 v61 段）；PotPlayer 常驻勿扰；GUI 自动化（鼠标/键盘注入）勿做，被动截图可用；
+- **测试基线现状**（2026-09-16 23:30 部署后）：liCalendar 运行中（注入开、explorer 5824、tap v58 驻留；双行：昌平 ⛅ 20℃ 多云 西北风1~3级 + 23:30 / 周三 2026-09-16+距中秋节9天+八月初六——**节日段已移日期行、在日期后农历前（liConfig rows.festival=2，用户定案）**；liConfig：gap=22/gap2=10、双行居中、weatherCity=空（自动跟随）、weatherAdcode=110114（锁定昌平区）、emoji 黑白（用户自切）+文字/风向风级开）；高德 key=用户作用域环境变量 GAODE_WEATHER_API（**部署重启须显式注入**：Start-Process 继承启动者 shell 的陈旧进程环境，见方案 v61 段）；**改 liConfig 必须在应用死亡窗口内做**（运行中编辑会被应用内存配置回写覆盖，23:29 实测一次）；PotPlayer 常驻勿扰；GUI 自动化（鼠标/键盘注入）勿做，被动截图可用；
 - **遗留（F/观察）**：①VM 停写归因未定案（归 F 长稳）②19:11 静默退出未复现 ③设置窗非最大化时小组件控件点击命中性一般（体验备注）④标记文件 toggle 钩子+panic 钩子 F 清理 ⑤时钟键盘唤起飞出/低分辨率/DPI 压测/触摸（C/D 遗留照旧）；
 - **E 阶段定案不变**（E0~E4/E6 关闭；A/B/C/D 定案不变，血泪全集内置 v56）；**F 阶段=真实使用观察期+退役清理 PR（方案 §5/§7）**。
 
