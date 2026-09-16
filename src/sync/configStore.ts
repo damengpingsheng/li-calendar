@@ -36,6 +36,7 @@ const configWindowsDefaults = {
     rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
     gap: 10,
     gap2: 10,
+    vgap: 0,
     halignTime: 0,
     halignDate: 0,
     weatherCity: '',

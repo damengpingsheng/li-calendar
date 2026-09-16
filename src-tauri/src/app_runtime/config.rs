@@ -38,6 +38,9 @@ pub struct ClockbarStyleConfig {
     /// 日期行段间距 px（0~40，缺省 10；与时间行分开调节）。
     #[serde(default)]
     pub gap2: Option<f64>,
+    /// 两行垂直间距 px（0~20，缺省 0；v59 tap 第二行 Margin 上边距）。
+    #[serde(default)]
+    pub vgap: Option<f64>,
     /// 时间行水平对齐（0=靠左缺省 1=居中 2=靠右）。
     #[serde(default)]
     pub halign_time: Option<i32>,

@@ -1,5 +1,7 @@
 // lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
 // v49/v50=E，v51=S 阶段时钟段自定义）
+// v59 变更（用户需求）：两行垂直间距可调——vgap（c1set "vgap"，钳制 0~20），
+//   第二行横板 Margin 上边距，LayoutHpanelChildren 统一重设（mode10 全量重建生效）。
 // v58 变更（用户想看居中效果驱动）：行水平对齐可配——halign[2]（0=左缺省/1=居中/2=右），
 //   c1set "align1"/"align2"，作用于自建横板（合法写入对象）；时间数字右侧空白=
 //   系统内边距+两行宽度差（日期行更宽撑宽容器、窄行左聚留白），对齐可配后用户可消除。
@@ -1155,6 +1157,7 @@ struct PanelStyle {
     double  sizes[4] = { 1,1,1,1 };   // v51 段字号倍率（钳制 0.5~2.0）
     double  gap = 10;                 // v51 段间距 px（钳制 0~40；时间行）
     double  gap2 = 10;                // v57 日期行段间距 px（钳制 0~40；与 gap 分开调节）
+    double  vgap = 0;                 // v59 两行垂直间距 px（钳制 0~20；第二行横板 Margin 上边距）
     int     rows[4] = { 1,1,1,2 };    // v55 段行归属：1=时间行，2=日期行（缺省农历在日期行）
     int     halign[2] = { 0,0 };      // v58 行水平对齐：0=左(缺省/现状) 1=居中 2=右（作用于自建横板）
 };
@@ -1231,6 +1234,9 @@ static void ApplySegLook(wux::Controls::TextBlock const& seg, int i, wux::Contro
 // 摘 Time/首建摘 Date 走 v35 自我 REM 抑制窗口（摘段不触发 tracked-REM）。
 static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp,
                                  wux::Controls::StackPanel const& hp2) {
+    // v59 两行垂直间距：第二行横板上边距=vgap（每次布局统一重设，样式变更
+    // 经 PanelBuild(mode10) 全量重走此函数生效；垂直 margin 不进水平 reflow 预算）
+    try { hp2.Margin({ 0, g_style.vgap, 0, 0 }); } catch (...) {}
     auto removeFromParent = [](wux::UIElement const& u) {
         try {
             auto curParent = wuxm::VisualTreeHelper::GetParent(u.as<wux::DependencyObject>());
@@ -2603,6 +2609,13 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                             if (JGetDbl(scope, "gap2", &dGap2)) {
                                 if (dGap2 > 40) dGap2 = 40;
                                 st.gap2 = dGap2;
+                                any = true;
+                            }
+                            double dVGap;
+                            if (JGetDbl(scope, "vgap", &dVGap)) {
+                                if (dVGap < 0) dVGap = 0;
+                                if (dVGap > 20) dVGap = 20;
+                                st.vgap = dVGap;
                                 any = true;
                             }
                             double dA1;

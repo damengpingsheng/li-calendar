@@ -275,6 +275,11 @@ pub fn style_ext_json() -> String {
         "\"gap2\":{:.0}",
         cfg.gap2.map(|g| clamp_f64(g, 0.0, 40.0)).unwrap_or(10.0)
     ));
+    // vgap：两行垂直间距（0~20 钳制恒发，缺省 0=原生紧排；v59 tap 第二行 Margin）
+    f.push(format!(
+        "\"vgap\":{:.0}",
+        cfg.vgap.map(|g| clamp_f64(g, 0.0, 20.0)).unwrap_or(0.0)
+    ));
 
     // align1/align2：行水平对齐（0=靠左缺省 1=居中 2=靠右——v58，时间数字右侧
     // 空白=系统内边距+两行宽度差，对齐可配让用户消除窄行右侧留白）

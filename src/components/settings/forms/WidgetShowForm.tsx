@@ -52,6 +52,7 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
   gap: 10,
   gap2: 10,
+  vgap: 0,
   halignTime: 0,
   halignDate: 0,
   weatherCity: '',
@@ -84,6 +85,7 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     rows,
     gap: typeof r.gap === 'number' ? Math.min(40, Math.max(0, r.gap)) : d.gap,
     gap2: typeof r.gap2 === 'number' ? Math.min(40, Math.max(0, r.gap2)) : d.gap2,
+    vgap: typeof r.vgap === 'number' ? Math.min(20, Math.max(0, r.vgap)) : d.vgap,
     halignTime: r.halignTime === 1 || r.halignTime === 2 ? r.halignTime : 0,
     halignDate: r.halignDate === 1 || r.halignDate === 2 ? r.halignDate : 0,
     // v60 天气段增强（后端还会再清洗/钳制一次——双端防御）；v62 城区名留空=自动跟随
@@ -258,6 +260,22 @@ const WidgetShowForm: React.FC = () => {
           <Divider plain style={{ margin: '8px 0' }}>
             时钟段样式（注入式时钟开启时生效）
           </Divider>
+          <div style={rowStyle}>
+            <span style={{ width: 96 }}>上下行间距</span>
+            <Slider
+              min={0}
+              max={20}
+              step={1}
+              value={clockbarStyle.vgap}
+              onChange={(v) => previewStyle({ ...clockbarStyle, vgap: v })}
+              onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, vgap: v })}
+              style={{ width: 160 }}
+              tooltip={{ formatter: (v) => `${v}px` }}
+            />
+            <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
+              时间行与日期行之间的垂直间隔
+            </span>
+          </div>
           <div style={rowStyle}>
             <span style={{ width: 96 }}>时间行间距</span>
             <Slider
