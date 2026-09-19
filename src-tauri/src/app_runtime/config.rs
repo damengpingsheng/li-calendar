@@ -32,6 +32,13 @@ pub struct ClockbarStyleConfig {
     /// 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2）。
     #[serde(default)]
     pub rows: std::collections::BTreeMap<String, i32>,
+    /// 时间段文案格式（v64：token 子集 HH H hh h mm m ss tt，缺省 HH:mm；
+    /// 文本由走时线程下发，tap 零格式逻辑）。
+    #[serde(default)]
+    pub time_format: Option<String>,
+    /// 日期段文案格式（v64：token 子集 yyyy yy MM M dd d ddd dddd，缺省 yyyy/M/d）。
+    #[serde(default)]
+    pub date_format: Option<String>,
     /// 段间距 px（0~40，缺省 10；时间行）。
     #[serde(default)]
     pub gap: Option<f64>,

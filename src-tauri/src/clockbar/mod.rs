@@ -41,6 +41,10 @@ pub(crate) static STOP: AtomicBool = AtomicBool::new(false);
 /// 检测到本标志后清 last_sent（强制重发当前行重建面板）并立即刷新天气。
 pub(crate) static DATA_REINIT: AtomicBool = AtomicBool::new(false);
 
+/// 走时链重初始化标志（v64）：与 DATA_REINIT 同源置位（watch），由走时线程独立
+/// 消费——清 last_key 强制补发当前时间/日期文本（断管重连后面板重建即时有值）。
+pub(crate) static TICK_REINIT: AtomicBool = AtomicBool::new(false);
+
 pub(crate) fn dbg_log(msg: &str) {
     use std::io::Write;
     if let Ok(mut f) = std::fs::OpenOptions::new()
@@ -63,14 +67,14 @@ pub fn injection_enabled() -> bool {
 pub fn tap_dll_path() -> Option<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            let p = dir.join("lical_clock_tap63.dll");
+            let p = dir.join("lical_clock_tap65.dll");
             if p.exists() {
                 return Some(p);
             }
         }
     }
     let dev = std::path::PathBuf::from(
-        r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap63.dll",
+        r"D:\project\li-calendar\src-tauri\clockbar\bin\lical_clock_tap65.dll",
     );
     dev.exists().then_some(dev)
 }

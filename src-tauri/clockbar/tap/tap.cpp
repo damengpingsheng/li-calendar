@@ -1,5 +1,23 @@
 // lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
-// v49/v50=E，v51=S 阶段时钟段自定义）
+// v49/v50=E，v51=S 阶段时钟段自定义，v64=六段统一）
+// v64 变更（时间/日期字号与格式可调，六段统一）：
+//   ① 段模型 4→6：time/date 成为自建段（SEGNAME[6]，order[6]，show/colors/sizes
+//      全部 [6]；rows[4]=1/rows[5]=2 恒定不收配置）。默认 order={0,1,2,5,3,4}=
+//      [w,f,t,date,lunar,time]——行内相对序与 v63 视觉一致（行2=日期、农历）。
+//   ② 原生 Time/Date 不再 reparent/包装（dateWrap 退役），改**原位隐藏**：
+//      SegWanted(4/5) 时 Visibility=Collapsed（隐藏前快照原值，恢复时回写）。
+//      系统 VM 仍每秒写 Time.Text（隐藏元素照写，无妨）；tick 每秒复核隐藏，
+//      若系统回写可见性则再压并记日志（拉锯观测点）。
+//   ③ c1t 快路径（text-only）：只对在场 time/date 段 Text() 赋值，不重排不重放
+//      样式；XAML 自动度量→SizeChanged→PanelReflow 链保持畅通。段缺席（首建前）
+//      退化为全量 PanelBuild（罕见）。c1set 同步支持 time/date 文本键（会话
+//      引导：数据线程每条 c1set 都带当前时间/日期文本）。
+//   ④ reflow：time/date 段永不被预算隐藏（隐藏候选=数据段 0..3）；行预算下限
+//      =max(capw, 该行 time/date 段期望宽)——时钟自身超 capw 时预算让位，
+//      裁数据段不裁时钟。time/date 段 MaxWidth=capw（不受 segmaxw 单段钳制）。
+//   ⑤ 时间/日期文案与字号由 host 走时线程/配置驱动（timeFormat/dateFormat、
+//      size_time/size_date）；tap 侧零格式逻辑。v35 reparent 自我 REM 抑制随
+//      reparent 一起退役（tracked REM 一律按真实重建处理）。
 // v59 变更（用户需求）：两行垂直间距可调——vgap（c1set "vgap"，钳制 0~20），
 //   第二行横板 Margin 上边距，LayoutHpanelChildren 统一重设（mode10 全量重建生效）。
 // v58 变更（用户想看居中效果驱动）：行水平对齐可配——halign[2]（0=左缺省/1=居中/2=右），
@@ -246,11 +264,9 @@ static Snap g_snap;
 // C1 面板前置声明（定义在文件后部；树回调只置标志/清引用，零引擎调用零锁等待）
 static void   PanelOrphan();
 static HRESULT PanelBuild(bool rebuildAfterGen);
-static bool   SelfReparentPositive();
 static volatile LONG g_panelWanted = 0;  // host 要求面板在场（c1set 置位，c1free/断线清零）
 static volatile LONG g_panelOn = 0;      // 面板在场标志（定义于 C1 段，此处仅供树回调判读）
 static bool g_hasData = false;           // host 下发的段文案缓存（重建用）
-static volatile LONG g_selfReparent = 0; // reparent 期间的自我 REM 抑制（v35，定义于 C1 段）
 
 // locate 判定（调用方持 g_stateLock）：链 = DTIC → ContainerGrid → 无名 StackPanel → Time/Date
 static bool chain_matches(const std::unordered_map<unsigned long long, Node>& m,
@@ -384,14 +400,8 @@ class TapObject : public IObjectWithSite, public IVisualTreeServiceCallback2 {
             }
         } else {
             isTracked = (h == g_hTime || h == g_hDate || h == g_hStack || h == g_hCont || h == g_hDTIC);
-            // v35：reparent 自我抑制——构建 lambda 把 Time 移出原生面板时引擎同步报 REM，
-            // 这不是树重建。双重判据：构建窗口标志 + 正向校验（Time 现父=自建横板），
-            // 后者防引擎队列化回调导致的时序漂移。
-            if (isTracked && (h == g_hTime || h == g_hDate) && (g_selfReparent || SelfReparentPositive())) {
-                log_line("TRACK suppress self-mutation REM h=%llX", h);
-                ReleaseSRWLockExclusive(&g_stateLock);
-                return;
-            }
+            // v64：reparent 退役（原生 Time/Date 原位隐藏，结构零改动）——tracked
+            // 元素 REM 一律按真实树重建处理（v35 自我抑制随 reparent 一起退役）。
             g_nodes.erase(h);
             if (isTracked && g_located) {
                 unsigned prevGen = g_gen;
@@ -1148,33 +1158,42 @@ static void CmdC0(int mode, const char* tag) {
 // 宿主心跳兜底（§4.2）：pipe 静默 >35s 视同断线，自动恢复。
 struct PanelStyle {
     double  fontscale = 0.55;   // 段字号 = Time.FontSize * fontscale * size_<id>
-    double  segmaxw = 170;      // 单段 MaxWidth（逻辑 px），超出省略号截断
+    double  segmaxw = 170;      // 单段 MaxWidth（逻辑 px），超出省略号截断（time/date 段用 capw）
     double  capw = 620;         // 自建横板 MaxWidth（显式宽度管理，D3）
     int     input = 1;          // C2 输入拦截 Border 开关
-    int     show[4] = { 1,1,1,1 };    // v51 数据段显示开关（time 恒显）
-    int     order[5] = { 0,1,2,3,4 }; // v51 显示顺序：order[k]=元素（0..3=数据段，4=Time）
-    unsigned colors[4] = { 0,0,0,0 }; // v51 段颜色：0=跟随主题，否则 0x00RRGGBB
-    double  sizes[4] = { 1,1,1,1 };   // v51 段字号倍率（钳制 0.5~2.0）
+    int     show[6] = { 1,1,1,1,1,1 };  // v64 段显示开关（time/date 恒 1——hide 键不接受）
+    int     order[6] = { 0,1,2,5,3,4 }; // v64 显示顺序：order[k]=元素（0..3=数据段，4=time，5=date）
+    unsigned colors[6] = { 0,0,0,0,0,0 }; // v64 段颜色：0=跟随主题，否则 0x00RRGGBB
+    double  sizes[6] = { 1,1,1,1,1,1 };  // v64 段字号倍率（钳制 0.5~2.0；4=time 5=date）
     double  gap = 10;                 // v51 段间距 px（钳制 0~40；时间行）
     double  gap2 = 10;                // v57 日期行段间距 px（钳制 0~40；与 gap 分开调节）
     double  vgap = 0;                 // v59 两行垂直间距 px（钳制 0~20；第二行横板 Margin 上边距）
-    int     rows[4] = { 1,1,1,2 };    // v55 段行归属：1=时间行，2=日期行（缺省农历在日期行）
+    int     rows[6] = { 1,1,1,2,1,2 }; // v55 段行归属：1=时间行，2=日期行（v64：4=time 恒 1，5=date 恒 2）
     int     halign[2] = { 0,0 };      // v58 行水平对齐：0=左(缺省/现状) 1=居中 2=右（作用于自建横板）
 };
 static PanelStyle         g_style;
-static wchar_t            g_segText[4][64];        // 天气 节日 节气 农历（host 下发缓存）
+static wchar_t            g_segText[6][64];        // 天气 节日 节气 农历 时间 日期（host 下发缓存）
 static unsigned           g_panelGen = 0;          // 建立时代次令牌
-static wfnd::IInspectable g_seg[4]{ nullptr, nullptr, nullptr, nullptr };
-static wfnd::IInspectable g_hpanelRef{ nullptr };   // 自建横板（含 4 段+Time）
-static wfnd::IInspectable g_hpanel2Ref{ nullptr };  // v55 第二行横板（Date+日期行段）
-static wfnd::IInspectable g_dateWrapRef{ nullptr }; // v55 Date 的自建包装 Border（对齐用，零写 Date 属性）
-static wfnd::IInspectable g_timeRef{ nullptr };     // 原生 Time（被 reparent，VM 持续写其 Text）
+static wfnd::IInspectable g_seg[6]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+static wfnd::IInspectable g_hpanelRef{ nullptr };   // 自建横板（时间行：行1 段+time 段）
+static wfnd::IInspectable g_hpanel2Ref{ nullptr };  // 第二行横板（date 段+行2 段）
+static wfnd::IInspectable g_timeRef{ nullptr };     // 原生 Time（v64：原位隐藏；样式模板+VM 持续写其 Text）
+static wfnd::IInspectable g_dateRef = nullptr;      // 原生 Date（v64：原位隐藏；日期行字号基准只读）
 static double g_dateFontSize = 0;                   // v56 原生 Date 字号（只读；0=未知→回退 Time 字号）
-static wfnd::IInspectable g_spRef{ nullptr }, g_dateRef{ nullptr }, g_contRef{ nullptr };
-static double             g_segDesired[4] = { 0,0,0,0 };
-static bool               g_segHidden[4] = { false,false,false,false };
-static int                g_snapDateIndex = -1;     // Date 在原生面板的原位（v46 摘离恢复用）
-static int                g_snapTimeIndex = -1;       // Time 在原生面板的原位（恢复用）
+// v64 原生元素可见性快照（隐藏前记录，恢复时回写；新 gen 元素首次隐藏时重取）
+static wux::Visibility g_snapTimeVis = wux::Visibility::Visible;
+static wux::Visibility g_snapDateVis = wux::Visibility::Visible;
+// v64a 可见性看护回调：26200 实测系统**每分钟 :01** 回写 Date（偶发 Time）
+// Visibility=Visible——tick 1s 复核存在 ≤1s 原生行闪现。改为 RegisterPropertyChanged
+// -Callback 即时压回：回调在 DP 变更通知内同步执行（渲染前），Collapsed 回写不产生
+// 可见帧；每分钟一次的回写量级=零拉锯风险（g_visGuard 防重入自触发）。tick 复核
+// 保留为兜底（正常应零出现——出现即说明回调链失效）。
+static int64_t g_timeVisTok = 0, g_dateVisTok = 0;
+static bool g_timeVisCb = false, g_dateVisCb = false;
+static int  g_visGuard = 0;
+static wfnd::IInspectable g_spRef{ nullptr }, g_contRef{ nullptr };
+static double             g_segDesired[6] = { 0,0,0,0,0,0 };
+static bool               g_segHidden[6] = { false,false,false,false,false,false };
 static winrt::event_token g_szToken{}, g_themeToken{};
 static bool               g_eventsOn = false;
 static wux::DispatcherTimer g_timer{ nullptr };
@@ -1249,16 +1268,16 @@ static void TipLeaseArm(DWORD ms) {
 static volatile LONG      g_lastRecvTick = 0;      // pipe 最近收到命令的时刻（GetTickCount）
 static volatile LONG      g_lastResyncTick = 0;    // 上次僵尸重同步时刻（限频 30s）
 static volatile LONG      g_lastSizeTick = 0;      // 横板最近一次尺寸变化时刻（v44 稳定门）
-// 隐藏优先级：v51 起按当前显示顺序（reflow 自左向右先藏/自右向左先恢复）；时间段=原生 Time 永不丢
-static const char* SEGNAME[4] = { "weather", "festival", "term", "lunar" };
+// 隐藏优先级：v51 起按当前显示顺序（reflow 自左向右先藏/自右向左先恢复）；
+// v64：time(4)/date(5) 段与原生 Time 一样永不丢（隐藏候选=数据段 0..3）
+static const char* SEGNAME[6] = { "weather", "festival", "term", "lunar", "time", "date" };
 static void AutoRestoreOnDisconnect(); // 定义于后（B0 恢复序列）
 static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::StackPanel const& hp2); // 定义于后（v41 tick 兜底调用；v55 双行）
 
 // ── v51 段身份/开关/顺序辅助 ──────────────────────────
-// 段 id 字符串 → 元素编号（0..3=数据段，4=Time，-1=未知）
+// 段 id 字符串 → 元素编号（0..3=数据段，4=time，5=date，-1=未知）
 static int SegIdFromName(const char* n) {
-    for (int i = 0; i < 4; i++) if (!strcmp(n, SEGNAME[i])) return i;
-    if (!strcmp(n, "time")) return 4;
+    for (int i = 0; i < 6; i++) if (!strcmp(n, SEGNAME[i])) return i;
     return -1;
 }
 // 段文案是否空白（v51：空白段不建元素——D4 节奏修复；host 空段发单空格）
@@ -1270,9 +1289,10 @@ static bool SegTextBlank(int i) {
 static bool SegWanted(int i) {
     return g_style.show[i] && !SegTextBlank(i);
 }
-// 段外观（字号/字体/颜色）。字号（v56 行感知对齐）：时间行段基准=Time.FontSize、
-// 日期行段基准=原生 Date.FontSize（各与所在行的系统文本对齐，用户实测 0.55 倍明显
-// 偏小后定案）；再乘 fontscale（全局倍率，缺省 1.0）与 size[i]（段倍率）。
+// 段外观（字号/字体/颜色）。字号（v56 行感知对齐，v64 适用全部 6 段）：
+// 时间行段基准=原生 Time.FontSize、日期行段基准=原生 Date.FontSize（只读快照；
+// 我们从不写原生字号 ⇒ 活读无累乘），再乘 fontscale（全局倍率，缺省 1.0）与
+// sizes[i]（段倍率；4=time 5=date 即「时间/日期字号可调」）。
 // 颜色=自定义色优先，theme 档（0）拷 Time 前景。仅作用于自建段（原生元素零写入）。
 static void ApplySegLook(wux::Controls::TextBlock const& seg, int i, wux::Controls::TextBlock const& tb) {
     double sz = g_style.sizes[i] > 0 ? g_style.sizes[i] : 1.0;
@@ -1292,13 +1312,11 @@ static void ApplySegLook(wux::Controls::TextBlock const& seg, int i, wux::Contro
         }
     } catch (...) {}
 }
-// v55：按 g_style.order + rows 重建两行横板子项顺序（UI 线程；winRT 调用非引擎调用）。
-// 第一行=时间行：rows[e]==1 的段依 order 相对序落位 + Time 恒在 order 槽位；
-// 第二行=日期行：[dateWrap(原生 Date), rows[e]==2 的段依 order 相对序]。
-// 段间距：每行内非首位段 left=gap（首位=0；日期行 Date 恒在首位⇒行内段恒有左邻）；
-// 时间行 Time 前最后段 right=gap（Time 原生零属性写入，v52 教训）。Date 的
-// 对齐由自建 dateWrap Border 承担（v55，零写 Date 属性）。
-// 摘 Time/首建摘 Date 走 v35 自我 REM 抑制窗口（摘段不触发 tracked-REM）。
+// v64：按 g_style.order + rows 重建两行横板子项顺序（UI 线程；winRT 调用非引擎调用）。
+// 六段全部是自建 TextBlock（含 time/date 段）——每行=rows[e]==该行的段依 order 相对序
+// 落位；不再触碰原生 Time/Date（它们原位隐藏，由 PanelBuild/tick 管理 Visibility）。
+// 段间距：每行内非首位段 left=行 gap（首位=0）。v53 的「Time 前末段 right=gap」
+// 特例退役（time 段是自建元素，margin 可写，统一按非首位 left 计）。
 static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp,
                                  wux::Controls::StackPanel const& hp2) {
     // v59 两行垂直间距：第二行横板上边距=vgap（每次布局统一重设，样式变更
@@ -1313,113 +1331,48 @@ static void LayoutHpanelChildren(wux::Controls::StackPanel const& hp,
                 for (uint32_t c = 0; c < pch.Size(); c++) {
                     if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(u)) { pch.RemoveAt(c); break; }
                 }
-            } else if (auto bd = curParent.try_as<wux::Controls::Border>()) {
-                // v55：Date 从 dateWrap 摘出时走这里（Border.Child 不是 Panel）
-                if (auto dU = g_dateRef.try_as<wux::UIElement>()) {
-                    if (winrt::get_abi(bd.Child()) == winrt::get_abi(dU)) bd.Child(nullptr);
-                }
             }
         } catch (...) {}
     };
     auto ch1 = hp.Children();
     auto ch2 = hp2.Children();
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         if (!g_seg[i]) continue;
         if (auto ui = g_seg[i].try_as<wux::UIElement>()) removeFromParent(ui);
     }
-    auto timeU = g_timeRef ? g_timeRef.try_as<wux::UIElement>() : nullptr;
-    auto dateWrapU = g_dateWrapRef ? g_dateWrapRef.try_as<wux::UIElement>() : nullptr;
-    InterlockedExchange(&g_selfReparent, 1);
-    if (timeU) removeFromParent(timeU);   // 首建时在原生 sp，重建时在自建横板
-    // v55 注意：Date 不在此处触碰——它常驻 dateWrap 内（wrap 的收编在 PanelBuild），
-    // 本函数只搬 dateWrap。若在此摘 Date（wrap.Child=null）会致 Date 无父隐形。
-    if (dateWrapU) removeFromParent(dateWrapU); // 重建时已在 ch2，先摘防 Append 双父异常
-    // 第一行：时间行
-    for (int k = 0; k < 5; k++) {
-        int e = g_style.order[k];
-        if (e == 4) {
-            if (timeU) ch1.Append(timeU);
-        } else if (g_seg[e] && g_style.rows[e] == 1) {
-            if (auto ui = g_seg[e].try_as<wux::UIElement>()) ch1.Append(ui);
-        }
-    }
-    // 第二行：日期行（Date 恒首位，之后依 order 相对序）
-    if (dateWrapU) ch2.Append(dateWrapU);
-    for (int k = 0; k < 5; k++) {
-        int e = g_style.order[k];
-        if (e == 4) continue;
-        if (g_seg[e] && g_style.rows[e] == 2) {
-            if (auto ui = g_seg[e].try_as<wux::UIElement>()) ch2.Append(ui);
-        }
-    }
-    InterlockedExchange(&g_selfReparent, 0);
-    // 段间距（v53/v55/v57）：按行独立——时间行用 gap、日期行用 gap2。每行内非首位
-    // 段 left=行间距；时间行 Time 前最后段 right=gap（Time 原生零属性写入）；
-    // 日期行 Date 恒在首位 ⇒ 行内段恒有左邻（left=gap2），无 right 需求。
-    {
-        int timeK = -1;
-        for (int k = 0; k < 5; k++) if (g_style.order[k] == 4) { timeK = k; break; }
-        int lastVisibleBeforeTime = -1;
-        for (int k = 0; k < (timeK >= 0 ? timeK : 5); k++) {
+    // 两行落位：行内依 order 相对序 Append（time 段=行1 普通成员，date 段=行2 普通成员）
+    for (int row = 1; row <= 2; row++) {
+        auto& ch = row == 1 ? ch1 : ch2;
+        double rowGap = row == 1 ? g_style.gap : g_style.gap2;
+        int visIdx = 0;
+        for (int k = 0; k < 6; k++) {
             int e = g_style.order[k];
-            if (e != 4 && g_seg[e] && g_style.rows[e] == 1) lastVisibleBeforeTime = k;
-        }
-        for (int k = 0; k < 5; k++) {
-            int e = g_style.order[k];
-            if (e == 4 || !g_seg[e]) continue;
-            bool row1 = g_style.rows[e] == 1;
-            double rowGap = row1 ? g_style.gap : g_style.gap2;
-            bool prev = false;
-            for (int j = 0; j < k; j++) {
-                int pe = g_style.order[j];
-                if (pe == 4 ? (row1 && timeK >= 0) : (g_seg[pe] && g_style.rows[pe] == (row1 ? 1 : 2))) { prev = true; break; }
-            }
-            if (!row1) prev = true; // 日期行：Date 恒在首位
-            bool lastBeforeTime = row1 && (k == lastVisibleBeforeTime) && timeK >= 0;
+            if (g_style.rows[e] != row) continue;
+            auto ui = g_seg[e] ? g_seg[e].try_as<wux::UIElement>() : nullptr;
+            if (!ui) continue;
+            ch.Append(ui);
             if (auto f = g_seg[e].try_as<wux::FrameworkElement>()) {
                 try {
                     auto mg = f.Margin();
-                    mg.Left = prev ? rowGap : 0.0;
-                    mg.Right = lastBeforeTime ? g_style.gap : 0.0;
+                    mg.Left = visIdx > 0 ? rowGap : 0.0;
+                    mg.Right = 0.0;
                     f.Margin(mg);
                 } catch (...) {}
             }
+            visIdx++;
         }
     }
-}
-
-// v46 正向判据（UI 线程；winRT 调用非引擎调用）：
-// Time 的现父=自建横板；或 Date 处于摘离态（面板在场且 Date 无父）。
-static bool SelfReparentPositive() {
-    try {
-        if (!g_panelOn) return false;
-        if (g_timeRef && g_hpanelRef) {
-            auto t = g_timeRef.try_as<wux::DependencyObject>();
-            auto hp = g_hpanelRef.try_as<wux::DependencyObject>();
-            if (t && hp) {
-                auto p = wuxm::VisualTreeHelper::GetParent(t);
-                if (p && winrt::get_abi(p.as<wfnd::IInspectable>()) == winrt::get_abi(hp.as<wfnd::IInspectable>())) return true;
-            }
-        }
-        if (g_dateRef) {
-            auto d = g_dateRef.try_as<wux::DependencyObject>();
-            if (d && !wuxm::VisualTreeHelper::GetParent(d)) return true;
-        }
-        return false;
-    } catch (...) { return false; }
 }
 
 // 树重建（gen++）时由 TrackTree 在 UI 线程调用：只置 panelOn=0（引用保留——断线时
 // PanelFree 仍需引用来拆除已 orphan 的面板元素，否则残留永远在屏上）。
 // 维护 tick/重建由 gen 令牌失配自然灭活。
 static void PanelOrphan() {
-    for (int i = 0; i < 4; i++) { g_segHidden[i] = false; }
+    for (int i = 0; i < 6; i++) { g_segHidden[i] = false; }
     g_eventsOn = false;
+    g_timeVisCb = false; g_dateVisCb = false; // v64a 旧代元素消亡，重放后由 PanelBuild 重注册
     InterlockedExchange(&g_panelOn, 0);
 }
-
-// v35：reparent 自我 REM 抑制的置位窗口见 PanelBuild（RemoveAt 前后）；
-// 正向校验 SelfReparentPositive 已随前置声明区定义。
 
 static void TouchRecv() { InterlockedExchange(&g_lastRecvTick, (LONG)GetTickCount()); }
 
@@ -1487,28 +1440,27 @@ static bool JScopeStyle(const char* j, char* out, size_t nOut) {
     out[n] = 0;
     return true;
 }
-// "order":"a,b,c,d,time" → order[5]（五元素各恰一次且含 time，否则整键拒绝）
+// "order":"a,b,c,d,date,time" → order[6]（v64：六元素各恰一次且含 time+date，否则整键拒绝）
 static bool JGetOrder(const char* s, int* order) {
     wchar_t w[96];
     if (!JGetStr(s, "order", w, 96)) return false;
     char a[128];
     w2a(w, a, sizeof(a));
-    int val[5], seen = 0;
-    bool used[5] = { false,false,false,false,false };
+    int val[6], seen = 0;
+    bool used[6] = { false,false,false,false,false,false };
     char* ctx = nullptr;
     for (char* tok = strtok_s(a, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
         int id = SegIdFromName(tok);
-        if (id < 0 || seen >= 5 || used[id]) return false;
+        if (id < 0 || seen >= 6 || used[id]) return false;
         used[id] = true;
         val[seen++] = id;
     }
-    if (seen != 5 || !used[4]) return false;
+    if (seen != 6 || !used[4] || !used[5]) return false;
     memcpy(order, val, sizeof val);
     return true;
 }
-// "hide":"weather,term"|"hide":"" → show[4]（列出的段关、未列=开；空值=全开；
-// time 不接受关；未知 id 整键拒绝。v53 起允许空值且 host 恒发本键——hide 缺省时
-// 旧 show 残留，会话内「把最后一个隐藏段重新打开」无法生效，23:34 实测）。
+// "hide":"weather,term"|"hide":"" → show[6]（列出的段关、未列=开；空值=全开；
+// time/date 不接受关；未知 id 整键拒绝。v53 起允许空值且 host 恒发本键）。
 static bool JGetHide(const char* s, int* show) {
     // 与 JGetStr 同口径但允许空串值（模式 "hide":" 共 8 字符，p 必须跨过整个模式）
     const char* p = strstr(s, "\"hide\":\"");
@@ -1521,7 +1473,7 @@ static bool JGetHide(const char* s, int* show) {
     }
     if (*p != '"') return false;
     val[n] = 0;
-    int v[4] = { 1,1,1,1 };
+    int v[6] = { 1,1,1,1,1,1 };
     if (n > 0) {
         wchar_t w[96];
         if (MultiByteToWideChar(CP_UTF8, 0, val, -1, w, (int)sizeof(w)) <= 0) return false;
@@ -1530,18 +1482,18 @@ static bool JGetHide(const char* s, int* show) {
         char* ctx = nullptr;
         for (char* tok = strtok_s(a, ",", &ctx); tok; tok = strtok_s(NULL, ",", &ctx)) {
             int id = SegIdFromName(tok);
-            if (id < 0 || id == 4) return false;
+            if (id < 0 || id >= 4) return false; // v64：time(4)/date(5) 恒显不接受关
             v[id] = 0;
         }
     }
     memcpy(show, v, sizeof v);
     return true;
 }
-// "color_<id>":"#RRGGBB"|"theme" → colors[4]（非法色值忽略该键；theme=0）
+// "color_<id>":"#RRGGBB"|"theme" → colors[6]（非法色值忽略该键；theme=0；v64 含 time/date）
 static bool JGetColors(const char* s, unsigned* colors) {
-    static const char* keys[4] = { "color_weather","color_festival","color_term","color_lunar" };
+    static const char* keys[6] = { "color_weather","color_festival","color_term","color_lunar","color_time","color_date" };
     bool any = false;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         wchar_t w[24];
         if (!JGetStr(s, keys[i], w, 24)) continue;
         char a[32];
@@ -1555,11 +1507,11 @@ static bool JGetColors(const char* s, unsigned* colors) {
     }
     return any;
 }
-// "size_<id>":倍率 → sizes[4]（钳制 0.5~2.0）
+// "size_<id>":倍率 → sizes[6]（钳制 0.5~2.0；v64 含 size_time/size_date）
 static bool JGetSizes(const char* s, double* sizes) {
-    static const char* keys[4] = { "size_weather","size_festival","size_term","size_lunar" };
+    static const char* keys[6] = { "size_weather","size_festival","size_term","size_lunar","size_time","size_date" };
     bool any = false;
-    for (int i = 0; i < 4; i++) {
+    for (int i = 0; i < 6; i++) {
         double v;
         if (!JGetDbl(s, keys[i], &v)) continue;
         any = true;
@@ -1569,7 +1521,7 @@ static bool JGetSizes(const char* s, double* sizes) {
     }
     return any;
 }
-// "row_<id>":1|2 → rows[4]（v55 行归属：1=时间行，2=日期行；其他值钳到 1）
+// "row_<id>":1|2 → rows[6]（v55 行归属；v64：仅数据段 0..3 接受，time 恒 1/date 恒 2）
 static bool JGetRows(const char* s, int* rows) {
     static const char* keys[4] = { "row_weather","row_festival","row_term","row_lunar" };
     bool any = false;
@@ -1673,9 +1625,7 @@ static void PanelTick() {
             return;
         }
         unsigned fixed = 0;
-        // v55：Date 不再摘离（恢复原生日期行，Date 在 dateWrap 内由系统全管）——
-        // v46 的「再摘」纠偏退役。仅防御性校验 Date 在 wrap 内（系统不管理其父）。
-        // 自建横板在场校验（在原生 sp 中）；v55 起 hp2 同检（缺失→补插，位置 1）
+        // 自建横板在场校验（在原生 sp 中；hp2 同检，缺失→补插，位置 1）
         auto spCh = sp.Children();
         auto hp = g_hpanelRef.try_as<wux::Controls::StackPanel>();
         auto hp2 = g_hpanel2Ref ? g_hpanel2Ref.try_as<wux::Controls::StackPanel>() : nullptr;
@@ -1702,50 +1652,34 @@ static void PanelTick() {
                 log_line("PANEL tick: re-insert hpanel2 at %u", (unsigned)at);
             }
         }
-        // v55：Date 须在 dateWrap 内（系统不管理 Date 的父，此为防御校验）
-        if (hp2 && g_dateWrapRef && g_dateRef) {
-            auto w = g_dateWrapRef.try_as<wux::Controls::Border>();
-            auto dU = g_dateRef.try_as<wux::UIElement>();
-            if (w && dU) {
-                auto c = w.Child();
-                bool inWrap = c && winrt::get_abi(c) == winrt::get_abi(dU);
-                if (!inWrap) {
-                    InterlockedExchange(&g_selfReparent, 1);
-                    try { w.Child(dU); } catch (...) { log_line("PANEL tick: re-wrap Date EXCEPTION"); }
-                    InterlockedExchange(&g_selfReparent, 0);
-                    fixed++;
-                    log_line("PANEL tick: re-wrap Date into dateWrap");
+        // v64 原生 Time/Date 隐藏复核：自建 time/date 段在场（wanted）时原生元素必须
+        // Collapsed；段缺席（引导期）不动。系统若回写可见性 → 再压 + 记日志（拉锯观测：
+        // 该日志若反复出现=系统在争夺 Visibility，需回方案重审隐藏策略）。
+        {
+            auto enforce = [&](wfnd::IInspectable const& ref, wux::Visibility& snapVis,
+                               int segIdx, const char* which) {
+                if (!g_seg[segIdx]) return;
+                if (auto u = ref.try_as<wux::UIElement>()) {
+                    try {
+                        if (u.Visibility() != wux::Visibility::Collapsed) {
+                            snapVis = u.Visibility(); // 现值非隐藏 ⇒ 作为恢复基准
+                            u.Visibility(wux::Visibility::Collapsed);
+                            fixed++;
+                            log_line("PANEL tick: re-hide native %s (system rewrote visibility)", which);
+                        }
+                    } catch (...) {}
                 }
-            }
+            };
+            enforce(g_timeRef, g_snapTimeVis, 4, "Time");
+            enforce(g_dateRef, g_snapDateVis, 5, "Date");
         }
-        // Time 在自建横板内校验（系统重主题化可能把它放回原生面板）
-        if (hp && g_timeRef) {
-            auto timeU = g_timeRef.try_as<wux::UIElement>();
-            auto hpCh = hp.Children();
-            bool inHpanel = false;
-            for (uint32_t c = 0; c < hpCh.Size(); c++)
-                if (timeU && winrt::get_abi(hpCh.GetAt(c)) == winrt::get_abi(timeU)) { inHpanel = true; break; }
-            if (!inHpanel) {
-                auto curParent = wuxm::VisualTreeHelper::GetParent(g_timeRef.as<wux::DependencyObject>());
-                if (curParent) {
-                    if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
-                        auto pch = pp.Children();
-                        for (uint32_t c = 0; c < pch.Size(); c++)
-                            if (timeU && winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(timeU)) { pch.RemoveAt(c); break; }
-                    }
-                }
-                hp.Children().Append(g_timeRef.try_as<wux::UIElement>());
-                fixed++;
-                log_line("PANEL tick: re-reparent Time into hpanel");
-            }
-        }
-        // v55 段成员校验（按行泛化）：wanted 段须在其行面板内、unwanted 段须缺席，
-        // 行归属变更同样失配；失配走整体重排（LayoutHpanelChildren，含 REM 抑制窗口）
+        // v55/v64 段成员校验（按行泛化）：wanted 段须在其行面板内、unwanted 段须缺席，
+        // 行归属变更同样失配；失配走整体重排（LayoutHpanelChildren）
         if (hp && hp2) {
             bool needLayout = false;
             auto hpCh = hp.Children();
             auto h2Ch = hp2.Children();
-            for (int i = 0; i < 4; i++) {
+            for (int i = 0; i < 6; i++) {
                 auto ui = g_seg[i] ? g_seg[i].try_as<wux::UIElement>() : nullptr;
                 bool in1 = false, in2 = false;
                 for (uint32_t c = 0; ui && c < hpCh.Size(); c++)
@@ -1779,7 +1713,7 @@ static void PanelTick() {
             }
         }
         // 缓存可见段期望宽（截断恢复判据）
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 6; i++) {
             if (!g_seg[i] || g_segHidden[i]) continue;
             if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
                 double dw = f.DesiredSize().Width;
@@ -1800,25 +1734,22 @@ static void PanelTick() {
     }
 }
 
-// 宽度策略（D3）：溢出→按优先级隐藏段；富余→按优先级恢复段。
+// 宽度策略（D3，v64 六段化）：溢出→按优先级隐藏**数据段**；富余→按优先级恢复。
 // v47/v48 实测定案：本机系统 XAML 对横板 MaxWidth 度量与排布均不兑现（实测
 // maxw=100 而 act=189.7）——宽度预算必须用 host 下发的 capw（显式管理），并用
 // Width（硬约束）做视觉钳制；DesiredSize 度量在级联期可能为 0（跳过评估）。
-// v55：两行各自独立预算（同一 capw 值）：时间行规则不变（Time 永不丢）；
-// 日期行溢出只藏我们的段（Date 的 Visibility 在系统手里，永不入 reflow 回路）。
+// v64：time(4)/date(5) 段永不被隐藏（隐藏候选=数据段 0..3）；行预算下限
+// =max(capw, 该行 time/date 段期望宽)——时钟自身超 capw 时预算让位（裁数据段
+// 不裁时钟），time/date 段 MaxWidth=capw（PanelBuild 设，不受 segmaxw 单段钳制）。
 static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::StackPanel const& hp2) {
     try {
         if (!g_panelOn) return;
-        double budget = g_style.capw;
-        if (budget <= 10) return;
-        // v51：显示顺序（自左向右）= 隐藏/恢复优先级序（时间段不在序列内，永不丢）
-        int seq[4];
+        if (g_style.capw <= 10) return;
+        // 显示顺序（自左向右）= 隐藏/恢复优先级序；time/date 段在序列内参与求和
+        int seq[6];
         int n = 0;
-        for (int k = 0; k < 5; k++) {
-            int e = g_style.order[k];
-            if (e != 4) seq[n++] = e;
-        }
-        // 行内期望宽求和（gap 计入，v51 纪律修订）；row=1|2
+        for (int k = 0; k < 6; k++) seq[n++] = g_style.order[k];
+        // 行内期望宽求和（gap 计入，v51 纪律修订）；row=1|2；返回行预算下限（含 time/date 让位）
         auto rowSum = [&](int row, bool* measuredOut) -> double {
             double sum = 0;
             bool anyVisible = false;
@@ -1829,38 +1760,35 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
                 if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                     double d = f.DesiredSize().Width;
                     if (d <= 0) { *measuredOut = false; break; }
-                    // v51：可见段之间的 gap 计入需求宽（gap 是 host 下发的确定常数，
-                    // 非引擎度量，不违反「勿信 MaxWidth/actual」本意）
-                    if (anyVisible) sum += g_style.gap;
+                    // 可见段之间的 gap 计入需求宽（gap 是 host 下发的确定常数）
+                    if (anyVisible) sum += (row == 1 ? g_style.gap : g_style.gap2);
                     sum += d;
                     anyVisible = true;
                 }
             }
-            if (row == 1 && g_timeRef) {
-                if (auto t = g_timeRef.try_as<wux::FrameworkElement>()) {
-                    double td = t.DesiredSize().Width;
-                    if (td <= 0) { *measuredOut = false; return sum; }
-                    if (anyVisible) sum += g_style.gap;
-                    sum += td;
-                }
-            }
             return sum;
         };
-        bool m1 = true, m2 = true;
+        bool m1 = true;
         double sum1 = rowSum(1, &m1);
         if (!m1) return; // 级联期度量未就绪，等下一轮
+        double budget = g_style.capw;
+        if (auto f4 = g_seg[4] ? g_seg[4].try_as<wux::FrameworkElement>() : nullptr) {
+            double td = f4.DesiredSize().Width;
+            if (td > budget) budget = td; // 时间段让位：预算下限=时间期望宽
+        }
         double target = sum1 > budget ? budget : sum1;
         try { hp.Width(target); } catch (...) {}  // v48：Width 硬钳制（MaxWidth 被环境无视）
         double overflow = sum1 - budget;
         if (overflow > 2) {
             for (int i = 0; i < n; i++) {         // 显示序自左向右：先藏离时间最远的段
                 int id = seq[i];
+                if (id >= 4) continue;            // v64：time/date 段永不隐藏
                 if (g_style.rows[id] != 1) continue;
                 if (!g_seg[id] || g_segHidden[id]) continue;
                 if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                     f.Visibility(wux::Visibility::Collapsed);
                     g_segHidden[id] = true;
-                    log_line("PANEL reflow: hide %s (row1 sum %.0f > capw %.0f)", SEGNAME[id], sum1, budget);
+                    log_line("PANEL reflow: hide %s (row1 sum %.0f > budget %.0f)", SEGNAME[id], sum1, budget);
                     return; // 一次一步，等下一轮布局
                 }
             }
@@ -1868,6 +1796,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             double surplus = -overflow;
             for (int i = n - 1; i >= 0; i--) {    // 显示序自右向左：先恢复紧邻时间的段
                 int id = seq[i];
+                if (id >= 4) continue;
                 if (g_style.rows[id] != 1) continue;
                 if (!g_seg[id] || !g_segHidden[id]) continue;
                 if (g_segDesired[id] > 0 && g_segDesired[id] > surplus - 8) continue; // 放不下
@@ -1879,7 +1808,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
                 }
             }
         }
-        // v55 日期行：Date 恒在场不入回路，仅我们的段参与（Date 期望宽从 wrap 读）
+        // v64 日期行：date 段=普通行2 成员（期望宽经 g_seg[5] 计入），数据段参与隐藏
         if (!hp2) return;
         double sum2 = 0;
         bool any2 = false;
@@ -1895,26 +1824,24 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
                 any2 = true;
             }
         }
-        if (g_dateWrapRef) {
-            if (auto w = g_dateWrapRef.try_as<wux::FrameworkElement>()) {
-                double dw = w.DesiredSize().Width;
-                if (dw <= 0) return;
-                if (any2) sum2 += g_style.gap2;
-                sum2 += dw;
-            }
+        double budget2 = g_style.capw;
+        if (auto f5 = g_seg[5] ? g_seg[5].try_as<wux::FrameworkElement>() : nullptr) {
+            double dd = f5.DesiredSize().Width;
+            if (dd > budget2) budget2 = dd; // 日期段让位
         }
-        double target2 = sum2 > budget ? budget : sum2;
+        double target2 = sum2 > budget2 ? budget2 : sum2;
         try { hp2.Width(target2); } catch (...) {}
-        double overflow2 = sum2 - budget;
+        double overflow2 = sum2 - budget2;
         if (overflow2 > 2) {
-            for (int i = 0; i < n; i++) {         // 日期行自左向右先藏（Date 不参与）
+            for (int i = 0; i < n; i++) {         // 日期行自左向右先藏（date 段不参与）
                 int id = seq[i];
+                if (id >= 4) continue;
                 if (g_style.rows[id] != 2) continue;
                 if (!g_seg[id] || g_segHidden[id]) continue;
                 if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                     f.Visibility(wux::Visibility::Collapsed);
                     g_segHidden[id] = true;
-                    log_line("PANEL reflow: hide %s (row2 sum %.0f > capw %.0f)", SEGNAME[id], sum2, budget);
+                    log_line("PANEL reflow: hide %s (row2 sum %.0f > budget %.0f)", SEGNAME[id], sum2, budget2);
                     return;
                 }
             }
@@ -1922,6 +1849,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             double surplus = -overflow2;
             for (int i = n - 1; i >= 0; i--) {    // 日期行自右向左恢复
                 int id = seq[i];
+                if (id >= 4) continue;
                 if (g_style.rows[id] != 2) continue;
                 if (!g_seg[id] || !g_segHidden[id]) continue;
                 if (g_segDesired[id] > 0 && g_segDesired[id] > surplus - 8) continue;
@@ -1936,10 +1864,51 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
     } catch (...) { log_line("PANEL reflow EXCEPTION — lie flat"); }
 }
 
-// 面板构建/更新（UI 线程，经 dispatched lambda 调用）。v34 reparent 结构；v55 双行化：
-// 原生 sp[Vertical, 不碰] = [自建横板[时间行段|Time], 自建横板2[DateWrap(原生 Date)|日期行段]]
-// ——Date 不再摘离（v46 教训只在「藏它」时成立；显示它时系统写 Visibility 与我们同向），
-// 其文本/可见性/配色全由系统管理，我们零写入。
+// v64a 可见性看护（UI 线程）：在原生 Time/Date 上注册 Visibility 属性回调，
+// 系统回写 Visible 时**渲染前**即时压回 Collapsed（段缺席/面板不在场时不干预）。
+static void VisWatchRegister(wfnd::IInspectable const& ref, int segIdx) {
+    bool& on = segIdx == 4 ? g_timeVisCb : g_dateVisCb;
+    if (on) return;
+    auto u = ref.try_as<wux::UIElement>();
+    if (!u) return;
+    try {
+        int64_t tok = u.RegisterPropertyChangedCallback(
+            wux::UIElement::VisibilityProperty(),
+            [segIdx](wux::DependencyObject const& d, wux::DependencyProperty const&) {
+                if (g_visGuard) return;
+                try {
+                    auto ue = d.try_as<wux::UIElement>();
+                    if (!ue || ue.Visibility() != wux::Visibility::Visible) return;
+                    if (!g_panelOn || !SegWanted(segIdx)) return; // 原生应可见的场合不干预
+                    g_visGuard = 1;
+                    ue.Visibility(wux::Visibility::Collapsed);
+                    g_visGuard = 0;
+                    log_line("VIS re-hide seg=%d pre-render (system minute refresh)", segIdx);
+                } catch (...) {}
+            });
+        if (segIdx == 4) g_timeVisTok = tok; else g_dateVisTok = tok;
+        on = true;
+        log_line("VIS watch registered seg=%d", segIdx);
+    } catch (...) { log_line("VIS register failed seg=%d", segIdx); }
+}
+static void VisWatchUnregister(wfnd::IInspectable const& ref, int segIdx) {
+    bool& on = segIdx == 4 ? g_timeVisCb : g_dateVisCb;
+    if (!on) return;
+    if (auto u = ref.try_as<wux::UIElement>()) {
+        try {
+            u.UnregisterPropertyChangedCallback(
+                wux::UIElement::VisibilityProperty(),
+                segIdx == 4 ? g_timeVisTok : g_dateVisTok);
+        } catch (...) {}
+    }
+    on = false;
+}
+
+// 面板构建/更新（UI 线程，经 dispatched lambda 调用）。v34 reparent 结构；v55 双行化；
+// v64 六段统一：原生 sp[Vertical, 不碰] = [自建横板[行1 段+time 段], 自建横板2[date 段+行2 段],
+// 原生 Time/Date(Collapsed)]——原生时间/日期**原位隐藏**（快照 Visibility，恢复时回写），
+// 系统 VM 仍每秒写 Time.Text（隐藏元素照写，无妨）；样式模板（字体/字重/前景/行基准字号）
+// 持续取自原生 Time/Date（只读）。
 static HRESULT PanelBuild(bool rebuildAfterGen) {
     unsigned long long hTime = 0, hStack = 0, hCont = 0, hDTIC = 0; unsigned gen = 0;
     if (!RequireHandles(&hTime, &hStack, &hCont, &hDTIC, &gen)) return E_NOT_VALID_STATE;
@@ -1962,10 +1931,12 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         wcsncpy_s(g_segText[1], L"教师节", _TRUNCATE);
         wcsncpy_s(g_segText[2], L"白露", _TRUNCATE);
         wcsncpy_s(g_segText[3], L"七月廿二", _TRUNCATE);
+        wcsncpy_s(g_segText[4], L"12:34", _TRUNCATE);
+        wcsncpy_s(g_segText[5], L"2026/9/19", _TRUNCATE);
         g_hasData = true;
     }
 
-    // Date 元素（按名在 sp 内找）+ Time/Date 原位记录
+    // Date 元素（按名在 sp 内找）——v64 仅用于引用/字号基准/隐藏目标（不 reparent）
     wfnd::IInspectable dateIns{ nullptr };
     int timeIdx = -1, dateIdx = -1;
     auto ch0 = sp.Children();
@@ -1976,13 +1947,8 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         }
     }
 
-    // 快照 + 引用（原生属性一律不写——v33 拉锯教训）。
-    // v53：原位快照仅在扫描到有效值时更新——Time/Date 已被摘进横板/dateWrap 的
-    // 重建轮次扫不到（timeIdx=-1），直接覆盖会把恢复位抹成 -1，此后 c1free/AUTO
-    // 恢复将把 Time 孤立（原生时钟消失；天气 30min 刷新即触发重建，v50 起潜伏）。
+    // 引用 + 原生字号基准（只读；v33 拉锯教训——布局属性零写入，Visibility 同向隐藏除外）
     if (dateIns) g_dateRef = dateIns;
-    if (timeIdx >= 0) g_snapTimeIndex = timeIdx;
-    if (dateIdx >= 0) g_snapDateIndex = dateIdx;
     g_spRef = sp; g_timeRef = tb;
     g_contRef = getObj(hCont);
 
@@ -2023,46 +1989,34 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
     try { hp2.HorizontalAlignment(g_style.halign[1] == 1 ? wux::HorizontalAlignment::Center
         : g_style.halign[1] == 2 ? wux::HorizontalAlignment::Right
         : wux::HorizontalAlignment::Left); } catch (...) {}
+    // v64 原生 Time/Date 原位隐藏 + 只读字号基准：
+    // ① 自建 time/date 段 wanted（文案非空）⇒ 原生元素 Collapsed（隐藏前快照现值，
+    //    PanelFree/退段时回写恢复）；段缺席（引导期/全空文案）⇒ 恢复原生可见——
+    //    宁可短暂出现原生行也不让时钟区空白。
+    // ② g_dateFontSize 只读原生 Date 字号（日期行段基准，与系统日期文本对齐）。
     {
-        bool dateWrapped = false;
-        if (g_dateWrapRef) {
-            if (auto w = g_dateWrapRef.try_as<wux::Controls::Border>()) {
-                auto dU = g_dateRef ? g_dateRef.try_as<wux::UIElement>() : nullptr;
-                auto c = w.Child();
-                if (dU && c && winrt::get_abi(c) == winrt::get_abi(dU)) dateWrapped = true;
-            }
-        }
-        if (!dateWrapped && g_dateRef) {
-            // 新建（或 wrap 与 Date 脱钩时重建）。【XAML 双父铁律】必须先把 Date 从
-            // 原父（原生 sp）摘除才能 Child()——v55 首建实测：直接 Child() 抛异常
-            // （c1set rc=2 hr=0x80004005，静默无 PANEL 日志）。摘除走 REM 抑制窗口。
-            auto dU = g_dateRef.try_as<wux::UIElement>();
-            bool removed = true;
-            if (dU) {
-                auto curParent = wuxm::VisualTreeHelper::GetParent(dU.as<wux::DependencyObject>());
-                if (curParent) {
-                    if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
-                        auto pch = pp.Children();
-                        InterlockedExchange(&g_selfReparent, 1);
-                        for (uint32_t c = 0; c < pch.Size(); c++) {
-                            if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(dU)) { pch.RemoveAt(c); break; }
-                        }
-                        InterlockedExchange(&g_selfReparent, 0);
+        auto hideNative = [](wfnd::IInspectable const& ref, wux::Visibility& snapVis, int segIdx,
+                             const char* which) {
+            if (!ref) return;
+            auto u = ref.try_as<wux::UIElement>();
+            if (!u) return;
+            try {
+                if (SegWanted(segIdx)) {
+                    if (u.Visibility() != wux::Visibility::Collapsed) {
+                        snapVis = u.Visibility(); // 首次隐藏前记录（Collapsed 态不覆盖快照）
+                        u.Visibility(wux::Visibility::Collapsed);
+                        log_line("PANEL build: native %s hidden (snap=%d)", which, (int)snapVis);
                     }
+                } else {
+                    u.Visibility(snapVis); // 引导期：恢复原生可见兜底
                 }
-            } else {
-                removed = false;
-            }
-            if (removed) {
-                // 新建（或 wrap 与 Date 脱钩时重建）；Child 赋值即完成 reparent
-                wux::Controls::Border wrap{};
-                wrap.VerticalAlignment(wux::VerticalAlignment::Center);
-                wrap.Child(dU);
-                g_dateWrapRef = wrap;
-                log_line("PANEL build: Date wrapped (native date row kept, idx %d)", g_snapDateIndex);
-            }
-        }
-        // v56：只读原生 Date 字号（日期行段基准，与系统日期文本对齐）；只读不写
+            } catch (...) {}
+        };
+        hideNative(g_timeRef, g_snapTimeVis, 4, "Time");
+        hideNative(g_dateRef, g_snapDateVis, 5, "Date");
+        // v64a 可见性看护：注册后系统分钟回写在渲染前即被压回（tick 复核仅兜底）
+        VisWatchRegister(g_timeRef, 4);
+        VisWatchRegister(g_dateRef, 5);
         if (g_dateRef) {
             if (auto d = g_dateRef.try_as<wux::Controls::TextBlock>()) {
                 try {
@@ -2073,8 +2027,9 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         }
     }
 
-    // 4 段（v51：wanted 段新建/更新文本与外观；unwanted 段先摘除再弃引用）
-    for (int i = 0; i < 4; i++) {
+    // 6 段（v64：wanted 段新建/更新文本与外观；unwanted 段先摘除再弃引用；
+    // time(4)/date(5) 段 MaxWidth=capw——不受 segmaxw 单段钳制，预算让位见 reflow）
+    for (int i = 0; i < 6; i++) {
         if (!SegWanted(i)) {
             if (g_seg[i]) {
                 // 【v51 实测教训】必须先从横板摘除再弃引用——先弃引用会让
@@ -2108,15 +2063,14 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
         seg.VerticalAlignment(wux::VerticalAlignment::Center);
         seg.TextWrapping(wux::TextWrapping::NoWrap);
         seg.TextTrimming(wux::TextTrimming::CharacterEllipsis);
-        seg.MaxWidth(g_style.segmaxw);
+        seg.MaxWidth(i >= 4 ? g_style.capw : g_style.segmaxw);
         if (makeNew) {
             g_seg[i] = seg;
             g_segHidden[i] = false;
             g_segDesired[i] = 0; // 清陈旧缓存（v44：避免跨会话污染 show 判据）
         }
     }
-    // 子项顺序+间距统一落位（v55 两行：含 Time reparent——首建时自原生 sp 摘除，
-    // 系统 VM 每秒仍按引用写 Time.Text，与父无关；Date 经 dateWrap 入第二行）
+    // 子项顺序+间距统一落位（v64 六段：time/date 段=普通自建成员；原生元素不动）
     LayoutHpanelChildren(hp, hp2);
     // 横板插到原生面板第 0 位，第二行插到第 1 位
     {
@@ -2138,25 +2092,26 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
     g_panelGen = gen;
     InterlockedExchange(&g_panelOn, 1);
     {
-        char s0[96], s1[96], s2[96], s3[96];
+        char s0[96], s1[96], s2[96], s3[96], s4[96], s5[96];
         w2a(g_segText[0], s0, sizeof(s0)); w2a(g_segText[1], s1, sizeof(s1));
         w2a(g_segText[2], s2, sizeof(s2)); w2a(g_segText[3], s3, sizeof(s3));
-        char ordA[128];
+        w2a(g_segText[4], s4, sizeof(s4)); w2a(g_segText[5], s5, sizeof(s5));
+        char ordA[144];
         {
             char* p = ordA;
-            for (int k = 0; k < 5; k++) {
+            for (int k = 0; k < 6; k++) {
                 int e = g_style.order[k];
                 char item[32];
-                if (e == 4) _snprintf_s(item, sizeof(item), _TRUNCATE, "TIME");
-                else if (!g_seg[e]) _snprintf_s(item, sizeof(item), _TRUNCATE, "(off)");
+                if (!g_seg[e]) _snprintf_s(item, sizeof(item), _TRUNCATE, "%s(off)", SEGNAME[e]);
                 else _snprintf_s(item, sizeof(item), _TRUNCATE, "%s@r%d", SEGNAME[e], g_style.rows[e]);
                 p += _snprintf_s(p, (size_t)(ordA + sizeof(ordA) - p), _TRUNCATE, "%s%s",
                                  k ? "|" : "", item);
             }
         }
-        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f timeFS=%.0f dateFS=%.1f (timeIdx=%d dateIdx=%d)",
-                 rebuildAfterGen ? "rebuild" : "build", gen, ordA, s0, s1, s2, s3,
-                 g_style.fontscale, g_style.gap, g_style.capw, tb.FontSize(), g_dateFontSize, timeIdx, dateIdx);
+        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f timeFS=%.0f dateFS=%.1f szT=%.2f szD=%.2f (timeIdx=%d dateIdx=%d)",
+                 rebuildAfterGen ? "rebuild" : "build", gen, ordA, s0, s1, s2, s3, s4, s5,
+                 g_style.fontscale, g_style.gap, g_style.capw, tb.FontSize(), g_dateFontSize,
+                 g_style.sizes[4], g_style.sizes[5], timeIdx, dateIdx);
         log_line("PANEL gaps: row1=%.0f row2=%.0f", g_style.gap, g_style.gap2);
     }
 
@@ -2241,10 +2196,10 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
             InterlockedExchange(&g_lastSizeTick, (LONG)GetTickCount()); // v44：只记脏，评估交给 tick（稳定门）
         });
         g_themeToken = sp.ActualThemeChanged([](wux::FrameworkElement const&, wfnd::IInspectable const&) {
-            try { // 主题翻转：仅 theme 档段重拷 Time 前景（v51：自定义色段不动）
+            try { // 主题翻转：仅 theme 档段重拷 Time 前景（v51：自定义色段不动；v64 六段）
                 if (auto t = g_timeRef.try_as<wux::Controls::TextBlock>()) {
                     auto fg = t.Foreground();
-                    for (int i = 0; i < 4; i++) {
+                    for (int i = 0; i < 6; i++) {
                         if (g_style.colors[i]) continue;
                         if (auto s = g_seg[i].try_as<wux::Controls::TextBlock>()) s.Foreground(fg);
                     }
@@ -2269,6 +2224,8 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
 }
 
 // 面板移除+原生恢复（UI 线程）。restoreNative=false 仅摘除我们自己的元素。
+// v64：原生 Time/Date 从未离开原生面板（无 reparent/dateWrap）——恢复=回写快照的
+// Visibility；横板/段/border 摘除逻辑同前。
 static void PanelFree(bool restoreNative) {
     try { if (g_timer) { g_timer.Stop(); } } catch (...) {}
     g_timer = nullptr;
@@ -2279,62 +2236,35 @@ static void PanelFree(bool restoreNative) {
             try { hp.SizeChanged(g_szToken); } catch (...) {}
     }
     g_eventsOn = false;
-    // 摘横板（连同段与 reparent 的 Time——先把 Time 放回原生面板原位）；
-    // v55：第二行横板摘除前先把 Date 从 dateWrap 解出
+    // v64a 摘可见性看护回调（元素即将还政于系统）
+    VisWatchUnregister(g_timeRef, 4);
+    VisWatchUnregister(g_dateRef, 5);
+    // v64 原生可见性恢复（快照回写；restoreNative=false 时保留隐藏——摘除面板场景
+    // 语义上仍在接管，交给后续 PanelBuild/AUTO 收尾）
+    if (restoreNative) {
+        if (auto u = g_timeRef.try_as<wux::UIElement>()) {
+            try { u.Visibility(g_snapTimeVis); } catch (...) {}
+        }
+        if (auto u = g_dateRef.try_as<wux::UIElement>()) {
+            try { u.Visibility(g_snapDateVis); } catch (...) {}
+        }
+    }
+    // 摘两块自建横板（段全在其中；不触碰原生 Time/Date 位置）
     auto sp = g_spRef ? g_spRef.try_as<wux::Controls::StackPanel>() : nullptr;
-    auto hp = g_hpanelRef ? g_hpanelRef.try_as<wux::Controls::StackPanel>() : nullptr;
-    auto hp2 = g_hpanel2Ref ? g_hpanel2Ref.try_as<wux::Controls::StackPanel>() : nullptr;
     if (sp) {
         auto spCh = sp.Children();
         auto hpU = g_hpanelRef.try_as<wux::UIElement>();
-        int hpIdx = -1;
-        for (uint32_t c = 0; c < spCh.Size(); c++)
-            if (hpU && winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(hpU)) { hpIdx = (int)c; break; }
-        if (hpIdx >= 0) {
-            // Time 先回原位（相对 Date 的原始次序：原 idx 记录于 g_snapTimeIndex）
-            if (hp && g_timeRef) {
-                auto tbU = g_timeRef.try_as<wux::UIElement>();
-                auto hpCh = hp.Children();
-                for (uint32_t c = 0; c < hpCh.Size(); c++)
-                    if (tbU && winrt::get_abi(hpCh.GetAt(c)) == winrt::get_abi(tbU)) { hpCh.RemoveAt(c); break; }
-            }
-            spCh.RemoveAt((uint32_t)hpIdx);
-            if (restoreNative && g_timeRef && g_snapTimeIndex >= 0) {
-                int at = g_snapTimeIndex;
-                if (at > (int)spCh.Size()) at = (int)spCh.Size();
-                spCh.InsertAt((uint32_t)at, g_timeRef.try_as<wux::UIElement>());
-            }
+        for (uint32_t c = 0; hpU && c < spCh.Size(); c++) {
+            if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(hpU)) { spCh.RemoveAt(c); break; }
         }
-        // v55：摘第二行横板（Date 解出 dateWrap；原生 Date 始终系统所有）
         auto h2U = g_hpanel2Ref ? g_hpanel2Ref.try_as<wux::UIElement>() : nullptr;
-        int h2Idx = -1;
-        for (uint32_t c = 0; c < spCh.Size(); c++)
-            if (h2U && winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(h2U)) { h2Idx = (int)c; break; }
-        if (g_dateWrapRef && g_dateRef) {
-            if (auto w = g_dateWrapRef.try_as<wux::Controls::Border>()) {
-                auto dU = g_dateRef.try_as<wux::UIElement>();
-                auto c = w.Child();
-                if (dU && c && winrt::get_abi(c) == winrt::get_abi(dU)) {
-                    InterlockedExchange(&g_selfReparent, 1);
-                    try { w.Child(nullptr); } catch (...) {}
-                    InterlockedExchange(&g_selfReparent, 0);
-                }
-            }
-        }
-        if (h2Idx >= 0) spCh.RemoveAt((uint32_t)h2Idx);
-        if (restoreNative && g_dateRef && g_snapDateIndex >= 0) {
-            try {
-                int at = g_snapDateIndex;
-                if (at > (int)spCh.Size()) at = (int)spCh.Size();
-                spCh.InsertAt((uint32_t)at, g_dateRef.try_as<wux::UIElement>());
-                log_line("PANEL free: Date re-inserted at %d", at);
-            } catch (...) {}
+        for (uint32_t c = 0; h2U && c < spCh.Size(); c++) {
+            if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(h2U)) { spCh.RemoveAt(c); break; }
         }
     }
-    for (int i = 0; i < 4; i++) { g_seg[i] = nullptr; g_segHidden[i] = false; g_segDesired[i] = 0; }
+    for (int i = 0; i < 6; i++) { g_seg[i] = nullptr; g_segHidden[i] = false; g_segDesired[i] = 0; }
     g_hpanelRef = nullptr;
     g_hpanel2Ref = nullptr;
-    g_dateWrapRef = nullptr;
     // 摘输入 Border
     if (g_borderRef) {
         try {
@@ -2348,14 +2278,12 @@ static void PanelFree(bool restoreNative) {
         } catch (...) {}
         g_borderRef = nullptr;
     }
-    // v55：Date 回插已在上方横板摘除块内完成（解 wrap→摘 hp2→原位插回）
-    g_snapDateIndex = -1; g_snapTimeIndex = -1;
     g_spRef = nullptr; g_timeRef = nullptr; g_dateRef = nullptr; g_contRef = nullptr;
     InterlockedExchange(&g_panelOn, 0);
     log_line("PANEL free (restoreNative=%d)", (int)restoreNative);
 }
 
-// mode: 10=c1set(build/update) 11=c1free
+// mode: 10=c1set(build/update) 11=c1free 12=c1t(time/date 文本快路径)
 static int RunC1Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
     wuc::CoreDispatcher disp{ nullptr };
     AcquireSRWLockShared(&g_stateLock); disp = g_disp; ReleaseSRWLockShared(&g_stateLock);
@@ -2371,6 +2299,27 @@ static int RunC1Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
                     TipRestoreAllUi(); // v63：面板拆除同场恢复被压制的 tooltip（幂等）
                     job->hr = S_OK;
                     InterlockedExchange(&job->done, 1);
+                } else if (job->mode == 12) {
+                    // v64 c1t 快路径：只对在场 time/date 段 Text() 赋值——不摘挂/不重排/
+                    // 不重放样式；XAML 自动 InvalidateMeasure → SizeChanged → PanelReflow
+                    // 链保持畅通（宽度随文本自然更新）。段缺席（面板未建/引导期）且
+                    // host 要求面板在场 → 退化为全量 PanelBuild（罕见；建段并顺带落位）。
+                    bool missing = (!g_seg[4] || !g_seg[5]);
+                    if (missing) {
+                        if (g_panelWanted && g_hasData) {
+                            job->hr = PanelBuild(false);
+                        } else {
+                            job->hr = S_OK; // 面板不在场：no-op，等 c1set 引导
+                        }
+                    } else {
+                        for (int i = 4; i < 6; i++) {
+                            if (auto seg = g_seg[i].try_as<wux::Controls::TextBlock>()) {
+                                try { seg.Text(winrt::hstring(g_segText[i])); } catch (...) {}
+                            }
+                        }
+                        job->hr = S_OK;
+                    }
+                    InterlockedExchange(&job->done, SUCCEEDED(job->hr) ? 1 : 2);
                 } else { job->hr = E_INVALIDARG; InterlockedExchange(&job->done, 2); }
             } catch (...) { job->hr = E_FAIL; InterlockedExchange(&job->done, 2); }
         });
@@ -2767,9 +2716,10 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                         double dInput = -1;
                         if (JGetDbl(rest, "input", &dInput)) { st.input = dInput > 0.5 ? 1 : 0; any = true; }
                         wchar_t tmp[64];
-                        struct { const char* key; int idx; } segs[4] = {
-                            {"weather",0},{"festival",1},{"term",2},{"lunar",3} };
-                        for (int i = 0; i < 4; i++) {
+                        struct { const char* key; int idx; } segs[6] = {
+                            {"weather",0},{"festival",1},{"term",2},{"lunar",3},
+                            {"time",4},{"date",5} };
+                        for (int i = 0; i < 6; i++) {
                             if (JGetStr(rest, segs[i].key, tmp, 64)) {
                                 wcsncpy_s(g_segText[segs[i].idx], tmp, _TRUNCATE);
                                 any = true;
@@ -2779,17 +2729,18 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                         // 非法值忽略保留旧值——与平面字段同款防御）
                         char scope[600];
                         if (JScopeStyle(rest, scope, sizeof(scope))) {
-                            int ord[5];
+                            int ord[6];
                             if (JGetOrder(scope, ord)) { memcpy(st.order, ord, sizeof ord); any = true; }
-                            int shw[4];
+                            int shw[6];
                             if (JGetHide(scope, shw)) { memcpy(st.show, shw, sizeof shw); any = true; }
-                            unsigned cols[4];
+                            unsigned cols[6];
                             memcpy(cols, st.colors, sizeof cols);
                             if (JGetColors(scope, cols)) { memcpy(st.colors, cols, sizeof cols); any = true; }
-                            double szs[4];
+                            double szs[6];
                             memcpy(szs, st.sizes, sizeof szs);
                             if (JGetSizes(scope, szs)) { memcpy(st.sizes, szs, sizeof szs); any = true; }
-                            int rws[4];
+                            int rws[6];
+                            memcpy(rws, st.rows, sizeof rws);
                             if (JGetRows(scope, rws)) { memcpy(st.rows, rws, sizeof rws); any = true; }
                             double dGap;
                             if (JGetDbl(scope, "gap", &dGap)) {
@@ -2833,6 +2784,30 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                             char a2[160];
                             _snprintf_s(a2, sizeof(a2), _TRUNCATE,
                                 "{\"v\":2,\"t\":\"c1set\",\"rc\":%d,\"hr\":%lu}\n",
+                                rc, (unsigned long)job->hr);
+                            send_line(a2);
+                        }
+                    }
+                } else if (!strcmp(cmd, "c1t")) {
+                    // v64 走时快路径：host 走时线程按文本变化下发当前时间/日期文案。
+                    // 只更新 g_segText[4]/[5] 并派发 mode12（Text-only）；**不置
+                    // g_panelWanted**（面板建立语义仍归 c1set）。ack 供 host 诊断计数，
+                    // host 侧不等待（幂等：下一条覆盖上一条）。
+                    if (strlen(rest) < 2 || strlen(rest) > 300) {
+                        send_line("{\"v\":2,\"t\":\"c1tack\",\"err\":\"bad_len\"}\n");
+                    } else {
+                        wchar_t tmp[64];
+                        bool anyT = false;
+                        if (JGetStr(rest, "time", tmp, 64)) { wcsncpy_s(g_segText[4], tmp, _TRUNCATE); anyT = true; }
+                        if (JGetStr(rest, "date", tmp, 64)) { wcsncpy_s(g_segText[5], tmp, _TRUNCATE); anyT = true; }
+                        if (!anyT) {
+                            send_line("{\"v\":2,\"t\":\"c1tack\",\"err\":\"no_fields\"}\n");
+                        } else {
+                            auto job = std::make_shared<UiJob>(); job->mode = 12;
+                            int rc = RunC1Job(job, 3000);
+                            char a2[96];
+                            _snprintf_s(a2, sizeof(a2), _TRUNCATE,
+                                "{\"v\":2,\"t\":\"c1tack\",\"rc\":%d,\"hr\":%lu}\n",
                                 rc, (unsigned long)job->hr);
                             send_line(a2);
                         }

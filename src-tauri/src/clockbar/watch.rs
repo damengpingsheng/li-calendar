@@ -73,9 +73,10 @@ fn watch_loop() {
             }
             if reinit && session_active {
                 super::DATA_REINIT.store(true, Ordering::Relaxed);
+                super::TICK_REINIT.store(true, Ordering::Relaxed);
                 // 重发 advise（tap AUTO 时自行 Unadvise 了；幂等）→ tap 重发 ready
                 if super::pipe::pipe_write(b"advise") {
-                    super::dbg_log("watch: tap AUTO detected — re-advise + DATA_REINIT");
+                    super::dbg_log("watch: tap AUTO detected — re-advise + DATA_REINIT + TICK_REINIT");
                 }
             }
         }
@@ -123,6 +124,7 @@ fn watch_loop() {
                     last_ping = std::time::Instant::now();
                     super::dbg_log("watch: session established");
                     data::spawn_data_thread();
+                    data::spawn_tick_thread(); // v64 走时线程（幂等，进程内单例）
                 }
                 Err(e) => {
                     // 沉降期失败在此重试；15s 节奏勿缩短（方案 §3 A/B 实测）

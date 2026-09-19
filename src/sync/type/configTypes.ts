@@ -52,18 +52,22 @@ export interface CalendarFooterVisible {
   footerCountdownVisible: boolean;
 }
 
-/** 注入式时钟段样式（S 阶段；时间段=原生样式不支持自定义，S0 定案） */
+/** 注入式时钟段样式（v64 六段：time/date 亦为自建段，字号/颜色/格式可调） */
 export interface ClockbarStyle {
-  /** 显示顺序（五元素 id 各恰一次，含 time） */
+  /** 显示顺序（六元素 id 各恰一次，含 time+date） */
   order: string[];
-  /** 数据段显示开关（time 恒显） */
+  /** 数据段显示开关（time/date 恒显） */
   show: Record<string, boolean>;
   /** 自定义颜色（"#rrggbb"；缺省=跟随主题） */
   colors: Record<string, string>;
-  /** 段字号倍率（0.5~2.0，缺省 1.0） */
+  /** 段字号倍率（0.5~2.0，缺省 1.0；time/date=时间/日期字号） */
   sizes: Record<string, number>;
-  /** 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2） */
+  /** 段行归属（1=时间行，2=日期行；缺省 weather/festival/term=1，lunar=2；time/date 固定） */
   rows: Record<string, number>;
+  /** 时间段文案格式（token：HH H hh h mm m ss tt；空=HH:mm） */
+  timeFormat: string;
+  /** 日期段文案格式（token：yyyy yy MM M dd d ddd dddd；空=yyyy/M/d） */
+  dateFormat: string;
   /** 段间距 px（0~40，缺省 10；时间行） */
   gap: number;
   /** 日期行段间距 px（0~40，缺省 10；与时间行分开调节） */

@@ -44,22 +44,25 @@ class ClockbarStyleErrorBoundary extends Component<
   }
 }
 
-/** 段 id → 中文名（与后端 SEG_IDS/time 对齐） */
+/** 段 id → 中文名（与后端 LOOK_IDS 对齐；v64：time/date 亦为自建段） */
 const SEG_LABELS: Record<string, string> = {
   weather: '天气',
   festival: '节日',
   term: '节气',
   lunar: '农历',
   time: '时间',
+  date: '日期',
 };
 
-/** 与 configStore 默认值一致的兜底样式（D4 现行为；v55 农历默认在日期行；v60 天气段增强） */
+/** 与 configStore 默认值一致的兜底样式（v64 六段：默认顺序=天气|节日|节气|日期|农历|时间） */
 const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
-  order: ['weather', 'festival', 'term', 'lunar', 'time'],
-  show: { weather: true, festival: true, term: true, lunar: true, time: true },
+  order: ['weather', 'festival', 'term', 'date', 'lunar', 'time'],
+  show: { weather: true, festival: true, term: true, lunar: true, time: true, date: true },
   colors: {},
   sizes: {},
   rows: { weather: 1, festival: 1, term: 1, lunar: 2 },
+  timeFormat: '',
+  dateFormat: '',
   gap: 10,
   gap2: 10,
   vgap: 0,
@@ -72,6 +75,24 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   weatherText: true,
   weatherWind: true,
 };
+
+/** 时间格式预设（value=token 串，与后端 format_time_text 一致；空=后端默认 HH:mm） */
+const TIME_FORMAT_PRESETS: { value: string; label: string }[] = [
+  { value: 'HH:mm', label: '14:23（24 时制）' },
+  { value: 'HH:mm:ss', label: '14:23:05（含秒）' },
+  { value: 'tt h:mm', label: '下午 2:23（12 时制）' },
+  { value: 'tt h:mm:ss', label: '下午 2:23:05（12 时制含秒）' },
+];
+
+/** 日期格式预设（空=后端默认 yyyy/M/d，即系统原生样式） */
+const DATE_FORMAT_PRESETS: { value: string; label: string }[] = [
+  { value: 'yyyy/M/d', label: '2026/9/19（系统默认）' },
+  { value: 'M月d日 ddd', label: '9月19日 周六' },
+  { value: 'yyyy-M-d ddd', label: '2026-9-19 周六' },
+  { value: 'M/d ddd', label: '9/19 周六' },
+  { value: 'dddd', label: '星期六（仅星期）' },
+  { value: 'MM-dd', label: '09-19（仅月日）' },
+];
 
 /** 预设常用色：取色面板底部直接点选，免拖滑条（任务栏文字深浅底色兼顾） */
 const COLOR_PRESETS: { label: string; colors: string[] }[] = [
@@ -95,24 +116,37 @@ const COLOR_PRESETS: { label: string; colors: string[] }[] = [
   },
 ];
 
-/** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段） */
+/** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段）；
+ * v64：五元素旧 order 在此迁移为六元素（date 插在首个行 2 段前=旧视觉不变，
+ * 与后端 migrate_order_5to6 同规则） */
 function normalizeStyle(raw: unknown): ClockbarStyle {
   const d = DEFAULT_CLOCKBAR_STYLE;
   if (!raw || typeof raw !== 'object') return { ...d };
   const r = raw as Partial<ClockbarStyle>;
   const known = Object.keys(SEG_LABELS);
-  const order = Array.isArray(r.order) ? r.order.filter((id) => known.includes(id)) : [];
   const rows: Record<string, number> = {};
   for (const id of ['weather', 'festival', 'term', 'lunar']) {
     const v = r.rows?.[id];
     rows[id] = v === 2 ? 2 : id === 'lunar' ? 2 : 1;
   }
+  const rowOf = (id: string): number => {
+    if (id === 'time') return 1;
+    if (id === 'date') return 2;
+    return rows[id] ?? (id === 'lunar' ? 2 : 1);
+  };
+  let order = Array.isArray(r.order) ? r.order.filter((id) => known.includes(id)) : [];
+  if (order.length === 5 && order.includes('time') && !order.includes('date')) {
+    const pos = order.findIndex((id) => rowOf(id) === 2);
+    order = pos >= 0 ? [...order.slice(0, pos), 'date', ...order.slice(pos)] : [...order, 'date'];
+  }
   return {
-    order: order.length === 5 ? order : [...d.order],
+    order: order.length === 6 ? order : [...d.order],
     show: { ...d.show, ...(r.show ?? {}) },
     colors: { ...(r.colors ?? {}) },
     sizes: { ...(r.sizes ?? {}) },
     rows,
+    timeFormat: typeof r.timeFormat === 'string' ? r.timeFormat.slice(0, 32) : '',
+    dateFormat: typeof r.dateFormat === 'string' ? r.dateFormat.slice(0, 32) : '',
     gap: typeof r.gap === 'number' ? Math.min(40, Math.max(0, r.gap)) : d.gap,
     gap2: typeof r.gap2 === 'number' ? Math.min(40, Math.max(0, r.gap2)) : d.gap2,
     vgap: typeof r.vgap === 'number' ? Math.min(20, Math.max(0, r.vgap)) : d.vgap,
@@ -373,7 +407,33 @@ const WidgetShowForm: React.FC = () => {
                   />
                 </Tooltip>
               </div>
-              <div style={{ ...segGridStyle, padding: '0 0 2px 12px' }}>
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>时间格式</span>
+                <Select
+                  size="small"
+                  value={clockbarStyle.timeFormat || 'HH:mm'}
+                  onChange={(v) => void commitStyle({ ...clockbarStyle, timeFormat: v })}
+                  options={TIME_FORMAT_PRESETS}
+                  style={{ width: 200 }}
+                />
+                <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
+                  任务栏时钟的时间段样式（v64 起可调）
+                </span>
+              </div>
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>日期格式</span>
+                <Select
+                  size="small"
+                  value={clockbarStyle.dateFormat || 'yyyy/M/d'}
+                  onChange={(v) => void commitStyle({ ...clockbarStyle, dateFormat: v })}
+                  options={DATE_FORMAT_PRESETS}
+                  style={{ width: 200 }}
+                />
+                <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
+                  日期段与农历/节日等同排列，样式与字号可调
+                </span>
+              </div>
+              <div style={{ ...segGridStyle, padding: '12px 0 2px 12px' }}>
                 {(['排序', '显示', '所在行', '颜色', '字体大小'] as const).map((label) => (
                   <span
                     key={label}
@@ -384,7 +444,7 @@ const WidgetShowForm: React.FC = () => {
                 ))}
               </div>
               {clockbarStyle.order.map((id, idx) => {
-                const isTime = id === 'time';
+                const isClock = id === 'time' || id === 'date'; // v64：自建时钟段——恒显恒行，字号/颜色/顺序可调
                 const shown = clockbarStyle.show[id] ?? true;
                 const color = clockbarStyle.colors[id];
                 const size = clockbarStyle.sizes[id] ?? 1;
@@ -418,127 +478,114 @@ const WidgetShowForm: React.FC = () => {
                       />
                       {SEG_LABELS[id]}
                     </span>
-                    {isTime ? (
-                      <div
-                        style={{
-                          gridColumn: '2 / -1',
-                          display: 'flex',
-                          alignItems: 'center',
-                          gap: 8,
+                    <span style={{ width: 60, display: 'inline-flex' }}>
+                      <Switch
+                        checked={isClock ? true : shown}
+                        disabled={isClock}
+                        checkedChildren="显示"
+                        unCheckedChildren="隐藏"
+                        onChange={(checked) => {
+                          const show = { ...clockbarStyle.show, [id]: checked };
+                          void commitStyle({ ...clockbarStyle, show });
                         }}
+                      />
+                    </span>
+                    <Tooltip
+                      title={
+                        isClock
+                          ? '时间/日期段行归属固定（时间行/日期行）'
+                          : '段落所在行：时间行与时间同行，日期行与日期同行'
+                      }
+                    >
+                      <Select
+                        size="small"
+                        value={id === 'time' ? 1 : id === 'date' ? 2 : row === 2 ? 2 : 1}
+                        disabled={isClock || !shown}
+                        onChange={(v) => {
+                          const rows = { ...clockbarStyle.rows, [id]: v };
+                          void commitStyle({ ...clockbarStyle, rows });
+                        }}
+                        options={[
+                          { value: 1, label: '时间行' },
+                          { value: 2, label: '日期行' },
+                        ]}
+                        style={{ width: 84 }}
+                      />
+                    </Tooltip>
+                    <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                      <Tooltip
+                        title={
+                          color
+                            ? '自定义颜色（选预设或拖滑条；面板底部可恢复跟随主题）'
+                            : '跟随主题（点击选色自定义）'
+                        }
                       >
-                        <Tag style={{ marginInlineEnd: 0 }}>系统原生样式</Tag>
-                        <span
-                          style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}
-                        >
-                          时间段保持系统时钟原生外观
-                        </span>
-                      </div>
-                    ) : (
-                      <>
-                        <span style={{ width: 60, display: 'inline-flex' }}>
-                          <Switch
-                            checked={shown}
-                            checkedChildren="显示"
-                            unCheckedChildren="隐藏"
-                            onChange={(checked) => {
-                              const show = { ...clockbarStyle.show, [id]: checked };
-                              void commitStyle({ ...clockbarStyle, show });
-                            }}
-                          />
-                        </span>
-                        <Tooltip title="段落所在行：时间行与时间同行，日期行与系统原生日期同行">
-                          <Select
-                            size="small"
-                            value={row === 2 ? 2 : 1}
-                            disabled={!shown}
-                            onChange={(v) => {
-                              const rows = { ...clockbarStyle.rows, [id]: v };
-                              void commitStyle({ ...clockbarStyle, rows });
-                            }}
-                            options={[
-                              { value: 1, label: '时间行' },
-                              { value: 2, label: '日期行' },
-                            ]}
-                            style={{ width: 84 }}
-                          />
-                        </Tooltip>
-                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
-                          <Tooltip
-                            title={
-                              color
-                                ? '自定义颜色（选预设或拖滑条；面板底部可恢复跟随主题）'
-                                : '跟随主题（点击选色自定义）'
-                            }
-                          >
-                            <ColorPicker
-                              size="small"
-                              disabledAlpha
-                              value={color ?? '#808080'}
-                              presets={COLOR_PRESETS}
-                              open={openColorSeg === id}
-                              onOpenChange={(o) => setOpenColorSeg(o ? id : null)}
-                              panelRender={(panel) => (
-                                <div>
-                                  {panel}
-                                  <Divider style={{ margin: '4px 0' }} />
-                                  {color ? (
-                                    <Button
-                                      size="small"
-                                      block
-                                      onClick={() => {
-                                        const colors = { ...clockbarStyle.colors };
-                                        delete colors[id];
-                                        void commitStyle({ ...clockbarStyle, colors });
-                                        setOpenColorSeg(null);
-                                      }}
-                                    >
-                                      跟随主题
-                                    </Button>
-                                  ) : (
-                                    <div
-                                      style={{
-                                        textAlign: 'center',
-                                        color: 'var(--ant-color-text-tertiary, #999)',
-                                        fontSize: 12,
-                                        padding: '2px 0',
-                                      }}
-                                    >
-                                      当前跟随主题
-                                    </div>
-                                  )}
+                        <ColorPicker
+                          size="small"
+                          disabledAlpha
+                          value={color ?? '#808080'}
+                          presets={COLOR_PRESETS}
+                          open={openColorSeg === id}
+                          onOpenChange={(o) => setOpenColorSeg(o ? id : null)}
+                          panelRender={(panel) => (
+                            <div>
+                              {panel}
+                              <Divider style={{ margin: '4px 0' }} />
+                              {color ? (
+                                <Button
+                                  size="small"
+                                  block
+                                  onClick={() => {
+                                    const colors = { ...clockbarStyle.colors };
+                                    delete colors[id];
+                                    void commitStyle({ ...clockbarStyle, colors });
+                                    setOpenColorSeg(null);
+                                  }}
+                                >
+                                  跟随主题
+                                </Button>
+                              ) : (
+                                <div
+                                  style={{
+                                    textAlign: 'center',
+                                    color: 'var(--ant-color-text-tertiary, #999)',
+                                    fontSize: 12,
+                                    padding: '2px 0',
+                                  }}
+                                >
+                                  当前跟随主题
                                 </div>
                               )}
-                              onChangeComplete={(c) => {
-                                const colors = {
-                                  ...clockbarStyle.colors,
-                                  [id]: c.toHexString(),
-                                };
-                                void commitStyle({ ...clockbarStyle, colors });
-                              }}
-                            />
-                          </Tooltip>
-                          {!color && <Tag style={{ marginInlineEnd: 0 }}>主题</Tag>}
-                        </span>
-                        <Slider
-                          min={0.5}
-                          max={2}
-                          step={0.05}
-                          value={size}
-                          disabled={!shown}
-                          onChange={(v) => {
-                            const sizes = { ...clockbarStyle.sizes, [id]: v };
-                            previewStyle({ ...clockbarStyle, sizes });
+                            </div>
+                          )}
+                          onChangeComplete={(c) => {
+                            const colors = {
+                              ...clockbarStyle.colors,
+                              [id]: c.toHexString(),
+                            };
+                            void commitStyle({ ...clockbarStyle, colors });
                           }}
-                          onChangeComplete={(v) => {
-                            const sizes = { ...clockbarStyle.sizes, [id]: v };
-                            void commitStyle({ ...clockbarStyle, sizes });
-                          }}
-                          style={segSliderStyle}
-                          tooltip={{ formatter: (v) => `${v?.toFixed(2)}×` }}
                         />
-                      </>
-                    )}
+                      </Tooltip>
+                      {!color && <Tag style={{ marginInlineEnd: 0 }}>主题</Tag>}
+                    </span>
+                    <Slider
+                      min={0.5}
+                      max={2}
+                      step={0.05}
+                      value={size}
+                      disabled={!isClock && !shown}
+                      onChange={(v) => {
+                        const sizes = { ...clockbarStyle.sizes, [id]: v };
+                        previewStyle({ ...clockbarStyle, sizes });
+                      }}
+                      onChangeComplete={(v) => {
+                        const sizes = { ...clockbarStyle.sizes, [id]: v };
+                        void commitStyle({ ...clockbarStyle, sizes });
+                      }}
+                      style={segSliderStyle}
+                      tooltip={{ formatter: (v) => `${v?.toFixed(2)}×` }}
+                    />
                   </div>
                 );
               })}
@@ -626,14 +673,9 @@ const WidgetShowForm: React.FC = () => {
                 </span>
               </div>
               <div style={{ padding: '6px 12px 0', color: '#999', fontSize: 12, lineHeight: 1.9 }}>
-                <div>顺序即任务栏时钟上的从左到右排列。</div>
-                <div>
-                  「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行。
-                </div>
-                <div>
-                  日期行首位恒为系统原生日期（如「周一
-                  2026-9-14」，含星期几），其余段落按上方顺序追加其后。
-                </div>
+                <div>顺序即任务栏时钟上的从左到右排列；时间/日期段样式（字号/颜色/格式）与数据段同样可调。</div>
+                <div>时间/日期恒显且行归属固定（时间行/日期行）；其余段落行归属可选。</div>
+                <div>时间/日期字号是所在行系统基准的倍率（1.00×=与原生同大小），时钟区宽度不足时优先裁数据段。</div>
                 <div>自定义颜色优先于主题，点「跟随主题」恢复自动配色。</div>
               </div>
             </div>

@@ -2,7 +2,7 @@
 rem B-stage TAP DLL build (Git Bash: cmd //c build_tap.cmd). ASCII only.
 rem Increment TAPVER to force explorer to load a fresh copy (old module stays resident until explorer restarts).
 setlocal
-if "%TAPVER%"=="" set TAPVER=16
+if "%TAPVER%"=="" set TAPVER=65
 set MSVC=D:\environment\VsBuildTools\VC\Tools\MSVC\14.44.35207
 set KIT=D:\environment\WindowsKits\10
 set INCLUDE=%MSVC%\include;%KIT%\Include\10.0.26100.0\um;%KIT%\Include\10.0.26100.0\shared;%KIT%\Include\10.0.26100.0\ucrt;%KIT%\Include\10.0.26100.0\winrt;%KIT%\Include\10.0.26100.0\cppwinrt

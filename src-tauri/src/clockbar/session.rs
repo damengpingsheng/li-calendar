@@ -6,7 +6,7 @@ use super::pipe;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const TAP_VER: u32 = 63;
+pub const TAP_VER: u32 = 65;
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 pub const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -46,6 +46,16 @@ static TTC_ACK: AtomicU64 = AtomicU64::new(0);
 static TTK_ACK: AtomicU64 = AtomicU64::new(0);
 static TTR_ACK: AtomicU64 = AtomicU64::new(0);
 
+// v64：c1tack 计数器（走时快路径 ack）。走时线程**不等待**（文本幂等，下条覆盖
+// 上条）——计数仅诊断用（watch 心跳日志/排障时确认走时链活着）。同为独立原子，
+// 不碰全局游标。
+static C1T_ACKS: AtomicU64 = AtomicU64::new(0);
+
+/// c1tack 累计计数（诊断：走时链健康度）。
+pub fn c1t_ack_count() -> u64 {
+    C1T_ACKS.load(Ordering::SeqCst)
+}
+
 fn json_num(line: &str, key: &str) -> Option<u64> {
     let pat = format!("\"{key}\":");
     let i = line.find(&pat)? + pat.len();
@@ -69,6 +79,8 @@ fn hook_tip_ack(line: &str) {
         if let (Some(id), Some(restored)) = (json_num(line, "id"), json_num(line, "restored")) {
             TTR_ACK.store((id << 8) | 0x80 | (restored & 0x7F), Ordering::SeqCst);
         }
+    } else if line.contains(r#""t":"c1tack""#) {
+        C1T_ACKS.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -340,6 +352,20 @@ pub fn send_c1set(json: &str) -> Option<String> {
         return None;
     }
     wait_for(|l| l.contains(r#""t":"c1set""#), 15_000)
+}
+
+/// 下发 c1t（v64 走时快路径：time/date 文本）。**不等待 ack**——文本命令幂等
+/// （下一条覆盖上一条），走时线程 250ms 节奏不能被 wait_for/游标消费拖住；
+/// ack 由 push_line 解析进独立原子计数（c1t_ack_count，仅诊断）。
+/// pipe_write 经 G_PIPE 互斥串行（与 data 线程的 c1set 写互斥，无字节流交错）。
+pub fn send_c1t(time: &str, date: &str) -> bool {
+    let mut line = String::with_capacity(64 + time.len() + date.len());
+    line.push_str("c1t {\"time\":\"");
+    line.push_str(time);
+    line.push_str("\",\"date\":\"");
+    line.push_str(date);
+    line.push_str("\"}");
+    pipe::pipe_write(line.as_bytes())
 }
 
 /// 下发 ttc（带 id 完成确认）：tap 在 UI 线程压制时钟 ToolTip（关闭已显示悬浮 +

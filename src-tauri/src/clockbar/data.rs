@@ -1,6 +1,7 @@
 // D 阶段时间数据：tyme4rs（锁版本 =1.5.0）每日计算（农历/节气/节日）。
 // 口径与前端 lunar-typescript 抽查对照（方案 §5 D 行验收：24 敏感日期一致）。
-// 时间段不在此列——时间=系统 VM 持有的原生 TimeInnerTextBlock，tap 零写入（D2）。
+// v64：时间/日期段改自建段——文案在此格式化（token 子集，走时线程 c1t 下发 +
+// c1set 引导恒带），tap 侧零格式逻辑。
 // 自探针 crate src/data.rs 逐字移植（E0）。
 
 use tyme4rs::tyme::solar::SolarDay;
@@ -23,14 +24,23 @@ impl DayData {
 
     /// c1set JSON（tap 限界解析口径：值内禁引号/反斜杠/控制符，UTF-8 直传）
     pub fn c1set_json(&self, style: &str) -> String {
+        self.c1set_json_with_clock(style, "")
+    }
+
+    /// c1set JSON + v64 时钟文本扩展（clock=`"time":"..","date":".."`，无前导逗号）。
+    /// 走时稳态不进 c1set（避免秒级变化触发全量重发）；c1set 每次发送恒带当前
+    /// 时间/日期=会话引导/重建即时有值（走时线程 c1t 补差）。
+    pub fn c1set_json_with_clock(&self, style: &str, clock: &str) -> String {
         format!(
-            "{{\"weather\":\"{}\",\"festival\":\"{}\",\"term\":\"{}\",\"lunar\":\"{}\"{}{}}}",
+            "{{\"weather\":\"{}\",\"festival\":\"{}\",\"term\":\"{}\",\"lunar\":\"{}\"{}{}{}{}}}",
             self.weather,
             self.festival,
             self.term,
             self.lunar,
-            if style.is_empty() { "" } else { "," },
-            style
+            if style.is_empty() && clock.is_empty() { "" } else { "," },
+            style,
+            if style.is_empty() || clock.is_empty() { "" } else { "," },
+            clock
         )
     }
 }
@@ -173,13 +183,148 @@ pub fn local_ymd() -> (i32, u32, u32) {
     (st.year as i32, st.month as u32, st.day as u32)
 }
 
+// ── v64 时间/日期文案格式化（token 子集；tap 侧零格式逻辑）─────────────
+
+/// 星期短名（day_of_week: 0=周日）。
+const WEEK_SHORT: [&str; 7] = ["周日", "周一", "周二", "周三", "周四", "周五", "周六"];
+/// 星期全名。
+const WEEK_FULL: [&str; 7] = ["星期日", "星期一", "星期二", "星期三", "星期四", "星期五", "星期六"];
+
+/// token 渲染：按「长 token 优先」逐位匹配，未匹配字符按 utf-8 字面输出。
+fn render_tokens(fmt: &str, tokens: &[(&str, String)]) -> String {
+    let mut out = String::new();
+    let mut i = 0;
+    while i < fmt.len() {
+        let mut matched = false;
+        for (p, v) in tokens {
+            if fmt[i..].starts_with(p) {
+                out.push_str(v);
+                i += p.len();
+                matched = true;
+                break;
+            }
+        }
+        if !matched {
+            let ch = fmt[i..].chars().next().unwrap();
+            out.push(ch);
+            i += ch.len_utf8();
+        }
+    }
+    out
+}
+
+fn num(v: u16, pad2: bool) -> String {
+    if pad2 && v < 10 {
+        format!("0{v}")
+    } else {
+        v.to_string()
+    }
+}
+
+/// 时间文案。token：HH(00-23)/H、hh(01-12)/h、mm/m、ss/s、tt(上午/下午)。
+/// 缺省 "HH:mm"。字面字符（含中文）原样输出；无转义机制。
+pub fn format_time_text(st: &super::ffi::LOCAL_TIME, fmt: &str) -> String {
+    let h12 = match st.hour % 12 {
+        0 => 12,
+        x => x,
+    };
+    let tt = if st.hour < 12 { "上午" } else { "下午" };
+    render_tokens(
+        fmt,
+        &[
+            ("HH", num(st.hour, true)),
+            ("hh", num(h12, true)),
+            ("mm", num(st.minute, true)),
+            ("ss", num(st.second, true)),
+            ("tt", tt.to_string()),
+            ("H", num(st.hour, false)),
+            ("h", num(h12, false)),
+            ("m", num(st.minute, false)),
+            ("s", num(st.second, false)),
+        ],
+    )
+}
+
+/// 日期文案。token：yyyy/yy、MM/M、dd/d、ddd(周六)/dddd(星期六)。
+/// 缺省 "yyyy/M/d"。字面字符原样输出。
+pub fn format_date_text(st: &super::ffi::LOCAL_TIME, fmt: &str) -> String {
+    let dow = (st.day_of_week % 7) as usize;
+    render_tokens(
+        fmt,
+        &[
+            ("yyyy", st.year.to_string()),
+            ("dddd", WEEK_FULL[dow].to_string()),
+            ("ddd", WEEK_SHORT[dow].to_string()),
+            ("yy", format!("{:02}", st.year % 100)),
+            ("MM", num(st.month, true)),
+            ("dd", num(st.day, true)),
+            ("M", num(st.month, false)),
+            ("d", num(st.day, false)),
+        ],
+    )
+}
+
+/// 配置取时间格式（空/缺省→"HH:mm"）。
+fn time_format_of(cfg: Option<&crate::app_runtime::config::ClockbarStyleConfig>) -> &str {
+    cfg.and_then(|c| c.time_format.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("HH:mm")
+}
+
+/// 配置取日期格式（空/缺省→"yyyy/M/d"）。
+fn date_format_of(cfg: Option<&crate::app_runtime::config::ClockbarStyleConfig>) -> &str {
+    cfg.and_then(|c| c.date_format.as_deref())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("yyyy/M/d")
+}
+
+/// 时钟文本清洗：剔除 tap 限界 JSON 不接受的字符（引号/反斜杠/控制符）。
+/// 格式串来自预设或 liConfig——手改配置可能带入，双端防御。
+fn sanitize_seg_text(s: &str) -> String {
+    s.chars()
+        .filter(|c| *c != '"' && *c != '\\' && !c.is_control())
+        .collect()
+}
+
 /// 生产默认样式（v56：fontscale 1.0=段字号与所在行系统文本对齐（行感知基准，
 /// 见 tap v56 注）；segmaxw 220（v61：天气段加城区名/风向风级后 170 截断「东北
 /// 风1~3级」实测，放宽单段预算，capw 总预算+优先级隐藏仍护底）/ capw 620 / input 1）。
 pub const DEFAULT_STYLE: &str = "\"fontscale\":1.0,\"segmaxw\":220,\"capw\":620,\"input\":1";
 
-/// S 阶段段 id 与 tap SEGNAME 对齐；time 恒显不参与 show/colors/sizes。
+/// S 阶段段 id 与 tap SEGNAME 对齐（hide/rows 仍仅数据段）；v64 外观键（colors/sizes/
+/// order）覆盖全部六段——time/date 也是自建段。
 const SEG_IDS: [&str; 4] = ["weather", "festival", "term", "lunar"];
+const LOOK_IDS: [&str; 6] = ["weather", "festival", "term", "lunar", "time", "date"];
+
+/// v64 order 迁移：五元素旧配置（无 date）→ 在首个行 2 元素前插入 date。
+/// 旧模型日期行=[原生 Date, 行2 数据段…]——date 插在行 2 序列最前=视觉不变。
+fn migrate_order_5to6(
+    order: &[String],
+    cfg: &crate::app_runtime::config::ClockbarStyleConfig,
+) -> Vec<String> {
+    if order.len() == 5 && order.iter().any(|id| id == "time") && !order.iter().any(|id| id == "date")
+    {
+        let row_of = |id: &str| -> i32 {
+            if id == "time" {
+                return 1;
+            }
+            let d = if id == "lunar" { 2 } else { 1 };
+            match cfg.rows.get(id) {
+                Some(&v) if v == 2 => 2,
+                _ => d,
+            }
+        };
+        let pos = order
+            .iter()
+            .position(|id| row_of(id) == 2)
+            .unwrap_or(order.len());
+        let mut migrated = order.to_vec();
+        migrated.insert(pos, "date".to_string());
+        migrated
+    } else {
+        order.to_vec()
+    }
+}
 
 fn clamp_f64(v: f64, lo: f64, hi: f64) -> f64 {
     v.max(lo).min(hi)
@@ -206,26 +351,32 @@ pub fn style_ext_json() -> String {
     };
     let mut f: Vec<String> = Vec::new();
 
-    // order：必须是五个已知 id 的合法排列（含 time 恰一次）才下发
-    let mut order: Vec<String> = cfg
-        .order
-        .iter()
-        .filter(|id| {
-            SEG_IDS.contains(&id.as_str()) || id.as_str() == "time"
-        })
-        .cloned()
-        .collect();
+    // order：必须是六个已知 id 的合法排列（含 time、date 各恰一次）才下发；
+    // v64 迁移：旧五元素配置先插 date（migrate_order_5to6）再校验
+    let order: Vec<String> = {
+        let filtered: Vec<String> = cfg
+            .order
+            .iter()
+            .filter(|id| LOOK_IDS.contains(&id.as_str()))
+            .cloned()
+            .collect();
+        migrate_order_5to6(&filtered, &cfg)
+    };
+    let mut order = order;
     order.dedup();
     let mut want_time = false;
+    let mut want_date = false;
     let mut seg_count = 0usize;
     for id in &order {
         if id == "time" {
             want_time = true;
+        } else if id == "date" {
+            want_date = true;
         } else {
             seg_count += 1;
         }
     }
-    if want_time && seg_count == SEG_IDS.len() && order.len() == 5 {
+    if want_time && want_date && seg_count == SEG_IDS.len() && order.len() == 6 {
         f.push(format!("\"order\":\"{}\"", order.join(",")));
     }
 
@@ -247,8 +398,8 @@ pub fn style_ext_json() -> String {
         f.push(format!("\"row_{id}\":{r}"));
     }
 
-    // colors 恒发（v55——"theme" 兜底，消会话内残留；同 hide 教训定式）
-    for id in SEG_IDS {
+    // colors 恒发（v55/v64——"theme" 兜底，消会话内残留；time/date 缺省同样跟随主题）
+    for id in LOOK_IDS {
         match cfg.colors.get(id) {
             Some(c) if is_hex6(c) => {
                 f.push(format!("\"color_{id}\":\"{}\"", c.to_lowercase()));
@@ -257,8 +408,8 @@ pub fn style_ext_json() -> String {
         }
     }
 
-    // sizes 恒发（v55——缺省 1.00；钳制 0.5~2.0）
-    for id in SEG_IDS {
+    // sizes 恒发（v55/v64——缺省 1.00；钳制 0.5~2.0；time/date=字号可调本体）
+    for id in LOOK_IDS {
         let v = match cfg.sizes.get(id) {
             Some(&v) if v.is_finite() => clamp_f64(v, 0.5, 2.0),
             _ => 1.0,
@@ -380,13 +531,23 @@ pub fn spawn_data_thread() {
                     }
                     compute_day(y, m, d, &wx_disp, &fest_seg)
                 };
-                // v57：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set
+                // v57：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set。
+                // v64：发送行恒带当前时间/日期文本（会话引导/重建即时有值）；
+                // 比较口径=不含时钟字段的 base（秒级变化不触发重发，稳态走 c1t）
                 let style = format!("{DEFAULT_STYLE}{}", style_ext_json());
-                let line = dd.c1set_json(&style);
-                if line != last_sent || write_retry > 0 {
+                let base = dd.c1set_json(&style);
+                let line = {
+                    let cfg = super::current_style();
+                    let st_now = super::ffi::now_local_time();
+                    let t_txt = sanitize_seg_text(&format_time_text(&st_now, time_format_of(cfg.as_ref())));
+                    let d_txt = sanitize_seg_text(&format_date_text(&st_now, date_format_of(cfg.as_ref())));
+                    let clock = format!("\"time\":\"{t_txt}\",\"date\":\"{d_txt}\"");
+                    dd.c1set_json_with_clock(&style, &clock)
+                };
+                if base != last_sent || write_retry > 0 {
                     match super::session::send_c1set(&line) {
                         Some(ack) => {
-                            last_sent = line;
+                            last_sent = base;
                             write_retry = 0;
                             super::dbg_log(&format!("data: c1set ack {ack}"));
                         }
@@ -405,6 +566,59 @@ pub fn spawn_data_thread() {
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(1000));
+            }
+        })
+        .ok();
+}
+
+/// v64 走时线程：独立于天气数据循环（同步 HTTP 会拖住循环，时钟不能跟着停摆）。
+/// 250ms 轮询 + 按文本变化才发送（秒显=每秒一拍，无秒=每分钟一拍；发送经
+/// send_c1t——幂等不等待 ack，避免与数据线程互吃全局游标响应）。REINIT（tap AUTO
+/// 恢复/断管重连）→ 清缓存强制补发。进程内单例（原子闸）。
+pub fn spawn_tick_thread() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    std::thread::Builder::new()
+        .name("clockbar-tick".into())
+        .spawn(|| {
+            super::dbg_log("tick: thread started (v64)");
+            let mut last: Option<(String, String)> = None;
+            let mut fail: u32 = 0;
+            loop {
+                if super::STOP.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
+                // v64 重连补发：与 DATA_REINIT 同源置位（watch），独立消费
+                if super::TICK_REINIT.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    super::dbg_log("tick: REINIT — force resend");
+                    last = None;
+                }
+                let cfg = super::current_style();
+                let st = super::ffi::now_local_time();
+                let t = sanitize_seg_text(&format_time_text(&st, time_format_of(cfg.as_ref())));
+                let d = sanitize_seg_text(&format_date_text(&st, date_format_of(cfg.as_ref())));
+                if last.as_ref() != Some(&(t.clone(), d.clone())) {
+                    if super::session::send_c1t(&t, &d) {
+                        if fail > 0 {
+                            super::dbg_log(&format!("tick: write recovered after {fail} fails"));
+                        }
+                        last = Some((t, d));
+                        fail = 0;
+                    } else {
+                        // 断管窗口（休眠唤醒/会话切换）：清缓存待管道自愈后补发；
+                        // 2s 退避（与 data 线程同款节奏，不刷日志洪泛）
+                        fail += 1;
+                        last = None;
+                        if fail <= 3 || fail % 20 == 1 {
+                            super::dbg_log(&format!("tick: c1t write failed (retry #{fail})"));
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(2000));
+                        continue;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(250));
             }
         })
         .ok();
