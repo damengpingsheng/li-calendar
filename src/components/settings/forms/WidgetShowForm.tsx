@@ -63,6 +63,19 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   weatherWind: true,
 };
 
+/** 预设常用色：取色面板底部直接点选，免拖滑条（任务栏文字深浅底色兼顾） */
+const COLOR_PRESETS: { label: string; colors: string[] }[] = [
+  {
+    label: '常用颜色',
+    colors: [
+      '#FFFFFF', '#BFBFBF', '#595959', '#000000',
+      '#FF4D4F', '#FF7A45', '#FAAD14', '#FADB14',
+      '#52C41A', '#13C2C2', '#1677FF', '#9254DE',
+      '#F759AB',
+    ],
+  },
+];
+
 /** 归一化：剔除未知 id、保底字段齐全（旧 liConfig 可能缺字段） */
 function normalizeStyle(raw: unknown): ClockbarStyle {
   const d = DEFAULT_CLOCKBAR_STYLE;
@@ -398,11 +411,12 @@ const WidgetShowForm: React.FC = () => {
                         style={{ width: 84 }}
                       />
                     </Tooltip>
-                    <Tooltip title={color ? '自定义颜色（点击色块修改）' : '跟随主题（点击选择颜色）'}>
+                    <Tooltip title={color ? '自定义颜色（点色块选预设或拖滑条）' : '跟随主题（点击选择颜色）'}>
                       <ColorPicker
                         size="small"
                         disabledAlpha
                         value={color ?? '#808080'}
+                        presets={COLOR_PRESETS}
                         onChangeComplete={(c) => {
                           const colors = { ...clockbarStyle.colors, [id]: c.toHexString() };
                           void commitStyle({ ...clockbarStyle, colors });
