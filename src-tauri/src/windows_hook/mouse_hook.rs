@@ -457,6 +457,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
     // - 菜单内的其他事件放行（TPM 菜单窗口自行处理/忽略）。
     if menu_open && native_tracking {
         if is_down && !crate::window_manager::menu_rect_contains(x, y) {
+            crate::dbg_log(&format!("native dismiss: outside-down msg={msg} cursor=({x},{y}) in_clock={in_clock}"));
             crate::window_manager::dismiss_native_menu_from_hook();
             if is_mouse_in_clock_area(x, y) {
                 if msg == WM_RBUTTONDOWN {
@@ -472,6 +473,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         {
             if let Some((rx1, ry1, rx2, ry2)) = crate::window_manager::native_menu_rect() {
                 if x >= rx1 && x <= rx2 && y >= ry1 && y <= ry2 {
+                    crate::dbg_log(&format!("native dismiss: item-up cursor=({x},{y}) exit={}", y > (ry1 + ry2) / 2));
                     crate::window_manager::dismiss_native_menu_from_hook();
                     if let Some(app) = crate::windows_hook::app_handle() {
                         let exit = y > (ry1 + ry2) / 2;

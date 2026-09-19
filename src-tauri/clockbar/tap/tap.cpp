@@ -2108,23 +2108,29 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                 // （v37 实测：时钟的「通知设置」飞出在右键【按下】即经冒泡触发，
                 // 仅处理 RightTapped 手势拦不住它；Tapped/RightTapped 是独立手势
                 // 事件，不受 Pointer 事件 Handled 影响，实测验证）
-                // v39：移动/进入也标记 Handled——v38 实测悬停 tooltip
-                // （「2026/9/13 周日 … (当地时间)」）经移动事件冒泡给原生按钮触发；
-                // 现状（旧覆盖层）无 tooltip，等价性要求一并抑制。
+                // v60：悬停归系统时钟管理。不能吞掉移动/进入/离开事件：
+                // 内容区被 Border 拦截而边缘仍命中原生按钮，会造成高亮和日期提示
+                // 随进入位置不一致。这里只接管点击，悬停事件正常路由。
                 border.PointerPressed([](wfnd::IInspectable const&, wux::Input::PointerRoutedEventArgs const& e) {
                     try { e.Handled(true); } catch (...) {}
                 });
                 border.PointerReleased([](wfnd::IInspectable const&, wux::Input::PointerRoutedEventArgs const& e) {
                     try { e.Handled(true); } catch (...) {}
                 });
-                border.PointerMoved([](wfnd::IInspectable const&, wux::Input::PointerRoutedEventArgs const& e) {
-                    try { e.Handled(true); } catch (...) {}
-                });
-                border.PointerEntered([](wfnd::IInspectable const&, wux::Input::PointerRoutedEventArgs const& e) {
-                    try { e.Handled(true); } catch (...) {}
-                });
-                border.PointerExited([](wfnd::IInspectable const&, wux::Input::PointerRoutedEventArgs const& e) {
-                    try { e.Handled(true); } catch (...) {}
+                border.PointerEntered([](wfnd::IInspectable const& s, wux::Input::PointerRoutedEventArgs const&) {
+                    // Read-only diagnostics; deliberately leave the event unhandled.
+                    try {
+                        auto cur = s.as<wux::DependencyObject>();
+                        for (int depth = 0; cur && depth < 12; ++depth) {
+                            auto tip = wux::Controls::ToolTipService::GetToolTip(cur);
+                            if (tip) {
+                                char cls[128] = "";
+                                w2a(winrt::get_class_name(tip).c_str(), cls, sizeof(cls));
+                                log_line("HOVER native tooltip depth=%d class=%s", depth, cls);
+                            }
+                            cur = wuxm::VisualTreeHelper::GetParent(cur);
+                        }
+                    } catch (...) { log_line("HOVER inspect failed"); }
                 });
                 // v40：ContextRequested 是 Win11 右键菜单的统一触发事件（右压即发、
                 // 经冒泡到原生按钮开「通知设置」飞出）；v38 的按下手势拦截被实测为

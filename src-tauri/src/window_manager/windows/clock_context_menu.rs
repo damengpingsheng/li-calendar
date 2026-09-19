@@ -10,19 +10,20 @@
 //! 落在已被隐藏的空处——表现为「点退出没反应」。菜单保持可见，直到：
 //! 动作执行 / Esc / 点击菜单外部（由低级钩子判定并隐藏，点击同时放行给下层）。
 use crate::windows_hook::IS_MENU_OPEN;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU64, Ordering};
 use std::sync::RwLock;
 use tauri::{AppHandle, Manager, WebviewWindow};
 use windows::core::BOOL;
 use windows::core::w;
-use windows::Win32::Foundation::{HWND, LRESULT, LPARAM, POINT, WPARAM};
+use windows::Win32::Foundation::{GetLastError, SetLastError, WIN32_ERROR, HWND, LRESULT, LPARAM, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     keybd_event, ReleaseCapture, INPUT, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYEVENTF_KEYUP,
     MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_MOVE, MOUSEINPUT, SendInput, VK_MENU,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, EnumWindows,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, EnumWindows,
     FindWindowW, GetClassNameW, GetCursorPos, GetForegroundWindow, GetSystemMetrics,
     GetWindowThreadProcessId, HWND_TOPMOST, IsWindowVisible, MF_STRING, PostMessageW,
     RegisterClassW, SetForegroundWindow, SetWindowPos, ShowWindow, SM_CXSCREEN, SM_CYSCREEN,
@@ -39,6 +40,26 @@ const MENU_HEIGHT: f64 = 112.0;
 /// 原生菜单命令 ID（与旧 TrackPopupMenu 实现一致）。
 const MENU_SETTINGS_ID: u32 = 1001;
 const MENU_EXIT_ID: u32 = 1002;
+
+/// Per-open diagnostic selection; absent/invalid file preserves the deployed behavior.
+/// Read once so changing the file cannot mix policies within one menu session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorPolicy {
+    Legacy,
+    NoMove,
+    NoMoveNoGuard,
+}
+
+fn cursor_policy() -> CursorPolicy {
+    let path = std::env::current_exe().ok()
+        .and_then(|p| p.parent().map(|d| d.join("clock-menu-diagnostic.txt")));
+    let value = path.and_then(|p| std::fs::read_to_string(p).ok());
+    match value.as_deref().map(str::trim) {
+        Some("nomove") => CursorPolicy::NoMove,
+        Some("nomove_noguard") => CursorPolicy::NoMoveNoGuard,
+        _ => CursorPolicy::Legacy,
+    }
+}
 
 /// 菜单当前屏幕矩形（物理坐标 x1,y1,x2,y2），供低级钩子判定「菜单外点击」。
 /// `None` 表示菜单未显示。
@@ -257,7 +278,11 @@ pub fn show_clock_context_menu(
     let mut y = (click_y - height * 3 / 4).clamp(0, (work_bottom - height).max(0));
     // 同原生路径：先消除 XAML 时钟 tooltip 并把光标落到菜单区域内
     // （两段式真实移动，见 `move_cursor_to_dismiss_tooltip` 注释），再显示菜单。
-    move_cursor_to_dismiss_tooltip(x + width / 2, y + height / 2);
+    let policy = cursor_policy();
+    crate::dbg_log(&format!("ccm cursor diagnostic v1: policy={policy:?} tauri=true"));
+    if policy == CursorPolicy::Legacy {
+        move_cursor_to_dismiss_tooltip(x + width / 2, y + height / 2);
+    }
     let _ = window.set_position(tauri::PhysicalPosition::new(x, y));
     let _ = window.show();
     // 收起任务栏 tooltip：它会悬浮在时钟正上方（即菜单「退出」项的位置），
@@ -313,8 +338,10 @@ pub fn hide_clock_context_menu(app_handle: &AppHandle) {
 
 // ---- 原生 TrackPopupMenu 路径（用户偏好的系统风格菜单；Tauri 窗口路径保留为备用）----
 
-/// 原生菜单属主窗口句柄缓存（TrackPopupMenu 必须有属主，空句柄会不显示/闪退）。
+/// 仅发布当前菜单属主，供钩子取消菜单；不能跨异步任务的执行线程缓存复用。
 static MENU_OWNER_HWND: AtomicIsize = AtomicIsize::new(0);
+// A watcher from a previous menu must never act on a newly opened menu.
+static MENU_SESSION: AtomicU64 = AtomicU64::new(0);
 
 /// 属主窗口过程：全部转发 `DefWindowProcW`。
 unsafe extern "system" fn menu_owner_wnd_proc(
@@ -326,12 +353,9 @@ unsafe extern "system" fn menu_owner_wnd_proc(
     unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
 }
 
-/// 惰性创建隐藏属主窗口（消息窗口语义，无需显示）。
+/// 每次在调用 TrackPopupMenu 的线程上创建属主，菜单结束后同线程销毁。
+/// 事件监听器是 async task，跨 await 后可能迁移到另一个运行时工作线程。
 unsafe fn ensure_menu_owner_window() -> Option<HWND> {
-    let cached = MENU_OWNER_HWND.load(Ordering::SeqCst);
-    if cached != 0 {
-        return Some(HWND(cached as *mut std::ffi::c_void));
-    }
     let class_name = w!("liCalendarMenuOwnerWnd");
     let hmodule = GetModuleHandleW(None).ok()?;
     let wc = WNDCLASSW {
@@ -358,6 +382,7 @@ unsafe fn ensure_menu_owner_window() -> Option<HWND> {
         )
         .ok()?;
         MENU_OWNER_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+        crate::dbg_log(&format!("native owner v2: hwnd={:?} thread={}", hwnd, GetCurrentThreadId()));
         Some(hwnd)
     }
 }
@@ -392,11 +417,16 @@ pub fn native_menu_rect() -> Option<(i32, i32, i32, i32)> {
 /// 不再与菜单重叠；之后再右键会重新弹出菜单（见 mouse_hook 的
 /// `NATIVE_DISMISS_PENDING` 重开路径）。300ms 阈值保证快速划过时钟区、
 /// 以及移回时钟立刻右键（重开菜单）都不受影响。
-fn spawn_menu_hover_guard() {
-    std::thread::spawn(|| {
+fn spawn_menu_hover_guard(policy: CursorPolicy, session: u64) {
+    std::thread::spawn(move || {
         let mut in_clock_since: Option<std::time::Instant> = None;
+        let mut previous_in_clock = None;
+        let started = std::time::Instant::now();
         loop {
             std::thread::sleep(std::time::Duration::from_millis(50));
+            if MENU_SESSION.load(Ordering::SeqCst) != session {
+                return;
+            }
             if !crate::windows_hook::NATIVE_MENU_TRACKING.load(Ordering::SeqCst) {
                 return;
             }
@@ -408,6 +438,16 @@ fn spawn_menu_hover_guard() {
             let pos = unsafe { GetCursorPos(&mut pt) }.is_ok();
             let in_clock =
                 pos && crate::windows_hook::is_mouse_in_clock_area(pt.x, pt.y);
+            if previous_in_clock != Some(in_clock) {
+                crate::dbg_log(&format!(
+                    "menu hover diagnostic: policy={policy:?} in_clock={in_clock} cursor=({},{}) elapsed_ms={}",
+                    pt.x, pt.y, started.elapsed().as_millis()
+                ));
+                previous_in_clock = Some(in_clock);
+            }
+            if policy == CursorPolicy::NoMoveNoGuard {
+                continue;
+            }
             if !in_clock {
                 in_clock_since = None;
                 continue;
@@ -431,9 +471,15 @@ fn spawn_menu_hover_guard() {
 ///    （见 mouse_hook.rs），TPM 在无前台下不处理项交互。
 /// 3. 瞬关重试：菜单 <150ms 内无选择消失 → 重新弹出（最多 3 次）。
 pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static str> {
+    let session = MENU_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
+    let policy = cursor_policy();
+    crate::dbg_log(&format!(
+        "ccm cursor diagnostic v1: policy={policy:?} injection={} click=({click_x},{click_y})",
+        crate::clockbar::injection_enabled()
+    ));
     IS_MENU_OPEN.store(true, Ordering::SeqCst);
     crate::windows_hook::NATIVE_MENU_TRACKING.store(true, Ordering::SeqCst);
-    spawn_menu_hover_guard();
+    spawn_menu_hover_guard(policy, session);
     let result;
     unsafe {
         let Some(owner) = ensure_menu_owner_window() else {
@@ -450,6 +496,8 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         hide_taskbar_tooltips();
 
         let Ok(hmenu) = CreatePopupMenu() else {
+            MENU_OWNER_HWND.store(0, Ordering::SeqCst);
+            let _ = DestroyWindow(owner);
             IS_MENU_OPEN.store(false, Ordering::SeqCst);
             crate::windows_hook::NATIVE_MENU_TRACKING.store(false, Ordering::SeqCst);
             return None;
@@ -477,7 +525,12 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         // 关键：TrackPopupMenu 之前先消除 XAML 时钟 tooltip 并把光标落到菜单
         // 上（两段式真实移动，见 `move_cursor_to_dismiss_tooltip` 注释）。
         // 菜单整体位于任务栏上方（menu_y 为工作区底缘），落点取菜单竖直中点。
-        move_cursor_to_dismiss_tooltip(menu_x, menu_y - 48);
+        if policy == CursorPolicy::Legacy {
+            move_cursor_to_dismiss_tooltip(menu_x, menu_y - 48);
+        }
+        let mut cursor = POINT::default();
+        let cursor_ok = GetCursorPos(&mut cursor).is_ok();
+        crate::dbg_log(&format!("menu before TPM: policy={policy:?} cursor_ok={cursor_ok} cursor=({},{})", cursor.x, cursor.y));
 
         // 记录菜单估算矩形，供钩子做菜单内（上/下半动作路由）与菜单外（关闭）判定
         MENU_RECT
@@ -495,6 +548,7 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         let mut attempt: u32 = 0;
         loop {
             let start = std::time::Instant::now();
+            SetLastError(WIN32_ERROR(0));
             ret = TrackPopupMenu(
                 hmenu,
                 TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_CENTERALIGN | TPM_BOTTOMALIGN,
@@ -504,9 +558,10 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
                 owner,
                 None,
             );
+            let error = GetLastError().0;
             let elapsed = start.elapsed();
             crate::dbg_log(&format!(
-                "native: TPM attempt={attempt} ret={} elapsed={elapsed:?}",
+                "native: TPM attempt={attempt} ret={} error={error} elapsed={elapsed:?}",
                 ret.0
             ));
             if ret.0 != 0 || elapsed >= std::time::Duration::from_millis(150) || attempt >= 2 {
@@ -519,6 +574,8 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         let _ = DestroyMenu(hmenu);
         let _ = PostMessageW(Some(owner), 0, WPARAM(0), LPARAM(0)); // WM_NULL 收尾
         let _ = ReleaseCapture();
+        MENU_OWNER_HWND.store(0, Ordering::SeqCst);
+        let _ = DestroyWindow(owner);
 
         let cmd = match ret.0 as u32 {
             MENU_EXIT_ID => Some("exit"),
@@ -529,6 +586,7 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
     }
     IS_MENU_OPEN.store(false, Ordering::SeqCst);
     crate::windows_hook::NATIVE_MENU_TRACKING.store(false, Ordering::SeqCst);
+    MENU_RECT.write().map(|mut g| *g = None).ok();
     crate::dbg_log(&format!("native: result={:?}", result));
     result
 }
