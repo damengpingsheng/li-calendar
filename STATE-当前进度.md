@@ -1,8 +1,10 @@
 # 会话续作指引：注入式任务栏时钟第三代（当前进度）
 
-> 更新时间：2026-09-16 深夜（v64=两行垂直间距 vgap 可调，**tap v59**（管道 b59）——v58 以来首次 tap 改动+explorer 重启实战；v63=节日段倒计时+西方节日退场；v62=行政区划全自动；v61=天气源切高德；v60=天气段增强） · 用途：新会话窗口快速接续
+> 更新时间：2026-09-19 深夜（**tap v63=右键菜单 tooltip 源头压制转正**——ttc/ttk/ttr 带 id 确认+8s 租约+断线/c1free/unload 三层自愈恢复，光标默认不动（策略文件缺省=NoMoveNoGuard，`legacy` 可回滚）；v65=高德 key 注册表兜底；v64=vgap；v63 节日段倒计时；v62 行政区划；v61 天气源高德） · 用途：新会话窗口快速接续
 
-## 0. 当前决策（唯一生效，2026-09-16 深夜更新）
+## 0. 当前决策（唯一生效，2026-09-19 深夜更新）
+
+> **右键菜单光标不动+tooltip 源头压制上线（tap v63，管道 b63）**：右键时钟→tap 在 explorer UI 线程关悬浮+清除 ToolTipService 附加属性（ttcack 确认后才弹菜单，120ms 有界等待）→菜单存活期 host 每 2s ttk 续期（兼探测系统懒绑定回挂）→菜单关 ttr 恢复（ttrack 确认）。泄漏兜底三层：8s 租约到期自愈/管道断开 ~100ms 自愈（kill 实测）/c1free+unload 恢复（全幂等）。v62 教训：ttr fire-and-forget 在退出竞态下丢失→悬停 tooltip 死 7 分钟（18:32 实测）；ack 走 session.rs 独立原子（TTC_ACK/TTK_ACK/TTR_ACK），**勿走 wait_for 全局游标**（与数据线程 c1set 等待互吃消息）。悬停守护与两段式光标移动退役（AGENTS 铁律 4/5 已改写；`NATIVE_MENU_RECT` 从未写入=死代码，菜单项点击靠 TPM 自行处理，勿依赖钩子路由）。改 tap 四处版本联动照旧。证据 `D:\agents_tmp\menu_cursor_20260919\`。
 
 > **v64 完成（tap v59 上线）**：两行垂直间距可调——c1set `"vgap"`（0~20 钳制，缺省 0），tap 侧 LayoutHpanelChildren 统一设第二行 Margin（mode10 全量重建生效，≤1s）；host clockbarStyle.vgap 恒发+设置页「上下行间距」滑条。**版本联动四处**：TAPVER 构建参数/pipe.rs PIPE_NAME/tap_dll_path/session.rs TAP_VER/探针 main.rs——改 tap 必查全。tap v59 驻留新 explorer（b59 管道/b59 日志），tap58 留存可回滚。**v63 完成**：节日段=当日中国节日显示名（纪念日当天也显示），否则「距春节10天」式倒计时（白名单=法定+传统 12 项）；西方节日不显示也不倒数（补充表删除）；单测 festival_segments_2026 15 例。**v62 完成**：行政区划全自动（adcode 四层链；城区名留空自动跟随；liConfig weatherAdcode=110114 锁昌平）。**v61 完成**：天气源切高德（GAODE_WEATHER_API；风级风向；旧链路回退）。详见方案 §3「T 阶段实测结果」v60~v64 段。证据 `D:\agents_tmp\t_stage_20260916\`。
 

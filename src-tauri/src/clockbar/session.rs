@@ -3,10 +3,10 @@
 
 use super::ffi;
 use super::pipe;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const TAP_VER: u32 = 62;
+pub const TAP_VER: u32 = 63;
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 pub const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -33,6 +33,56 @@ pub(crate) fn push_line(q: &MsgQ, line: &str) {
             let cut = v.len() - 8000;
             v.drain(..cut);
         }
+    }
+    hook_tip_ack(line);
+}
+
+// ---- v63：ttc/ttk/ttr 确认走独立原子，不经 wait_for 全局游标 ----
+// 菜单线程（等 ttcack）与数据线程（等 c1set ack，每秒都在等）并发时，游标式
+// 消费会互吃消息（B 阶段血泪 #7 同型）。push_line 顺手解析三类 ack 写入原子，
+// 菜单侧自旋等待，零干扰。
+// 编码：(id << 8) | 0x80（ack 到位）| 低 7 位计数。
+static TTC_ACK: AtomicU64 = AtomicU64::new(0);
+static TTK_ACK: AtomicU64 = AtomicU64::new(0);
+static TTR_ACK: AtomicU64 = AtomicU64::new(0);
+
+fn json_num(line: &str, key: &str) -> Option<u64> {
+    let pat = format!("\"{key}\":");
+    let i = line.find(&pat)? + pat.len();
+    let rest = &line[i..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    rest[..end].parse().ok()
+}
+
+fn hook_tip_ack(line: &str) {
+    if line.contains(r#""t":"ttcack""#) {
+        if let (Some(id), Some(cleared)) = (json_num(line, "id"), json_num(line, "cleared")) {
+            TTC_ACK.store((id << 8) | 0x80 | (cleared & 0x7F), Ordering::SeqCst);
+        }
+    } else if line.contains(r#""t":"ttkack""#) {
+        if let (Some(id), Some(found)) = (json_num(line, "id"), json_num(line, "found")) {
+            TTK_ACK.store((id << 8) | 0x80 | (found & 0x7F), Ordering::SeqCst);
+        }
+    } else if line.contains(r#""t":"ttrack""#) {
+        if let (Some(id), Some(restored)) = (json_num(line, "id"), json_num(line, "restored")) {
+            TTR_ACK.store((id << 8) | 0x80 | (restored & 0x7F), Ordering::SeqCst);
+        }
+    }
+}
+
+fn wait_tip_ack(ack: &AtomicU64, id: u64, timeout_ms: u64) -> Option<u64> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+    loop {
+        let v = ack.load(Ordering::SeqCst);
+        if (v & 0x80) != 0 && (v >> 8) == id {
+            return Some(v & 0x7F);
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
 }
 
@@ -292,23 +342,47 @@ pub fn send_c1set(json: &str) -> Option<String> {
     wait_for(|l| l.contains(r#""t":"c1set""#), 15_000)
 }
 
-/// 下发 ttc：tap 在 UI 线程压制时钟 ToolTip（v62：保存并清除 ToolTipService
-/// 附加属性，含关闭已显示的悬浮）。右键菜单弹出前调用——26200 实测该 tooltip
-/// 是 explorer 的 Xaml_WindowedPopupClass 置顶弹窗，会盖住 TPM 菜单项吃点击，
-/// 且菜单驻留期间悬停会重新成熟（仅 IsOpen=false 挡不住，v61 实测）。
-/// fire-and-forget：失败仅记日志不阻塞菜单。
-pub fn send_ttc() {
-    if !pipe::pipe_write(b"ttc") {
-        crate::dbg_log("ttc: pipe_write failed (tap not connected?)");
+/// 下发 ttc（带 id 完成确认）：tap 在 UI 线程压制时钟 ToolTip（关闭已显示悬浮 +
+/// 保存并清除附加属性，武装 8s 租约）。右键菜单弹出前调用——26200 实测该 tooltip
+/// 是 explorer 的 Xaml_WindowedPopupClass 置顶弹窗，会盖住 TPM 菜单项吃点击，且
+/// 菜单驻留期间悬停会重新成熟。返回 Some(cleared)=已确认抑制；None=未确认
+/// （超时/管道断/tap 不在位）——调用方如实记录并继续弹菜单，不阻塞。
+pub fn send_ttc_wait(id: u64, timeout_ms: u64) -> Option<u64> {
+    if !crate::clockbar::injection_enabled() {
+        return None;
     }
+    if !pipe::pipe_write(format!("ttc {id}").as_bytes()) {
+        crate::dbg_log(&format!("ttc id={id}: pipe_write failed"));
+        return None;
+    }
+    wait_tip_ack(&TTC_ACK, id, timeout_ms)
 }
 
-/// 下发 ttr：tap 原位恢复 ttc 清除的 ToolTip 附加属性。菜单关闭时调用，
-/// 保证平时悬停的日期悬浮功能不受影响。fire-and-forget。
-pub fn send_ttr() {
-    if !pipe::pipe_write(b"ttr") {
-        crate::dbg_log("ttr: pipe_write failed (tap not connected?)");
+/// 下发 ttk（租约续期 + 中途探测）：菜单存活期间由续期线程每 2s 调用。返回
+/// Some(found)——found>0 表示系统在菜单存活期间重新挂上了 tooltip（tap 已一并
+/// 压制），是「驻留期回写」观测数据；None=续期无 ack（租约自愈由 tap 侧兜底）。
+pub fn send_ttk_wait(id: u64, timeout_ms: u64) -> Option<u64> {
+    if !crate::clockbar::injection_enabled() {
+        return None;
     }
+    if !pipe::pipe_write(format!("ttk {id}").as_bytes()) {
+        return None;
+    }
+    wait_tip_ack(&TTK_ACK, id, timeout_ms)
+}
+
+/// 下发 ttr（带 id 确认）：tap 原位恢复被压制的 ToolTip 附加属性并解除租约。
+/// 菜单关闭时调用。返回 Some(restored)=确认恢复；None=未确认（tap 侧租约
+/// 到期/断线路径会自愈，无需 host 重试）。
+pub fn send_ttr_wait(id: u64, timeout_ms: u64) -> Option<u64> {
+    if !crate::clockbar::injection_enabled() {
+        return None;
+    }
+    if !pipe::pipe_write(format!("ttr {id}").as_bytes()) {
+        crate::dbg_log(&format!("ttr id={id}: pipe_write failed"));
+        return None;
+    }
+    wait_tip_ack(&TTR_ACK, id, timeout_ms)
 }
 
 /// 优雅拆除（E3 全清理语义）：c1free 摘面板 → unadvise 退订 → 断开连接。

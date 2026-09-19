@@ -43,6 +43,9 @@ const MENU_EXIT_ID: u32 = 1002;
 
 /// Per-open diagnostic selection; absent/invalid file preserves the deployed behavior.
 /// Read once so changing the file cannot mix policies within one menu session.
+/// v63 起默认（含文件缺失/无效）= NoMoveNoGuard：tooltip 压制由 tap ttc/ttr 源头
+/// 接管（v62 实测驻留无重弹、点击不被吃），光标移动与悬停守护退役。文件仅作
+/// 实验覆盖：显式写 `legacy` 可回滚两段式移动+守护。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CursorPolicy {
     Legacy,
@@ -55,10 +58,42 @@ fn cursor_policy() -> CursorPolicy {
         .and_then(|p| p.parent().map(|d| d.join("clock-menu-diagnostic.txt")));
     let value = path.and_then(|p| std::fs::read_to_string(p).ok());
     match value.as_deref().map(str::trim) {
+        Some("legacy") => CursorPolicy::Legacy,
         Some("nomove") => CursorPolicy::NoMove,
-        Some("nomove_noguard") => CursorPolicy::NoMoveNoGuard,
-        _ => CursorPolicy::Legacy,
+        _ => CursorPolicy::NoMoveNoGuard,
     }
+}
+
+/// 最近一次 ttc 的菜单 id（Tauri 备用菜单路径 hide 时用它发 ttr；原生路径在
+/// 函数内用局部 session id，不经此静态量）。
+static LAST_TTC_ID: AtomicU64 = AtomicU64::new(0);
+
+/// v63 租约续期线程：菜单存活期间每 2s 发 ttk 续期（TPM 阻塞在菜单线程，续期
+/// 必须旁路）；菜单关闭/进程死亡 → 标志翻转/进程消亡 → 续期停止 → tap 侧租约
+/// 到期自动恢复。ttk 的 found 计数是「驻留期系统是否回写 tooltip」的观测数据。
+fn spawn_menu_lease_renewal(id: u64, require_native_tracking: bool) {
+    std::thread::spawn(move || {
+        let mut round: u32 = 0;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            if !IS_MENU_OPEN.load(Ordering::SeqCst) {
+                return;
+            }
+            if require_native_tracking
+                && !crate::windows_hook::NATIVE_MENU_TRACKING.load(Ordering::SeqCst)
+            {
+                return;
+            }
+            round += 1;
+            match crate::clockbar::session::send_ttk_wait(id, 600) {
+                Some(found) if found > 0 => crate::dbg_log(&format!(
+                    "ttk id={id} round={round} system re-attached tooltip! found={found}"
+                )),
+                Some(_) => {}
+                None => crate::dbg_log(&format!("ttk id={id} round={round} no ack")),
+            }
+        }
+    });
 }
 
 /// 菜单当前屏幕矩形（物理坐标 x1,y1,x2,y2），供低级钩子判定「菜单外点击」。
@@ -242,10 +277,18 @@ pub fn show_clock_context_menu(
     click_x: i32,
     click_y: i32,
 ) -> Result<(), String> {
-    // v61：菜单弹出前经管道让 tap 收掉时钟 XAML tooltip（Xaml_WindowedPopupClass
-    // 会盖住菜单项吃点击，实测）。最早时机发送，给 UI 线程最大提前量。
-    crate::clockbar::session::send_ttc();
     let window = ensure_window(app_handle).ok_or_else(|| "创建右键菜单窗口失败".to_string())?;
+    // v63：菜单弹出前经管道让 tap 压制时钟 XAML tooltip（带 id 完成确认 + 租约，
+    // 见 session::send_ttc_wait）。放在窗口创建成功之后，失败路径不产生待恢复对。
+    let ttc_id = (MENU_SESSION.fetch_add(1, Ordering::SeqCst) + 1) as u64;
+    LAST_TTC_ID.store(ttc_id, Ordering::SeqCst);
+    match crate::clockbar::session::send_ttc_wait(ttc_id, 120) {
+        Some(cleared) => {
+            crate::dbg_log(&format!("ttc id={ttc_id} confirmed cleared={cleared}"));
+            spawn_menu_lease_renewal(ttc_id, false);
+        }
+        None => crate::dbg_log(&format!("ttc id={ttc_id} suppression unconfirmed (timeout)")),
+    }
     let scale = window.scale_factor().unwrap_or(1.0);
     let width = (MENU_WIDTH * scale).ceil() as i32;
     let height = (MENU_HEIGHT * scale).ceil() as i32;
@@ -335,8 +378,13 @@ pub fn hide_clock_context_menu(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("clock_context_menu") {
         let _ = window.hide();
     }
-    // v62：菜单已关闭，恢复 ttc 压制的时钟 tooltip（无已保存对时为无害空操作）
-    crate::clockbar::session::send_ttr();
+    // v63：菜单已关闭，恢复 ttc 压制的时钟 tooltip（带确认；tap 侧租约/断线路径
+    // 兜底自愈，无已保存对时为无害空操作）
+    let id = LAST_TTC_ID.load(Ordering::SeqCst);
+    match crate::clockbar::session::send_ttr_wait(id, 800) {
+        Some(restored) => crate::dbg_log(&format!("ttr id={id} confirmed restored={restored}")),
+        None => crate::dbg_log(&format!("ttr id={id} restore unconfirmed (lease self-heals)")),
+    }
     IS_MENU_OPEN.store(false, Ordering::SeqCst);
     MENU_RECT.write().map(|mut guard| *guard = None).ok();
 }
@@ -510,10 +558,18 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         let _ = AppendMenuW(hmenu, MF_STRING, MENU_SETTINGS_ID as usize, w!("设置"));
         let _ = AppendMenuW(hmenu, MF_STRING, MENU_EXIT_ID as usize, w!("退出"));
 
-        // v62：菜单弹出前经管道让 tap 压制时钟 XAML tooltip（Xaml_WindowedPopupClass
-        // 会盖住菜单项吃点击，且菜单驻留期间悬停会重新成熟——实测）。放在失败门
-        // 之后，保证 ttc/ttr 成对；ttr 在 TPM 返回后调用，平时悬停功能不受影响。
-        crate::clockbar::session::send_ttc();
+        // v63：菜单弹出前经管道让 tap 压制时钟 XAML tooltip（带 id 完成确认 +
+        // 8s 租约；Xaml_WindowedPopupClass 会盖住菜单项吃点击，且菜单驻留期间
+        // 悬停会重新成熟——实测）。放在失败门之后保证 ttc/ttr 成对；未确认则
+        // 如实记录并继续弹菜单（不阻塞）。
+        let ttc_id = session as u64;
+        match crate::clockbar::session::send_ttc_wait(ttc_id, 120) {
+            Some(cleared) => {
+                crate::dbg_log(&format!("ttc id={ttc_id} confirmed cleared={cleared}"));
+                spawn_menu_lease_renewal(ttc_id, true);
+            }
+            None => crate::dbg_log(&format!("ttc id={ttc_id} suppression unconfirmed (timeout)")),
+        }
 
         // 菜单底边贴工作区底缘（任务栏上方），BOTTOMALIGN + 居中于点击点横坐标
         let screen_height = GetSystemMetrics(SM_CYSCREEN);
@@ -586,8 +642,16 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         let _ = ReleaseCapture();
         MENU_OWNER_HWND.store(0, Ordering::SeqCst);
         let _ = DestroyWindow(owner);
-        // v62：菜单已关闭，恢复 ttc 清除的时钟 tooltip（平时悬停功能不受影响）
-        crate::clockbar::session::send_ttr();
+        // v63：菜单已关闭，恢复 ttc 压制的时钟 tooltip（带确认；未确认由 tap 侧
+        // 租约到期/断线路径自愈）
+        match crate::clockbar::session::send_ttr_wait(ttc_id, 800) {
+            Some(restored) => {
+                crate::dbg_log(&format!("ttr id={ttc_id} confirmed restored={restored}"))
+            }
+            None => crate::dbg_log(&format!(
+                "ttr id={ttc_id} restore unconfirmed (lease self-heals)"
+            )),
+        }
 
         let cmd = match ret.0 as u32 {
             MENU_EXIT_ID => Some("exit"),

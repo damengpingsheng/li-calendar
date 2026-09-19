@@ -5,9 +5,10 @@
 
 | 文件内容 | 光标 | 原生菜单 300ms 时钟悬停守护 |
 | --- | --- | --- |
-| `legacy`、文件不存在或内容无效 | 原两段式移动 | 开启 |
-| `nomove` | 不主动移动 | 开启（用于隔离守护影响） |
+| 文件不存在或内容无效（v63 起默认） | 不主动移动 | 关闭（tooltip 由 tap ttc/ttr 源头压制） |
 | `nomove_noguard` | 不主动移动 | 关闭，仅记录进出时钟区域 |
+| `nomove` | 不主动移动 | 开启（用于隔离守护影响） |
+| `legacy` | 原两段式移动 | 开启（完整旧行为回滚） |
 
 Tauri 备用菜单同样遵循光标模式，但原本没有此原生守护。
 模式在一次菜单期间保持不变。旧菜单的守护线程不能跨会话干预新菜单。
@@ -28,6 +29,31 @@ Tauri 备用菜单同样遵循光标模式，但原本没有此原生守护。
 
 当前属于诊断阶段；不应把“不移动”直接等同于 tooltip 已彻底解决。
 恢复原行为：将文件内容改为 `legacy`。
+
+## 2026-09-19 v63：ttc/ttr 源头压制转正（默认值翻转）
+
+诊断结论落定：tooltip 盖菜单吃点击的根因是系统时钟的 XAML ToolTip
+（`Xaml_WindowedPopupClass`），tap 在时钟元素树上可直达（depth=1）。
+v61（仅 IsOpen=false）挡不住驻留期悬停重成熟；v62（保存+清除 ToolTipService
+附加属性）压制有效但恢复链有泄漏（退出竞态实测丢 ttr，悬停功能死了 7 分钟）。
+v63 三项收尾：
+
+1. **带 id 的完成确认**：`ttc <id>` → `ttcack{id,found,cleared,err}`（host
+   有界等待 120ms，未确认如实记「抑制未确认」并照常弹菜单）；`ttr <id>` →
+   `ttrack{id,restored}`。ack 走独立原子解析，不经 wait_for 全局游标
+   （避免与数据线程 c1set 等待互吃消息）。
+2. **三层恢复兜底**：正常关闭 ttr（实测在进程退出前完成确认）；管道断开
+   `AutoRestoreOnDisconnect`（kill 实测 ~100ms 内恢复，悬停功能无损）；
+   8s 租约（ttk 每 2s 续期——菜单真开着则永不恢复，进程死/续期停则到期
+   自动恢复；另有 c1free/unload 面板拆除恢复，全部幂等）。
+3. **默认值翻转**：文件缺失/无效 = NoMoveNoGuard（不移动+无守护）；
+   `legacy` 为显式回滚。
+
+实测（tap b63 日志 + menu_dbg）：ack 链全通（ttc confirmed cleared=2 →
+4 轮 ttk 续期 → ttr confirmed restored=2）；驻留 7s 无重弹无回写
+（ttk found=0）；kill 中途菜单 → 断线自愈 → 悬停 tooltip 复活（截图）；
+设置/退出点击直达；退出竞态不再泄漏。ttk 的 found 计数即「驻留期系统
+是否回写」的持续观测点。
 
 ## 2026-09-19 本机诊断结果
 

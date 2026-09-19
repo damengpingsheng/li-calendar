@@ -1179,11 +1179,73 @@ static winrt::event_token g_szToken{}, g_themeToken{};
 static bool               g_eventsOn = false;
 static wux::DispatcherTimer g_timer{ nullptr };
 static wfnd::IInspectable g_borderRef{ nullptr };
-// v62：ttc 时保存被清除的 (owner, tip) 对（最多 4 对），ttr 时原位恢复。
-// 只在 dispatched lambda（UI 线程）内读写，无需加锁。
+// v62/v63：ttc 时保存被清除的 (owner, tip) 对（最多 4 对），ttr/清理路径/租约到期
+// 时原位恢复。全部读写只在 dispatched lambda（UI 线程）内——同线程串行无需加锁。
 static wfnd::IInspectable g_tipOwnerSaved[4]{ nullptr, nullptr, nullptr, nullptr };
 static wfnd::IInspectable g_tipSaved[4]{ nullptr, nullptr, nullptr, nullptr };
 static int g_tipSavedCount = 0;
+// v63 租约：ttc 武装（默认 8s），ttk 续期，ttr/恢复清零；到期仍未恢复 → 看门狗
+// 在 UI 线程自动恢复。兜住 host 死亡/命令丢失类泄漏（实测：ttr 写入成功但 tap
+// 未收到，泄漏持续 7 分钟）。volatile LONG64 对齐 64 位读写在 x64 原子。
+static volatile LONG64 g_tipLeaseDeadline = 0;
+static volatile LONG g_tipWatchRunning = 0;
+
+// 恢复全部已保存的 tooltip 附加属性（UI 线程专用；幂等，零保存对时为无害空操作）。
+static void TipRestoreAllUi() {
+    if (g_tipSavedCount <= 0) return;
+    int restored = 0;
+    for (int i = 0; i < g_tipSavedCount && i < 4; ++i) {
+        try {
+            auto owner = g_tipOwnerSaved[i].try_as<wux::DependencyObject>();
+            if (owner && g_tipSaved[i]) {
+                wux::Controls::ToolTipService::SetToolTip(owner, g_tipSaved[i]);
+                restored++;
+            }
+        } catch (...) { log_line("TIP restore exception idx=%d", i); }
+        g_tipOwnerSaved[i] = nullptr;
+        g_tipSaved[i] = nullptr;
+    }
+    g_tipSavedCount = 0;
+    InterlockedExchange64(&g_tipLeaseDeadline, 0);
+    log_line("TIP restored=%d lease cleared", restored);
+}
+
+// v63 租约看门狗线程：deadline==0 连续 3s 才退场（防「新武装恰逢旧线程收尾」的
+// 创建竞态——旧线程可继续服务新租约）；到期 → UI 线程恢复。线程只读原子/派发，
+// 不做引擎调用（血泪 #5 纪律；RunAsync 入队与 C1 自动重建线程同型）。
+static DWORD WINAPI TipLeaseWatchdog(LPVOID) {
+    int idleRounds = 0;
+    for (;;) {
+        Sleep(1000);
+        LONG64 deadline = InterlockedCompareExchange64(&g_tipLeaseDeadline, 0, 0);
+        if (deadline == 0) {
+            if (++idleRounds >= 3) break;
+            continue;
+        }
+        idleRounds = 0;
+        if ((LONG64)GetTickCount64() < deadline) continue;
+        log_line("TTL lease expired -> auto restore");
+        wuc::CoreDispatcher disp{ nullptr };
+        AcquireSRWLockShared(&g_stateLock); disp = g_disp; ReleaseSRWLockShared(&g_stateLock);
+        if (disp) {
+            disp.RunAsync(wuc::CoreDispatcherPriority::Normal, []() {
+                try { TipRestoreAllUi(); } catch (...) { log_line("TTL restore EXCEPTION"); }
+            });
+        }
+        break;
+    }
+    InterlockedExchange(&g_tipWatchRunning, 0);
+    return 0;
+}
+
+// 武装/续期租约（UI 线程调用）。
+static void TipLeaseArm(DWORD ms) {
+    InterlockedExchange64(&g_tipLeaseDeadline, (LONG64)(GetTickCount64() + ms));
+    if (InterlockedCompareExchange(&g_tipWatchRunning, 1, 0) != 0) return;
+    HANDLE t = CreateThread(NULL, 0, TipLeaseWatchdog, NULL, 0, NULL);
+    if (t) CloseHandle(t);
+    else InterlockedExchange(&g_tipWatchRunning, 0);
+}
 static volatile LONG      g_lastRecvTick = 0;      // pipe 最近收到命令的时刻（GetTickCount）
 static volatile LONG      g_lastResyncTick = 0;    // 上次僵尸重同步时刻（限频 30s）
 static volatile LONG      g_lastSizeTick = 0;      // 横板最近一次尺寸变化时刻（v44 稳定门）
@@ -2306,6 +2368,7 @@ static int RunC1Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
                     InterlockedExchange(&job->done, SUCCEEDED(job->hr) ? 1 : 2);
                 } else if (job->mode == 11) {
                     PanelFree(true);
+                    TipRestoreAllUi(); // v63：面板拆除同场恢复被压制的 tooltip（幂等）
                     job->hr = S_OK;
                     InterlockedExchange(&job->done, 1);
                 } else { job->hr = E_INVALIDARG; InterlockedExchange(&job->done, 2); }
@@ -2325,9 +2388,13 @@ static void AutoRestoreOnDisconnect() {
     {
         wuc::CoreDispatcher disp{ nullptr };
         AcquireSRWLockShared(&g_stateLock); disp = g_disp; ReleaseSRWLockShared(&g_stateLock);
-        if (disp && g_panelOn) {
+        if (disp) {
             disp.RunAsync(wuc::CoreDispatcherPriority::Normal, []() {
-                try { PanelFree(true); log_line("AUTO panel freed on disconnect"); }
+                try {
+                    if (g_panelOn) PanelFree(true);
+                    TipRestoreAllUi(); // v63：断线即恢复被压制的 tooltip（host 死亡也能自愈）
+                    log_line("AUTO panel/tooltip restored on disconnect");
+                }
                 catch (...) { log_line("AUTO PanelFree EXCEPTION"); }
             });
         }
@@ -2511,16 +2578,23 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                         }
                     }
                 } else if (!strcmp(cmd, "ttc")) {
-                    // v62：host 右键菜单即将弹出 → 压制时钟 ToolTip。实测（26200）
-                    // 该 tooltip 是 explorer 的 Xaml_WindowedPopupClass 置顶弹窗，
-                    // 会盖住 TPM 菜单项吃点击；且 v61 实测仅 IsOpen(false) 挡不住
-                    // 菜单驻留期间的悬停重成熟（~2s 后重弹盖菜单）。故保存并清除
-                    // ToolTipService 附加属性（悬停计时器无从触发），菜单关闭时由
-                    // host 下发 ttr 原位恢复。纯 fire-and-forget：结果走 tap 日志。
+                    // v63：host 右键菜单即将弹出 → 压制时钟 ToolTip（带 id 完成确认 +
+                    // 8s 租约）。实测（26200）该 tooltip 是 explorer 的
+                    // Xaml_WindowedPopupClass 置顶弹窗，会盖住 TPM 菜单项吃点击；
+                    // 且仅 IsOpen(false) 挡不住菜单驻留期间的悬停重成熟（v61 实测）。
+                    // 故保存并清除 ToolTipService 附加属性；菜单关闭 ttr 恢复，
+                    // 租约到期/断线/拆除兜底自愈（详见 TipLeaseWatchdog）。
+                    long long ttcId = _atoi64(arg);
                     wuc::CoreDispatcher dispTtc{ nullptr };
                     AcquireSRWLockShared(&g_stateLock); dispTtc = g_disp; ReleaseSRWLockShared(&g_stateLock);
-                    if (!dispTtc) { log_line("TTC no dispatcher"); }
-                    else dispTtc.RunAsync(wuc::CoreDispatcherPriority::Normal, []() {
+                    if (!dispTtc) {
+                        log_line("TTC id=%lld no dispatcher", ttcId);
+                        char ack[128];
+                        _snprintf_s(ack, sizeof(ack), _TRUNCATE,
+                            "{\"v\":2,\"t\":\"ttcack\",\"id\":%lld,\"found\":0,\"cleared\":0,\"err\":1}\n", ttcId);
+                        send_line(ack);
+                    }
+                    else dispTtc.RunAsync(wuc::CoreDispatcherPriority::Normal, [ttcId]() {
                         try {
                             int found = 0, cleared = 0;
                             auto cur = g_borderRef.try_as<wux::DependencyObject>();
@@ -2543,37 +2617,79 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                                             didClear = true;
                                             cleared++;
                                         }
-                                        log_line("TTC depth=%d wasOpen=%d cleared=%d saved=%d",
-                                                 depth, wasOpen ? 1 : 0, didClear ? 1 : 0, g_tipSavedCount);
+                                        log_line("TTC id=%lld depth=%d wasOpen=%d cleared=%d",
+                                                 ttcId, depth, wasOpen ? 1 : 0, didClear ? 1 : 0);
                                     }
                                 } catch (...) { log_line("TTC depth=%d inspect exception", depth); }
                                 cur = wuxm::VisualTreeHelper::GetParent(cur);
                             }
-                            log_line("TTC done found=%d cleared=%d savedCount=%d", found, cleared, g_tipSavedCount);
-                        } catch (...) { log_line("TTC EXCEPTION"); }
+                            if (cleared > 0) TipLeaseArm(8000);
+                            char ack[128];
+                            _snprintf_s(ack, sizeof(ack), _TRUNCATE,
+                                "{\"v\":2,\"t\":\"ttcack\",\"id\":%lld,\"found\":%d,\"cleared\":%d,\"err\":0}\n",
+                                ttcId, found, cleared);
+                            send_line(ack);
+                            log_line("TTC id=%lld done found=%d cleared=%d", ttcId, found, cleared);
+                        } catch (...) {
+                            char ack[128];
+                            _snprintf_s(ack, sizeof(ack), _TRUNCATE,
+                                "{\"v\":2,\"t\":\"ttcack\",\"id\":%lld,\"found\":0,\"cleared\":0,\"err\":1}\n", ttcId);
+                            send_line(ack);
+                            log_line("TTC id=%lld EXCEPTION", ttcId);
+                        }
+                    });
+                } else if (!strcmp(cmd, "ttk")) {
+                    // v63：租约续期 + 中途探测。探测回读 ToolTipService 状态——系统若
+                    // 在菜单存活期间（懒绑定）重新挂上 tooltip，发现即一并保存+清除
+                    // （抑制维护），ack 带 found 计数供 host 留痕。
+                    long long ttkId = _atoi64(arg);
+                    wuc::CoreDispatcher dispTtk{ nullptr };
+                    AcquireSRWLockShared(&g_stateLock); dispTtk = g_disp; ReleaseSRWLockShared(&g_stateLock);
+                    if (!dispTtk) { log_line("TTK id=%lld no dispatcher", ttkId); }
+                    else dispTtk.RunAsync(wuc::CoreDispatcherPriority::Normal, [ttkId]() {
+                        try {
+                            int found = 0, cleared = 0;
+                            auto cur = g_borderRef.try_as<wux::DependencyObject>();
+                            for (int depth = 0; cur && depth < 12; ++depth) {
+                                try {
+                                    auto tip = wux::Controls::ToolTipService::GetToolTip(cur);
+                                    if (tip) {
+                                        found++;
+                                        if (g_tipSavedCount < 4) {
+                                            g_tipOwnerSaved[g_tipSavedCount] = cur;
+                                            g_tipSaved[g_tipSavedCount] = tip;
+                                            g_tipSavedCount++;
+                                            wux::Controls::ToolTipService::SetToolTip(cur, nullptr);
+                                            cleared++;
+                                        }
+                                    }
+                                } catch (...) {}
+                                cur = wuxm::VisualTreeHelper::GetParent(cur);
+                            }
+                            if (g_tipSavedCount > 0) TipLeaseArm(8000);
+                            char ack[128];
+                            _snprintf_s(ack, sizeof(ack), _TRUNCATE,
+                                "{\"v\":2,\"t\":\"ttkack\",\"id\":%lld,\"found\":%d,\"cleared\":%d}\n",
+                                ttkId, found, cleared);
+                            send_line(ack);
+                            if (found > 0) log_line("TTK id=%lld found=%d cleared=%d (re-attach handled)", ttkId, found, cleared);
+                        } catch (...) { log_line("TTK id=%lld EXCEPTION", ttkId); }
                     });
                 } else if (!strcmp(cmd, "ttr")) {
-                    // v62：菜单已关闭 → 恢复 ttc 清除的 ToolTip 附加属性（原位回插）。
+                    // v63：菜单已关闭 → 恢复 ttc/ttk 清除的 ToolTip 附加属性（带 id ack）。
+                    long long ttrId = _atoi64(arg);
                     wuc::CoreDispatcher dispTtr{ nullptr };
                     AcquireSRWLockShared(&g_stateLock); dispTtr = g_disp; ReleaseSRWLockShared(&g_stateLock);
-                    if (!dispTtr) { log_line("TTR no dispatcher"); }
-                    else dispTtr.RunAsync(wuc::CoreDispatcherPriority::Normal, []() {
+                    if (!dispTtr) { log_line("TTR id=%lld no dispatcher", ttrId); }
+                    else dispTtr.RunAsync(wuc::CoreDispatcherPriority::Normal, [ttrId]() {
                         try {
-                            int restored = 0;
-                            for (int i = 0; i < g_tipSavedCount; ++i) {
-                                try {
-                                    auto owner = g_tipOwnerSaved[i].try_as<wux::DependencyObject>();
-                                    if (owner && g_tipSaved[i]) {
-                                        wux::Controls::ToolTipService::SetToolTip(owner, g_tipSaved[i]);
-                                        restored++;
-                                    }
-                                } catch (...) { log_line("TTR restore exception idx=%d", i); }
-                                g_tipOwnerSaved[i] = nullptr;
-                                g_tipSaved[i] = nullptr;
-                            }
-                            log_line("TTR done restored=%d savedCount=%d", restored, g_tipSavedCount);
-                            g_tipSavedCount = 0;
-                        } catch (...) { log_line("TTR EXCEPTION"); }
+                            int before = g_tipSavedCount;
+                            TipRestoreAllUi();
+                            char ack[128];
+                            _snprintf_s(ack, sizeof(ack), _TRUNCATE,
+                                "{\"v\":2,\"t\":\"ttrack\",\"id\":%lld,\"restored\":%d}\n", ttrId, before);
+                            send_line(ack);
+                        } catch (...) { log_line("TTR id=%lld EXCEPTION", ttrId); }
                     });
                 } else if (!strcmp(cmd, "stats")) {
                     unsigned gen = 0; bool loc = false; bool mod = false; bool disp = false;
