@@ -1179,6 +1179,11 @@ static winrt::event_token g_szToken{}, g_themeToken{};
 static bool               g_eventsOn = false;
 static wux::DispatcherTimer g_timer{ nullptr };
 static wfnd::IInspectable g_borderRef{ nullptr };
+// v62：ttc 时保存被清除的 (owner, tip) 对（最多 4 对），ttr 时原位恢复。
+// 只在 dispatched lambda（UI 线程）内读写，无需加锁。
+static wfnd::IInspectable g_tipOwnerSaved[4]{ nullptr, nullptr, nullptr, nullptr };
+static wfnd::IInspectable g_tipSaved[4]{ nullptr, nullptr, nullptr, nullptr };
+static int g_tipSavedCount = 0;
 static volatile LONG      g_lastRecvTick = 0;      // pipe 最近收到命令的时刻（GetTickCount）
 static volatile LONG      g_lastResyncTick = 0;    // 上次僵尸重同步时刻（限频 30s）
 static volatile LONG      g_lastSizeTick = 0;      // 横板最近一次尺寸变化时刻（v44 稳定门）
@@ -2505,6 +2510,71 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                             send_line(out);
                         }
                     }
+                } else if (!strcmp(cmd, "ttc")) {
+                    // v62：host 右键菜单即将弹出 → 压制时钟 ToolTip。实测（26200）
+                    // 该 tooltip 是 explorer 的 Xaml_WindowedPopupClass 置顶弹窗，
+                    // 会盖住 TPM 菜单项吃点击；且 v61 实测仅 IsOpen(false) 挡不住
+                    // 菜单驻留期间的悬停重成熟（~2s 后重弹盖菜单）。故保存并清除
+                    // ToolTipService 附加属性（悬停计时器无从触发），菜单关闭时由
+                    // host 下发 ttr 原位恢复。纯 fire-and-forget：结果走 tap 日志。
+                    wuc::CoreDispatcher dispTtc{ nullptr };
+                    AcquireSRWLockShared(&g_stateLock); dispTtc = g_disp; ReleaseSRWLockShared(&g_stateLock);
+                    if (!dispTtc) { log_line("TTC no dispatcher"); }
+                    else dispTtc.RunAsync(wuc::CoreDispatcherPriority::Normal, []() {
+                        try {
+                            int found = 0, cleared = 0;
+                            auto cur = g_borderRef.try_as<wux::DependencyObject>();
+                            for (int depth = 0; cur && depth < 12; ++depth) {
+                                try {
+                                    auto tip = wux::Controls::ToolTipService::GetToolTip(cur);
+                                    if (tip) {
+                                        found++;
+                                        bool wasOpen = false;
+                                        try {
+                                            auto tt = tip.try_as<wux::Controls::ToolTip>();
+                                            if (tt) { wasOpen = tt.IsOpen(); if (wasOpen) { tt.IsOpen(false); } }
+                                        } catch (...) { log_line("TTC depth=%d close exception", depth); }
+                                        bool didClear = false;
+                                        if (g_tipSavedCount < 4) {
+                                            g_tipOwnerSaved[g_tipSavedCount] = cur;
+                                            g_tipSaved[g_tipSavedCount] = tip;
+                                            g_tipSavedCount++;
+                                            wux::Controls::ToolTipService::SetToolTip(cur, nullptr);
+                                            didClear = true;
+                                            cleared++;
+                                        }
+                                        log_line("TTC depth=%d wasOpen=%d cleared=%d saved=%d",
+                                                 depth, wasOpen ? 1 : 0, didClear ? 1 : 0, g_tipSavedCount);
+                                    }
+                                } catch (...) { log_line("TTC depth=%d inspect exception", depth); }
+                                cur = wuxm::VisualTreeHelper::GetParent(cur);
+                            }
+                            log_line("TTC done found=%d cleared=%d savedCount=%d", found, cleared, g_tipSavedCount);
+                        } catch (...) { log_line("TTC EXCEPTION"); }
+                    });
+                } else if (!strcmp(cmd, "ttr")) {
+                    // v62：菜单已关闭 → 恢复 ttc 清除的 ToolTip 附加属性（原位回插）。
+                    wuc::CoreDispatcher dispTtr{ nullptr };
+                    AcquireSRWLockShared(&g_stateLock); dispTtr = g_disp; ReleaseSRWLockShared(&g_stateLock);
+                    if (!dispTtr) { log_line("TTR no dispatcher"); }
+                    else dispTtr.RunAsync(wuc::CoreDispatcherPriority::Normal, []() {
+                        try {
+                            int restored = 0;
+                            for (int i = 0; i < g_tipSavedCount; ++i) {
+                                try {
+                                    auto owner = g_tipOwnerSaved[i].try_as<wux::DependencyObject>();
+                                    if (owner && g_tipSaved[i]) {
+                                        wux::Controls::ToolTipService::SetToolTip(owner, g_tipSaved[i]);
+                                        restored++;
+                                    }
+                                } catch (...) { log_line("TTR restore exception idx=%d", i); }
+                                g_tipOwnerSaved[i] = nullptr;
+                                g_tipSaved[i] = nullptr;
+                            }
+                            log_line("TTR done restored=%d savedCount=%d", restored, g_tipSavedCount);
+                            g_tipSavedCount = 0;
+                        } catch (...) { log_line("TTR EXCEPTION"); }
+                    });
                 } else if (!strcmp(cmd, "stats")) {
                     unsigned gen = 0; bool loc = false; bool mod = false; bool disp = false;
                     AcquireSRWLockShared(&g_stateLock);

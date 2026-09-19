@@ -242,6 +242,9 @@ pub fn show_clock_context_menu(
     click_x: i32,
     click_y: i32,
 ) -> Result<(), String> {
+    // v61：菜单弹出前经管道让 tap 收掉时钟 XAML tooltip（Xaml_WindowedPopupClass
+    // 会盖住菜单项吃点击，实测）。最早时机发送，给 UI 线程最大提前量。
+    crate::clockbar::session::send_ttc();
     let window = ensure_window(app_handle).ok_or_else(|| "创建右键菜单窗口失败".to_string())?;
     let scale = window.scale_factor().unwrap_or(1.0);
     let width = (MENU_WIDTH * scale).ceil() as i32;
@@ -332,6 +335,8 @@ pub fn hide_clock_context_menu(app_handle: &AppHandle) {
     if let Some(window) = app_handle.get_webview_window("clock_context_menu") {
         let _ = window.hide();
     }
+    // v62：菜单已关闭，恢复 ttc 压制的时钟 tooltip（无已保存对时为无害空操作）
+    crate::clockbar::session::send_ttr();
     IS_MENU_OPEN.store(false, Ordering::SeqCst);
     MENU_RECT.write().map(|mut guard| *guard = None).ok();
 }
@@ -505,6 +510,11 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         let _ = AppendMenuW(hmenu, MF_STRING, MENU_SETTINGS_ID as usize, w!("设置"));
         let _ = AppendMenuW(hmenu, MF_STRING, MENU_EXIT_ID as usize, w!("退出"));
 
+        // v62：菜单弹出前经管道让 tap 压制时钟 XAML tooltip（Xaml_WindowedPopupClass
+        // 会盖住菜单项吃点击，且菜单驻留期间悬停会重新成熟——实测）。放在失败门
+        // 之后，保证 ttc/ttr 成对；ttr 在 TPM 返回后调用，平时悬停功能不受影响。
+        crate::clockbar::session::send_ttc();
+
         // 菜单底边贴工作区底缘（任务栏上方），BOTTOMALIGN + 居中于点击点横坐标
         let screen_height = GetSystemMetrics(SM_CYSCREEN);
         let screen_width = GetSystemMetrics(SM_CXSCREEN);
@@ -576,6 +586,8 @@ pub fn track_native_clock_menu(click_x: i32, click_y: i32) -> Option<&'static st
         let _ = ReleaseCapture();
         MENU_OWNER_HWND.store(0, Ordering::SeqCst);
         let _ = DestroyWindow(owner);
+        // v62：菜单已关闭，恢复 ttc 清除的时钟 tooltip（平时悬停功能不受影响）
+        crate::clockbar::session::send_ttr();
 
         let cmd = match ret.0 as u32 {
             MENU_EXIT_ID => Some("exit"),

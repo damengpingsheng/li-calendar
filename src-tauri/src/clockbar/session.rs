@@ -6,7 +6,7 @@ use super::pipe;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
-pub const TAP_VER: u32 = 60;
+pub const TAP_VER: u32 = 62;
 // CLSID {D4C1B77E-4E2F-4E7A-9B31-5F0A6C2E8B14}
 // GUID 内存布局（LE）：Data1 u32 | Data2/Data3 u16 拼一个 u32 | Data4[0..4] | Data4[4..8]
 pub const TAP_CLSID: [u32; 4] = [0xD4C1_B77E, 0x4E7A_4E2F, 0x0A5F_319B, 0x148B_2E6C];
@@ -290,6 +290,25 @@ pub fn send_c1set(json: &str) -> Option<String> {
         return None;
     }
     wait_for(|l| l.contains(r#""t":"c1set""#), 15_000)
+}
+
+/// 下发 ttc：tap 在 UI 线程压制时钟 ToolTip（v62：保存并清除 ToolTipService
+/// 附加属性，含关闭已显示的悬浮）。右键菜单弹出前调用——26200 实测该 tooltip
+/// 是 explorer 的 Xaml_WindowedPopupClass 置顶弹窗，会盖住 TPM 菜单项吃点击，
+/// 且菜单驻留期间悬停会重新成熟（仅 IsOpen=false 挡不住，v61 实测）。
+/// fire-and-forget：失败仅记日志不阻塞菜单。
+pub fn send_ttc() {
+    if !pipe::pipe_write(b"ttc") {
+        crate::dbg_log("ttc: pipe_write failed (tap not connected?)");
+    }
+}
+
+/// 下发 ttr：tap 原位恢复 ttc 清除的 ToolTip 附加属性。菜单关闭时调用，
+/// 保证平时悬停的日期悬浮功能不受影响。fire-and-forget。
+pub fn send_ttr() {
+    if !pipe::pipe_write(b"ttr") {
+        crate::dbg_log("ttr: pipe_write failed (tap not connected?)");
+    }
 }
 
 /// 优雅拆除（E3 全清理语义）：c1free 摘面板 → unadvise 退订 → 断开连接。
