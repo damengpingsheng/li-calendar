@@ -34,6 +34,7 @@ pub fn show_or_create_main_window(app_handle: &AppHandle) {
     ))
     .title("松鼠日历") // 设置窗口标题
     .inner_size(800.0, 600.0) // 设置窗口内部大小
+    .min_inner_size(800.0, 480.0) // 最小宽=默认宽：配合前端内容区定宽 588，设置页布局任意尺寸下静止
     .center() // 窗口居中
     .resizable(true) // 允许调整大小
     .always_on_top(true) // 主设置窗口默认置顶

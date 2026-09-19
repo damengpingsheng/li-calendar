@@ -1,5 +1,16 @@
 import { invoke } from '@tauri-apps/api/core';
-import { Button, ColorPicker, Divider, Form, Input, Select, Slider, Switch, Tag, Tooltip } from 'antd';
+import {
+  Button,
+  ColorPicker,
+  Divider,
+  Form,
+  Input,
+  Select,
+  Slider,
+  Switch,
+  Tag,
+  Tooltip,
+} from 'antd';
 import React, { Component, useEffect, useState } from 'react';
 import { syncValuesConfig } from '../../../sync/base/syncValuesConfig.ts';
 import { useConfigSync } from '../../../sync/configStore.ts';
@@ -7,7 +18,10 @@ import type { ClockbarStyle } from '../../../sync/type/configTypes.ts';
 import { isDesktop, isWindows } from '../../../utils/platform.ts';
 
 /** 时钟段样式分组的错误边界：渲染异常时显示错误信息而不是白屏整页 */
-class ClockbarStyleErrorBoundary extends Component<{ children: React.ReactNode }, { error: Error | null }> {
+class ClockbarStyleErrorBoundary extends Component<
+  { children: React.ReactNode },
+  { error: Error | null }
+> {
   state = { error: null as Error | null };
   static getDerivedStateFromError(error: Error) {
     return { error };
@@ -20,11 +34,7 @@ class ClockbarStyleErrorBoundary extends Component<{ children: React.ReactNode }
       return (
         <div style={{ padding: 12, color: '#c00', fontSize: 12 }}>
           时钟段样式面板渲染异常：{this.state.error.message}
-          <Button
-            size="small"
-            type="link"
-            onClick={() => this.setState({ error: null })}
-          >
+          <Button size="small" type="link" onClick={() => this.setState({ error: null })}>
             重试
           </Button>
         </div>
@@ -68,9 +78,18 @@ const COLOR_PRESETS: { label: string; colors: string[] }[] = [
   {
     label: '常用颜色',
     colors: [
-      '#FFFFFF', '#BFBFBF', '#595959', '#000000',
-      '#FF4D4F', '#FF7A45', '#FAAD14', '#FADB14',
-      '#52C41A', '#13C2C2', '#1677FF', '#9254DE',
+      '#FFFFFF',
+      '#BFBFBF',
+      '#595959',
+      '#000000',
+      '#FF4D4F',
+      '#FF7A45',
+      '#FAAD14',
+      '#FADB14',
+      '#52C41A',
+      '#13C2C2',
+      '#1677FF',
+      '#9254DE',
       '#F759AB',
     ],
   },
@@ -82,9 +101,7 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
   if (!raw || typeof raw !== 'object') return { ...d };
   const r = raw as Partial<ClockbarStyle>;
   const known = Object.keys(SEG_LABELS);
-  const order = Array.isArray(r.order)
-    ? r.order.filter((id) => known.includes(id))
-    : [];
+  const order = Array.isArray(r.order) ? r.order.filter((id) => known.includes(id)) : [];
   const rows: Record<string, number> = {};
   for (const id of ['weather', 'festival', 'term', 'lunar']) {
     const v = r.rows?.[id];
@@ -104,7 +121,9 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
     // v60 天气段增强（后端还会再清洗/钳制一次——双端防御）；v62 城区名留空=自动跟随
     weatherCity: typeof r.weatherCity === 'string' ? r.weatherCity.slice(0, 16) : d.weatherCity,
     weatherAdcode:
-      typeof r.weatherAdcode === 'string' ? r.weatherAdcode.replace(/\D/g, '').slice(0, 6) : d.weatherAdcode,
+      typeof r.weatherAdcode === 'string'
+        ? r.weatherAdcode.replace(/\D/g, '').slice(0, 6)
+        : d.weatherAdcode,
     weatherEmoji: r.weatherEmoji !== false,
     weatherEmojiColor: r.weatherEmojiColor !== false,
     weatherText: r.weatherText !== false,
@@ -123,6 +142,8 @@ const WidgetShowForm: React.FC = () => {
   const [clockbarInjectionLoading, setClockbarInjectionLoading] = useState<boolean>(false);
   /** 时钟段样式（S 阶段：开关/顺序/颜色/字号/间距） */
   const [clockbarStyle, setClockbarStyle] = useState<ClockbarStyle>(DEFAULT_CLOCKBAR_STYLE);
+  /** 当前展开取色面板的段 id（受控展开，供面板内「跟随主题」点击后立即收起） */
+  const [openColorSeg, setOpenColorSeg] = useState<string | null>(null);
 
   useEffect(() => {
     if (config?.clockbarStyle) setClockbarStyle(normalizeStyle(config.clockbarStyle));
@@ -223,6 +244,17 @@ const WidgetShowForm: React.FC = () => {
     gap: 8,
     padding: '4px 0 4px 12px',
   };
+  // 段样式五列网格（排序/显示/行/颜色/字号）：全部定宽锁定，任何行（含表头）列位
+  // 一致，窗口拉宽/缩窄整表不动。显示列 60 包一层定宽 flex 容器再放开关——开关
+  // 用自然宽度渲染（同天气段增强行，实测 57px），不参与网格项尺寸判定，杜绝裁字；
+  // 行列 84=Select 定宽；颜色列容纳色块+「主题」状态标签
+  const segGridStyle: React.CSSProperties = {
+    display: 'grid',
+    gridTemplateColumns: '96px 60px 84px 120px 110px',
+    columnGap: 8,
+    alignItems: 'center',
+    padding: '4px 0 4px 12px',
+  };
   const segSliderStyle: React.CSSProperties = { width: 110 };
 
   return (
@@ -268,278 +300,345 @@ const WidgetShowForm: React.FC = () => {
 
       {isWindows && (
         <>
-        <ClockbarStyleErrorBoundary>
-        <div style={{ marginTop: 8 }}>
-          <Divider plain style={{ margin: '8px 0' }}>
-            时钟段样式（注入式时钟开启时生效）
-          </Divider>
-          <div style={rowStyle}>
-            <span style={{ width: 96 }}>上下行间距</span>
-            <Slider
-              min={0}
-              max={20}
-              step={1}
-              value={clockbarStyle.vgap}
-              onChange={(v) => previewStyle({ ...clockbarStyle, vgap: v })}
-              onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, vgap: v })}
-              style={{ width: 160 }}
-              tooltip={{ formatter: (v) => `${v}px` }}
-            />
-            <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
-              时间行与日期行之间的垂直间隔
-            </span>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ width: 96 }}>时间行间距</span>
-            <Slider
-              min={0}
-              max={40}
-              step={1}
-              value={clockbarStyle.gap}
-              onChange={(v) => previewStyle({ ...clockbarStyle, gap: v })}
-              onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap: v })}
-              style={{ width: 160 }}
-              tooltip={{ formatter: (v) => `${v}px` }}
-            />
-            <Tooltip title="整行在时钟区内的水平对齐（时间数字右侧的空白受此影响）">
-              <Select
-                size="small"
-                value={clockbarStyle.halignTime}
-                onChange={(v) => void commitStyle({ ...clockbarStyle, halignTime: v })}
-                options={[
-                  { value: 0, label: '靠左' },
-                  { value: 1, label: '居中' },
-                  { value: 2, label: '靠右' },
-                ]}
-                style={{ width: 76 }}
-              />
-            </Tooltip>
-          </div>
-          <div style={rowStyle}>
-            <span style={{ width: 96 }}>日期行间距</span>
-            <Slider
-              min={0}
-              max={40}
-              step={1}
-              value={clockbarStyle.gap2}
-              onChange={(v) => previewStyle({ ...clockbarStyle, gap2: v })}
-              onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap2: v })}
-              style={{ width: 160 }}
-              tooltip={{ formatter: (v) => `${v}px` }}
-            />
-            <Tooltip title="整行在时钟区内的水平对齐">
-              <Select
-                size="small"
-                value={clockbarStyle.halignDate}
-                onChange={(v) => void commitStyle({ ...clockbarStyle, halignDate: v })}
-                options={[
-                  { value: 0, label: '靠左' },
-                  { value: 1, label: '居中' },
-                  { value: 2, label: '靠右' },
-                ]}
-                style={{ width: 76 }}
-              />
-            </Tooltip>
-          </div>
-          {clockbarStyle.order.map((id, idx) => {
-            const isTime = id === 'time';
-            const shown = clockbarStyle.show[id] ?? true;
-            const color = clockbarStyle.colors[id];
-            const size = clockbarStyle.sizes[id] ?? 1;
-            const row = id === 'lunar' ? (clockbarStyle.rows[id] ?? 2) : (clockbarStyle.rows[id] ?? 1);
-            return (
-              <div key={id} style={rowStyle}>
-                <span
-                  style={{
-                    width: 96,
-                    flexShrink: 0,
-                    display: 'inline-flex',
-                    alignItems: 'center',
-                    gap: 4,
-                    whiteSpace: 'nowrap',
-                  }}
-                >
-                  <Button
-                    size="small"
-                    type="text"
-                    icon="↑"
-                    disabled={idx === 0}
-                    onClick={() => moveSeg(idx, -1)}
-                    aria-label={`${SEG_LABELS[id]}上移`}
-                  />
-                  <Button
-                    size="small"
-                    type="text"
-                    icon="↓"
-                    disabled={idx === clockbarStyle.order.length - 1}
-                    onClick={() => moveSeg(idx, 1)}
-                    aria-label={`${SEG_LABELS[id]}下移`}
-                  />
-                  {SEG_LABELS[id]}
+          <ClockbarStyleErrorBoundary>
+            <div style={{ marginTop: 8 }}>
+              <Divider plain style={{ margin: '8px 0' }}>
+                时钟段样式（注入式时钟开启时生效）
+              </Divider>
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>上下行间距</span>
+                <Slider
+                  min={0}
+                  max={20}
+                  step={1}
+                  value={clockbarStyle.vgap}
+                  onChange={(v) => previewStyle({ ...clockbarStyle, vgap: v })}
+                  onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, vgap: v })}
+                  style={{ width: 160 }}
+                  tooltip={{ formatter: (v) => `${v}px` }}
+                />
+                <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
+                  时间行与日期行之间的垂直间隔
                 </span>
-                {isTime ? (
-                  <>
-                    <Tag style={{ marginInlineEnd: 0 }}>系统原生样式</Tag>
-                    <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
-                      时间段保持系统时钟原生外观
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Switch
-                      checked={shown}
-                      checkedChildren="显示"
-                      unCheckedChildren="隐藏"
-                      onChange={(checked) => {
-                        const show = { ...clockbarStyle.show, [id]: checked };
-                        void commitStyle({ ...clockbarStyle, show });
+              </div>
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>时间行间距</span>
+                <Slider
+                  min={0}
+                  max={40}
+                  step={1}
+                  value={clockbarStyle.gap}
+                  onChange={(v) => previewStyle({ ...clockbarStyle, gap: v })}
+                  onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap: v })}
+                  style={{ width: 160 }}
+                  tooltip={{ formatter: (v) => `${v}px` }}
+                />
+                <Tooltip title="整行在时钟区内的水平对齐（时间数字右侧的空白受此影响）">
+                  <Select
+                    size="small"
+                    value={clockbarStyle.halignTime}
+                    onChange={(v) => void commitStyle({ ...clockbarStyle, halignTime: v })}
+                    options={[
+                      { value: 0, label: '靠左' },
+                      { value: 1, label: '居中' },
+                      { value: 2, label: '靠右' },
+                    ]}
+                    style={{ width: 76 }}
+                  />
+                </Tooltip>
+              </div>
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>日期行间距</span>
+                <Slider
+                  min={0}
+                  max={40}
+                  step={1}
+                  value={clockbarStyle.gap2}
+                  onChange={(v) => previewStyle({ ...clockbarStyle, gap2: v })}
+                  onChangeComplete={(v) => void commitStyle({ ...clockbarStyle, gap2: v })}
+                  style={{ width: 160 }}
+                  tooltip={{ formatter: (v) => `${v}px` }}
+                />
+                <Tooltip title="整行在时钟区内的水平对齐">
+                  <Select
+                    size="small"
+                    value={clockbarStyle.halignDate}
+                    onChange={(v) => void commitStyle({ ...clockbarStyle, halignDate: v })}
+                    options={[
+                      { value: 0, label: '靠左' },
+                      { value: 1, label: '居中' },
+                      { value: 2, label: '靠右' },
+                    ]}
+                    style={{ width: 76 }}
+                  />
+                </Tooltip>
+              </div>
+              <div style={{ ...segGridStyle, padding: '0 0 2px 12px' }}>
+                {(['排序', '显示', '所在行', '颜色', '字体大小'] as const).map((label) => (
+                  <span
+                    key={label}
+                    style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}
+                  >
+                    {label}
+                  </span>
+                ))}
+              </div>
+              {clockbarStyle.order.map((id, idx) => {
+                const isTime = id === 'time';
+                const shown = clockbarStyle.show[id] ?? true;
+                const color = clockbarStyle.colors[id];
+                const size = clockbarStyle.sizes[id] ?? 1;
+                const row =
+                  id === 'lunar' ? (clockbarStyle.rows[id] ?? 2) : (clockbarStyle.rows[id] ?? 1);
+                return (
+                  <div key={id} style={segGridStyle}>
+                    <span
+                      style={{
+                        display: 'inline-flex',
+                        alignItems: 'center',
+                        gap: 4,
+                        whiteSpace: 'nowrap',
                       }}
-                    />
-                    <Tooltip title="段落所在行：时间行与时间同行，日期行与系统原生日期同行">
-                      <Select
-                        size="small"
-                        value={row === 2 ? 2 : 1}
-                        disabled={!shown}
-                        onChange={(v) => {
-                          const rows = { ...clockbarStyle.rows, [id]: v };
-                          void commitStyle({ ...clockbarStyle, rows });
-                        }}
-                        options={[
-                          { value: 1, label: '时间行' },
-                          { value: 2, label: '日期行' },
-                        ]}
-                        style={{ width: 84 }}
-                      />
-                    </Tooltip>
-                    <Tooltip title={color ? '自定义颜色（点色块选预设或拖滑条）' : '跟随主题（点击选择颜色）'}>
-                      <ColorPicker
-                        size="small"
-                        disabledAlpha
-                        value={color ?? '#808080'}
-                        presets={COLOR_PRESETS}
-                        onChangeComplete={(c) => {
-                          const colors = { ...clockbarStyle.colors, [id]: c.toHexString() };
-                          void commitStyle({ ...clockbarStyle, colors });
-                        }}
-                      />
-                    </Tooltip>
-                    {color && (
+                    >
                       <Button
                         size="small"
-                        type="link"
-                        onClick={() => {
-                          const colors = { ...clockbarStyle.colors };
-                          delete colors[id];
-                          void commitStyle({ ...clockbarStyle, colors });
+                        type="text"
+                        icon="↑"
+                        disabled={idx === 0}
+                        onClick={() => moveSeg(idx, -1)}
+                        aria-label={`${SEG_LABELS[id]}上移`}
+                      />
+                      <Button
+                        size="small"
+                        type="text"
+                        icon="↓"
+                        disabled={idx === clockbarStyle.order.length - 1}
+                        onClick={() => moveSeg(idx, 1)}
+                        aria-label={`${SEG_LABELS[id]}下移`}
+                      />
+                      {SEG_LABELS[id]}
+                    </span>
+                    {isTime ? (
+                      <div
+                        style={{
+                          gridColumn: '2 / -1',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: 8,
                         }}
                       >
-                        跟随主题
-                      </Button>
+                        <Tag style={{ marginInlineEnd: 0 }}>系统原生样式</Tag>
+                        <span
+                          style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}
+                        >
+                          时间段保持系统时钟原生外观
+                        </span>
+                      </div>
+                    ) : (
+                      <>
+                        <span style={{ width: 60, display: 'inline-flex' }}>
+                          <Switch
+                            checked={shown}
+                            checkedChildren="显示"
+                            unCheckedChildren="隐藏"
+                            onChange={(checked) => {
+                              const show = { ...clockbarStyle.show, [id]: checked };
+                              void commitStyle({ ...clockbarStyle, show });
+                            }}
+                          />
+                        </span>
+                        <Tooltip title="段落所在行：时间行与时间同行，日期行与系统原生日期同行">
+                          <Select
+                            size="small"
+                            value={row === 2 ? 2 : 1}
+                            disabled={!shown}
+                            onChange={(v) => {
+                              const rows = { ...clockbarStyle.rows, [id]: v };
+                              void commitStyle({ ...clockbarStyle, rows });
+                            }}
+                            options={[
+                              { value: 1, label: '时间行' },
+                              { value: 2, label: '日期行' },
+                            ]}
+                            style={{ width: 84 }}
+                          />
+                        </Tooltip>
+                        <span style={{ display: 'inline-flex', alignItems: 'center', gap: 8 }}>
+                          <Tooltip
+                            title={
+                              color
+                                ? '自定义颜色（选预设或拖滑条；面板底部可恢复跟随主题）'
+                                : '跟随主题（点击选色自定义）'
+                            }
+                          >
+                            <ColorPicker
+                              size="small"
+                              disabledAlpha
+                              value={color ?? '#808080'}
+                              presets={COLOR_PRESETS}
+                              open={openColorSeg === id}
+                              onOpenChange={(o) => setOpenColorSeg(o ? id : null)}
+                              panelRender={(panel) => (
+                                <div>
+                                  {panel}
+                                  <Divider style={{ margin: '4px 0' }} />
+                                  {color ? (
+                                    <Button
+                                      size="small"
+                                      block
+                                      onClick={() => {
+                                        const colors = { ...clockbarStyle.colors };
+                                        delete colors[id];
+                                        void commitStyle({ ...clockbarStyle, colors });
+                                        setOpenColorSeg(null);
+                                      }}
+                                    >
+                                      跟随主题
+                                    </Button>
+                                  ) : (
+                                    <div
+                                      style={{
+                                        textAlign: 'center',
+                                        color: 'var(--ant-color-text-tertiary, #999)',
+                                        fontSize: 12,
+                                        padding: '2px 0',
+                                      }}
+                                    >
+                                      当前跟随主题
+                                    </div>
+                                  )}
+                                </div>
+                              )}
+                              onChangeComplete={(c) => {
+                                const colors = {
+                                  ...clockbarStyle.colors,
+                                  [id]: c.toHexString(),
+                                };
+                                void commitStyle({ ...clockbarStyle, colors });
+                              }}
+                            />
+                          </Tooltip>
+                          {!color && <Tag style={{ marginInlineEnd: 0 }}>主题</Tag>}
+                        </span>
+                        <Slider
+                          min={0.5}
+                          max={2}
+                          step={0.05}
+                          value={size}
+                          disabled={!shown}
+                          onChange={(v) => {
+                            const sizes = { ...clockbarStyle.sizes, [id]: v };
+                            previewStyle({ ...clockbarStyle, sizes });
+                          }}
+                          onChangeComplete={(v) => {
+                            const sizes = { ...clockbarStyle.sizes, [id]: v };
+                            void commitStyle({ ...clockbarStyle, sizes });
+                          }}
+                          style={segSliderStyle}
+                          tooltip={{ formatter: (v) => `${v?.toFixed(2)}×` }}
+                        />
+                      </>
                     )}
-                    <Slider
-                      min={0.5}
-                      max={2}
-                      step={0.05}
-                      value={size}
-                      disabled={!shown}
-                      onChange={(v) => {
-                        const sizes = { ...clockbarStyle.sizes, [id]: v };
-                        previewStyle({ ...clockbarStyle, sizes });
-                      }}
-                      onChangeComplete={(v) => {
-                        const sizes = { ...clockbarStyle.sizes, [id]: v };
-                        void commitStyle({ ...clockbarStyle, sizes });
-                      }}
-                      style={segSliderStyle}
-                      tooltip={{ formatter: (v) => `${v?.toFixed(2)}×` }}
-                    />
-                  </>
-                )}
+                  </div>
+                );
+              })}
+              <Divider plain style={{ margin: '12px 0 4px' }}>
+                天气段增强
+              </Divider>
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>城区名</span>
+                <Tooltip title="城区名留空=自动跟随定位的城区（高德响应自带，剥「市/区/县」后缀）；填写则固定显示所填文本">
+                  <Input
+                    size="small"
+                    style={{ width: 110 }}
+                    maxLength={16}
+                    value={cityDraft}
+                    placeholder="留空=自动"
+                    onChange={(e) => setCityDraft(e.target.value)}
+                    onBlur={commitCity}
+                    onPressEnter={commitCity}
+                  />
+                </Tooltip>
+                <Tooltip title="高德行政区划码：留空=按 IP 自动定位（直辖市只到市级）；填 6 位锁定区县级（如 110114=昌平区）。改后下一分钟内生效">
+                  <Input
+                    size="small"
+                    style={{ width: 96 }}
+                    maxLength={6}
+                    value={adcodeDraft}
+                    placeholder="adcode"
+                    onChange={(e) => setAdcodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                    onBlur={commitAdcode}
+                    onPressEnter={commitAdcode}
+                  />
+                </Tooltip>
+                <span style={{ whiteSpace: 'nowrap' }}>现象文字</span>
+                <Switch
+                  size="small"
+                  checked={clockbarStyle.weatherText}
+                  checkedChildren="显示"
+                  unCheckedChildren="隐藏"
+                  onChange={(checked) =>
+                    void commitStyle({ ...clockbarStyle, weatherText: checked })
+                  }
+                />
+                <Tooltip title="风向风级（高德数据源，如「东北风3~4级」），拼在现象文字后">
+                  <span style={{ whiteSpace: 'nowrap' }}>风向风级</span>
+                </Tooltip>
+                <Switch
+                  size="small"
+                  checked={clockbarStyle.weatherWind}
+                  checkedChildren="显示"
+                  unCheckedChildren="隐藏"
+                  onChange={(checked) =>
+                    void commitStyle({ ...clockbarStyle, weatherWind: checked })
+                  }
+                />
               </div>
-            );
-          })}
-          <Divider plain style={{ margin: '12px 0 4px' }}>
-            天气段增强
-          </Divider>
-          <div style={rowStyle}>
-            <span style={{ width: 96 }}>城区名</span>
-            <Tooltip title="城区名留空=自动跟随定位的城区（高德响应自带，剥「市/区/县」后缀）；填写则固定显示所填文本">
-              <Input
-                size="small"
-                style={{ width: 110 }}
-                maxLength={16}
-                value={cityDraft}
-                placeholder="留空=自动"
-                onChange={(e) => setCityDraft(e.target.value)}
-                onBlur={commitCity}
-                onPressEnter={commitCity}
-              />
-            </Tooltip>
-            <Tooltip title="高德行政区划码：留空=按 IP 自动定位（直辖市只到市级）；填 6 位锁定区县级（如 110114=昌平区）。改后下一分钟内生效">
-              <Input
-                size="small"
-                style={{ width: 96 }}
-                maxLength={6}
-                value={adcodeDraft}
-                placeholder="adcode"
-                onChange={(e) => setAdcodeDraft(e.target.value.replace(/\D/g, '').slice(0, 6))}
-                onBlur={commitAdcode}
-                onPressEnter={commitAdcode}
-              />
-            </Tooltip>
-            <span style={{ whiteSpace: 'nowrap' }}>现象文字</span>
-            <Switch
-              size="small"
-              checked={clockbarStyle.weatherText}
-              checkedChildren="显示"
-              unCheckedChildren="隐藏"
-              onChange={(checked) => void commitStyle({ ...clockbarStyle, weatherText: checked })}
-            />
-            <Tooltip title="风向风级（高德数据源，如「东北风3~4级」），拼在现象文字后">
-              <span style={{ whiteSpace: 'nowrap' }}>风向风级</span>
-            </Tooltip>
-            <Switch
-              size="small"
-              checked={clockbarStyle.weatherWind}
-              checkedChildren="显示"
-              unCheckedChildren="隐藏"
-              onChange={(checked) => void commitStyle({ ...clockbarStyle, weatherWind: checked })}
-            />
-          </div>
-          <div style={rowStyle}>
-            <span style={{ width: 96 }}>天气图标</span>
-            <Tooltip title="Unicode emoji 拼进天气段（🌞⛅☁🌦⛈🌧🌨🌫🌪 按天气码映射）。黑白=文本字形 U+FE0E——2026-09-16 任务栏实测：仅 ☁ 等有文本字形者真黑白，其余回落彩色（Windows 字体 fallback）。">
-              <Select
-                size="small"
-                value={!clockbarStyle.weatherEmoji ? 'off' : clockbarStyle.weatherEmojiColor ? 'color' : 'mono'}
-                onChange={(v) =>
-                  void commitStyle({
-                    ...clockbarStyle,
-                    weatherEmoji: v !== 'off',
-                    weatherEmojiColor: v === 'color',
-                  })
-                }
-                options={[
-                  { value: 'color', label: '彩色' },
-                  { value: 'mono', label: '黑白' },
-                  { value: 'off', label: '关闭' },
-                ]}
-                style={{ width: 76 }}
-              />
-            </Tooltip>
-            <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
-              示例：昌平 ⛈ 26.1℃ 雷阵雨
-            </span>
-          </div>
-          <div style={{ padding: '6px 12px 0', color: '#999', fontSize: 12, lineHeight: 1.9 }}>
-            <div>顺序即任务栏时钟上的从左到右排列。</div>
-            <div>「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行。</div>
-            <div>日期行首位恒为系统原生日期（如「周一 2026-9-14」，含星期几），其余段落按上方顺序追加其后。</div>
-            <div>自定义颜色优先于主题，点「跟随主题」恢复自动配色。</div>
-          </div>
-        </div>
-        </ClockbarStyleErrorBoundary>
-        <Divider style={{ margin: '36px 0 12px' }} />
+              <div style={rowStyle}>
+                <span style={{ width: 96 }}>天气图标</span>
+                <Tooltip title="Unicode emoji 拼进天气段（🌞⛅☁🌦⛈🌧🌨🌫🌪 按天气码映射）。黑白=文本字形 U+FE0E——2026-09-16 任务栏实测：仅 ☁ 等有文本字形者真黑白，其余回落彩色（Windows 字体 fallback）。">
+                  <Select
+                    size="small"
+                    value={
+                      !clockbarStyle.weatherEmoji
+                        ? 'off'
+                        : clockbarStyle.weatherEmojiColor
+                          ? 'color'
+                          : 'mono'
+                    }
+                    onChange={(v) =>
+                      void commitStyle({
+                        ...clockbarStyle,
+                        weatherEmoji: v !== 'off',
+                        weatherEmojiColor: v === 'color',
+                      })
+                    }
+                    options={[
+                      { value: 'color', label: '彩色' },
+                      { value: 'mono', label: '黑白' },
+                      { value: 'off', label: '关闭' },
+                    ]}
+                    style={{ width: 76 }}
+                  />
+                </Tooltip>
+                <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>
+                  示例：昌平 ⛈ 26.1℃ 雷阵雨
+                </span>
+              </div>
+              <div style={{ padding: '6px 12px 0', color: '#999', fontSize: 12, lineHeight: 1.9 }}>
+                <div>顺序即任务栏时钟上的从左到右排列。</div>
+                <div>
+                  「日期行」为系统原生日期（时间+日期+星期保持系统样式），行归属可选择段落在时间行或日期行。
+                </div>
+                <div>
+                  日期行首位恒为系统原生日期（如「周一
+                  2026-9-14」，含星期几），其余段落按上方顺序追加其后。
+                </div>
+                <div>自定义颜色优先于主题，点「跟随主题」恢复自动配色。</div>
+              </div>
+            </div>
+          </ClockbarStyleErrorBoundary>
+          <Divider style={{ margin: '36px 0 12px' }} />
         </>
       )}
     </div>

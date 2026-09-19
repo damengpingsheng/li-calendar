@@ -97,7 +97,8 @@ const Settings: React.FC<SettingsPageProps> = ({ mobileCalendarOnly = false }) =
         />
       </Col>
       <Col flex="auto" style={{ padding: 16, overflowY: 'auto', height: '100%' }}>
-        {renderContent()}
+        {/* 内容区定宽 588（默认窗口的内容宽度）：任意窗口尺寸下布局静止，加宽只增右侧留白 */}
+        <div style={{ width: 588 }}>{renderContent()}</div>
       </Col>
     </Row>
   );
