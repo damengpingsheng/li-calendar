@@ -5,8 +5,10 @@
 // 端点定案（2026-09-13 D 阶段实测）：
 // - www.weather.com.cn/data/sk/{id}.html 已 301 死链——前端旧实现已静默失效；
 // - 实况：http://d1.weather.com.cn/weather_index/{id}.html?date=...
-//   （必须带 Referer: http://www.weather.com.cn/），正文 GBK/UTF-8 混杂——
-//   只取 ASCII 字段 temp / weathercode，天气名用代码表映射，规避 GBK 解码；
+//   （必须带 Referer: http://www.weather.com.cn/）。中文编码勘误（2026-09-19
+//   od 字节级实测）：正文实为 UTF-8（cityname/WD/WS/weather 全部 UTF-8 字节），
+//   D 阶段「GBK 混杂」是控制台按 GBK 误读 UTF-8 所致——v65 起直接取 dataSK
+//   的 cityname/WD/WS 中文原值（降级源补城区名+风向），不再绕道规避；
 // - IP 定位：http://wgeo.weather.com.cn/ip/?_=<ts>（须带 Referer），
 //   返回 `var ip="...";var id="101010700";var addr=...`（只取 ASCII 的 id）。
 //
@@ -25,10 +27,10 @@ pub struct WeatherNow {
     pub text: String,
     /// weathercode 整数（"d13"/"n7" 去昼夜前缀后的数值；解析失败=u32::MAX→无 emoji）
     pub code: u32,
-    /// 风向风级展示串（高德源；中国天气网源无此数据=空串）
+    /// 风向风级展示串（高德 lives[0] / 天气网 dataSK 的 WD+WS，两源皆有）
     pub wind: String,
-    /// 城区名自动跟随（高德 weatherInfo lives[0].city 剥「市/区/县」后缀；
-    /// liConfig weatherCity 非空时被手动值覆盖，中国天气网源=空）
+    /// 城区名自动跟随（高德 lives[0].city / 天气网 dataSK.cityname 剥「市/区/县」
+    /// 后缀；liConfig weatherCity 非空时被手动值覆盖）
     pub city_auto: String,
 }
 
@@ -399,7 +401,14 @@ pub fn fetch_now(cityid: &str) -> Result<WeatherNow, String> {
         u32::MAX
     };
     let text = weather_code_name(num).to_string();
-    Ok(WeatherNow { temp, text, code: num, wind: String::new(), city_auto: String::new() })
+    // v65 降级补全：dataSK 也有城区名（cityname）与风向风级（WD/WS，中文 UTF-8，
+    // 编码勘误见文件头）。降级到天气网源时城区名/风向不再消失；WS 带「级」后缀，
+    // format_wind 期望纯级数（高德 windpower 口径），先剥掉避免「2级级」。
+    let ws = json_str(&j, "WS").unwrap_or_default();
+    let ws = ws.trim_end_matches('级');
+    let wind = format_wind(&json_str(&j, "WD").unwrap_or_default(), ws);
+    let city_auto = strip_city_suffix(&json_str(&j, "cityname").unwrap_or_default());
+    Ok(WeatherNow { temp, text, code: num, wind, city_auto })
 }
 
 /// 高德天气实况（restapi.amap.com/v3/weather/weatherInfo，HTTP 直连零新依赖，
@@ -547,11 +556,67 @@ fn resolve_amap_adcode(key: &str) -> Result<String, String> {
     }
 }
 
-/// 数据源调度（T 阶段换源定案 + v62 全自动行政区划）：环境变量 GAODE_WEATHER_API
-/// （32 位高德 Web服务 key）在场 → 高德源（adcode 四层解析链见 resolve_amap_adcode）；
-/// 高德失败回退中国天气网旧链路（cityid 解析链不变）。两者都失败返回拼接错误。
+/// 高德 key 解析（v65 方案2）：① 进程环境 `GAODE_WEATHER_API`（临时覆盖优先）；
+/// ② 注册表 `HKCU\Environment` 兜底。后者是 setx 持久化用户变量的落点，但长生命
+/// 周期父进程（终端/宿主）的环境块不随注册表刷新，从其启动的子进程继承不到——
+/// 2026-09-19 实证：变量在注册表而 bash 启动的进程没有，高德分支整体跳过→天气源
+/// 静默降级、城区名消失。直读注册表与启动环境彻底解耦。
+fn amap_key() -> String {
+    if let Ok(k) = std::env::var("GAODE_WEATHER_API") {
+        let k = k.trim();
+        if !k.is_empty() {
+            return k.to_string();
+        }
+    }
+    match amap_key_registry() {
+        Some(k) => {
+            super::dbg_log("weather: amap key from registry HKCU\\Environment (proc env empty)");
+            k
+        }
+        None => {
+            super::dbg_log("weather: no amap key (proc env + registry), weathercn only");
+            String::new()
+        }
+    }
+}
+
+/// 注册表读 `HKCU\Environment\GAODE_WEATHER_API`（REG_SZ/REG_EXPAND_SZ 兼容，
+/// setx 落 REG_SZ）。读失败/值为空一律 None（调用方记日志后走天气网源）。
+fn amap_key_registry() -> Option<String> {
+    use windows::core::w;
+    use windows::Win32::Foundation::WIN32_ERROR;
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_CURRENT_USER, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+    };
+    let flags = RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ;
+    let mut buf = [0u16; 64]; // 32 位 hex key + NUL 上限 33，64 富余
+    let mut size = (buf.len() * 2) as u32;
+    let res = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            w!("Environment"),
+            w!("GAODE_WEATHER_API"),
+            flags,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if res != WIN32_ERROR(0) {
+        return None;
+    }
+    let len = (size as usize / 2).min(buf.len());
+    let s = String::from_utf16_lossy(&buf[..len]);
+    let s = s.trim_end_matches('\0').trim().to_string();
+    if s.is_empty() { None } else { Some(s) }
+}
+
+/// 数据源调度（T 阶段换源定案 + v62 全自动行政区划 + v65 key 注册表兜底）：
+/// key 解析链 amap_key()（进程 env → 注册表 HKCU\Environment）非空 → 高德源
+/// （adcode 四层解析链见 resolve_amap_adcode）；高德失败回退中国天气网旧链路
+/// （cityid 解析链不变；v65 起降级源自带城区名/风向）。两者都失败返回拼接错误。
 pub fn fetch_now_any() -> Result<WeatherNow, String> {
-    let key = std::env::var("GAODE_WEATHER_API").unwrap_or_default();
+    let key = amap_key();
     if !key.is_empty() {
         match resolve_amap_adcode(&key).and_then(|ad| fetch_now_amap(&key, &ad)) {
             Ok(w) => return Ok(w),
@@ -609,6 +674,58 @@ pub fn resolve_cityid() -> String {
         Err(e) => {
             super::dbg_log(&format!("weather: locate_cityid failed: {e}"));
             String::new()
+        }
+    }
+}
+
+/// v65 天气源降级链测试：天气网 dataSK 城区名/风向提取（编码勘误后纯 UTF-8，
+/// 无需转码）+ 高德 key 解析链的注册表兜底。
+#[cfg(test)]
+mod weather_v65_tests {
+    use super::*;
+
+    /// dataSK 真实报文样例（2026-09-19 od 字节级实测 101010700 昌平，
+    /// 202609191550 时次；中文均为 UTF-8 原字节）。
+    const DATASK: &str = concat!(
+        r#"{"nameen":"changping","cityname":"昌平","city":"101010700","temp":"27.4","tempf":"81.3","#,
+        r#""WD":"东南","wde":"SE","WS":"2级","wse":"10km\/h","SD":"55%","sd":"55%","qy":"1008","#,
+        r#""njd":"17km","time":"15:50","rain":"0","rain24h":"0","aqi":"53","aqi_pm25":"53","#,
+        r#""weather":"多云","weathere":"Cloudy","weathercode":"d01"}"#
+    );
+
+    /// 降级源补城区名：cityname 取中文（非 cityDZ 段的拼音 nameen）并剥后缀。
+    #[test]
+    fn weathercn_cityname() {
+        let j = extract_djson(&format!("var dataSK ={DATASK};"), "dataSK").unwrap();
+        assert_eq!(strip_city_suffix(&json_str(&j, "cityname").unwrap()), "昌平");
+        // 区/县后缀同样剥一层（海淀区→海淀）；缺字段/空值→空（城区名缺省不显示）
+        let j2 = r#"{"cityname":"海淀区","temp":"20"}"#;
+        assert_eq!(strip_city_suffix(&json_str(j2, "cityname").unwrap()), "海淀");
+        assert!(json_str(r#"{"temp":"20"}"#, "cityname").is_none());
+    }
+
+    /// 降级源补风向：WD+WS 经 format_wind 归一，WS 的「级」后缀剥掉防重复。
+    #[test]
+    fn weathercn_wind() {
+        let j = extract_djson(&format!("var dataSK ={DATASK};"), "dataSK").unwrap();
+        let ws = json_str(&j, "WS").unwrap();
+        assert_eq!(ws.trim_end_matches('级'), "2");
+        assert_eq!(format_wind(&json_str(&j, "WD").unwrap(), ws.trim_end_matches('级')), "东南风2级");
+        // 无 WD/WS → 空串（不拼风段，与高德口径一致）
+        assert_eq!(format_wind("", ""), "");
+        assert_eq!(format_wind("东南", ""), "");
+    }
+
+    /// 注册表兜底：本机 HKCU\Environment\GAODE_WEATHER_API 已由 setx 写入
+    /// （32 位 hex）——直接对真实注册表断言非空（无则跳过，CI 无此变量）。
+    #[test]
+    fn amap_key_registry_fallback() {
+        match amap_key_registry() {
+            Some(k) => {
+                assert_eq!(k.len(), 32);
+                assert!(k.bytes().all(|b| b.is_ascii_hexdigit()));
+            }
+            None => {} // 未配置 key 的机器上合法
         }
     }
 }
