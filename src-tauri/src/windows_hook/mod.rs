@@ -21,6 +21,8 @@ pub use clock_window::{
     find_clock_window, get_taskbar_info, is_mouse_in_clock_area, refresh_clock_rect_if_in_taskbar,
 };
 pub(crate) use clock_window::refresh_clock_area_cache;
+/// 一次性原生 UIA 探针（诊断入口用；见 `clock_window::diag_uia_probe`）。
+pub(crate) use clock_window::diag_uia_probe;
 /// 任务栏组件开关、钩子消息泵线程、钩子管理器、退出时显式卸钩。
 pub use mouse_hook::{
     set_taskbar_widget_enabled, start_hook_message_thread, uninstall_global_mouse_hook,

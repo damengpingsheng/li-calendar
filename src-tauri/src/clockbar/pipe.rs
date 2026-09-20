@@ -6,7 +6,7 @@ use super::session;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
-pub const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b65"; // 与 tap v65 版本化一致
+pub const PIPE_NAME: &str = r"\\.\pipe\lical-clockbar-b67"; // 与 tap v67 版本化一致
 
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;

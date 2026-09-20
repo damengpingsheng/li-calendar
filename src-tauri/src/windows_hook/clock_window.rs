@@ -441,3 +441,98 @@ unsafe extern "system" fn enum_child_windows_proc(hwnd: HWND, lparam: LPARAM) ->
     }
     TRUE
 }
+/// 一次性原生 UIA 探针（诊断入口 `D:\agents_tmp\clockbar-c0.txt` 内容 `uia` 触发）：
+/// dump 时钟按钮（ClockButton 自动 ID/类名候选）、全部 OmniButton、按名查找
+/// 显示桌面按钮以及 TrayNotifyWnd 的屏幕矩形。XAML 岛内容只有原生 COM UIA
+/// 可见（托管 UIA 与纯 Win32 枚举均摸不到，2026-09-20 实测），故复用本文件的
+/// `IUIAutomation` 路径；矩形同时记录原始值与经 `validate_or_scale_clock_rect`
+/// 的校准值，供留白分析与命中区域核对。
+pub fn diag_uia_probe() {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let dump_rect = |tag: &str, rect: RECT| {
+            let validated = validate_or_scale_clock_rect(rect);
+            let v = match validated {
+                Some(r) => format!("({},{},{},{})", r.left, r.top, r.right, r.bottom),
+                None => "<invalid>".to_string(),
+            };
+            crate::dbg_log(&format!(
+                "uiaprobe: {tag} rect=({},{},{},{}) validated={v}",
+                rect.left, rect.top, rect.right, rect.bottom
+            ));
+        };
+        if let Ok(hwnd_tray) = FindWindowW(w!("Shell_TrayWnd"), None) {
+            let mut tray_rect = RECT::default();
+            if GetWindowRect(hwnd_tray, &mut tray_rect).is_ok() {
+                dump_rect("Shell_TrayWnd", tray_rect);
+            }
+            if let Ok(hwnd_notify) =
+                FindWindowExW(Some(hwnd_tray), None, w!("TrayNotifyWnd"), None)
+            {
+                let mut notify_rect = RECT::default();
+                if GetWindowRect(hwnd_notify, &mut notify_rect).is_ok() {
+                    dump_rect("TrayNotifyWnd", notify_rect);
+                }
+            }
+        }
+        let automation: IUIAutomation = match CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER) {
+            Ok(a) => a,
+            Err(e) => {
+                crate::dbg_log(&format!("uiaprobe: CoCreateInstance failed: {e}"));
+                return;
+            }
+        };
+        let Ok(hwnd_tray) = FindWindowW(w!("Shell_TrayWnd"), None) else {
+            crate::dbg_log("uiaprobe: Shell_TrayWnd not found");
+            return;
+        };
+        let tray_element = match automation.ElementFromHandle(hwnd_tray) {
+            Ok(e) => e,
+            Err(e) => {
+                crate::dbg_log(&format!("uiaprobe: ElementFromHandle failed: {e}"));
+                return;
+            }
+        };
+        // ① 时钟按钮：AutomationId「ClockButton」优先，类名候选兜底（同 get_clock_rect_via_uia）
+        let autoid_ok = automation
+            .CreatePropertyCondition(UIA_AutomationIdPropertyId, &VARIANT::from("ClockButton"))
+            .ok()
+            .and_then(|c| tray_element.FindFirst(TreeScope_Descendants, &c).ok())
+            .inspect(|el| {
+                if let Ok(r) = el.CurrentBoundingRectangle() {
+                    let name = el.CurrentName().map(|n| n.to_string()).unwrap_or_default();
+                    crate::dbg_log(&format!("uiaprobe: ClockButton autoid hit name='{name}'"));
+                    dump_rect("ClockButton", r);
+                }
+            })
+            .is_some();
+        if !autoid_ok {
+            crate::dbg_log("uiaprobe: ClockButton autoid miss");
+        }
+        // ② 全量 OmniButton（显示桌面/时钟/通知在该宿主类下）+ ③ 按名找显示桌面
+        if let Ok(true_cond) = automation.CreateTrueCondition() {
+            if let Ok(all) = tray_element.FindAll(TreeScope_Descendants, &true_cond) {
+                let mut n = all.Length().unwrap_or(0);
+                if n > 400 {
+                    n = 400; // 单次诊断上限，防树异常膨胀
+                }
+                for i in 0..n {
+                    let Ok(el) = all.GetElement(i) else { continue };
+                    let cls = el.CurrentClassName().map(|c| c.to_string()).unwrap_or_default();
+                    let name = el.CurrentName().map(|x| x.to_string()).unwrap_or_default();
+                    let aid = el.CurrentAutomationId().map(|x| x.to_string()).unwrap_or_default();
+                    if !cls.contains("OmniButton") && !name.contains("显示桌面") {
+                        continue;
+                    }
+                    crate::dbg_log(&format!(
+                        "uiaprobe: HIT cls='{cls}' id='{aid}' name='{name}'"
+                    ));
+                    if let Ok(r) = el.CurrentBoundingRectangle() {
+                        dump_rect("omni/desktop", r);
+                    }
+                }
+                crate::dbg_log(&format!("uiaprobe: scanned {n} elements"));
+            }
+        }
+    }
+}

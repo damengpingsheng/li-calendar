@@ -50,6 +50,7 @@ fn watch_loop() {
             super::dbg_log("watch: stop flag — exiting");
             return;
         }
+        c0_diag_check(session_active);
         // tap 事件全量落日志（快照后锁外打印，不消费全局游标，与 wait_for 判定互不干扰）
         {
             let q = session::msg_queue();
@@ -177,8 +178,35 @@ fn watch_loop() {
     }
 }
 
-fn sleep_interruptible(ms: u64) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
+/// 诊断入口（留白分析基线用，2026-09-20）：`D:\agents_tmp\clockbar-c0.txt` 出现即
+/// 执行一次只读诊断并删除文件。内容 `c0tree`/`c0meas` 经管道透传给 tap（输出落在
+/// `clockbar_tap_b65.log`）；`uia` 走 host 侧原生 UIA 探针（输出 menu_dbg.log）。
+/// 生产管道只收 explorer 客户端、host 无外部透传入口，文件触发是唯一无侵入通道。
+fn c0_diag_check(session_active: bool) {
+    const C0_PATH: &str = r"D:\agents_tmp\clockbar-c0.txt";
+    let Ok(content) = std::fs::read_to_string(C0_PATH) else {
+        return;
+    };
+    if std::fs::remove_file(C0_PATH).is_err() {
+        super::dbg_log("c0diag: trigger file delete failed — skip acting (anti-loop)");
+        return;
+    }
+    let cmd = content.trim();
+    super::dbg_log(&format!("c0diag: trigger '{cmd}' (session_active={session_active})"));
+    match cmd {
+        "c0tree" | "c0meas" => {
+            if session_active && super::pipe::pipe_write(cmd.as_bytes()) {
+                super::dbg_log("c0diag: sent to tap (output → clockbar_tap_b65.log)");
+            } else {
+                super::dbg_log("c0diag: not sent (session inactive or pipe write failed)");
+            }
+        }
+        "uia" => crate::windows_hook::diag_uia_probe(),
+        other => super::dbg_log(&format!("c0diag: unknown command '{other}' (want c0tree/c0meas/uia)")),
+    }
+}
+
+fn sleep_interruptible(ms: u64) {    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(ms);
     while std::time::Instant::now() < deadline {
         if super::STOP.load(Ordering::Relaxed) {
             return;

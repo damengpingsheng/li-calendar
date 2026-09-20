@@ -910,6 +910,11 @@ static void DumpTextBlockStyle(wux::Controls::TextBlock const& tb, const char* w
 }
 
 // mode: 3=c0tree 4=c0ins 5=c0meas 6=c0rm 7=c0add（引擎结构通道对照）
+// v66：自建横板引用定义前置至此（c0meas 段级 dump 在本函数内引用；原定义在 UI 状态区）。
+static wfnd::IInspectable g_hpanelRef{ nullptr };   // 自建横板（时间行：行1 段+time 段）
+static wfnd::IInspectable g_hpanel2Ref{ nullptr };  // 第二行横板（date 段+行2 段）
+static wfnd::IInspectable g_seg[6]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
+static const char* SEGNAME[6] = { "weather", "festival", "term", "lunar", "time", "date" };
 static int RunC0Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
     wuc::CoreDispatcher disp{ nullptr };
     AcquireSRWLockShared(&g_stateLock); disp = g_disp; ReleaseSRWLockShared(&g_stateLock);
@@ -1032,6 +1037,33 @@ static int RunC0Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
                                 auto ds = f2.DesiredSize();
                                 log_line("C0MEAS stack child[%u] cls=%s name=%s act=%.1f desired=%.1f",
                                          i, clsA, nmA, f2.ActualWidth(), ds.Width);
+                            }
+                        }
+                        // v66：段级 dump——右缘留白定位（段 act/desired/margin/vis + 横板宽度）
+                        try {
+                            auto m = sp.Margin();
+                            log_line("C0MEAS sp margin=[%.1f %.1f %.1f %.1f]", m.Left, m.Top, m.Right, m.Bottom);
+                        } catch (...) {}
+                        for (int i = 0; i < 6; i++) {
+                            if (!g_seg[i]) continue;
+                            if (auto f = g_seg[i].try_as<wux::FrameworkElement>()) {
+                                try {
+                                    auto mg = f.Margin();
+                                    auto u = f.try_as<wux::UIElement>();
+                                    log_line("C0MEAS seg %s act=%.1f desired=%.1f margin=[%.1f %.1f %.1f %.1f] vis=%d",
+                                             SEGNAME[i], f.ActualWidth(), f.DesiredSize().Width,
+                                             mg.Left, mg.Top, mg.Right, mg.Bottom,
+                                             u ? (int)u.Visibility() : -1);
+                                } catch (...) {}
+                            }
+                        }
+                        for (int row = 1; row <= 2; row++) {
+                            auto pref = row == 1 ? g_hpanelRef : g_hpanel2Ref;
+                            if (auto p = pref ? pref.try_as<wux::Controls::StackPanel>() : nullptr) {
+                                double wd = 0;
+                                try { wd = p.Width(); } catch (...) {}
+                                log_line("C0MEAS hpanel%d act=%.1f width=%.1f halign=%d",
+                                         row, p.ActualWidth(), wd, (int)p.HorizontalAlignment());
                             }
                         }
                     }
@@ -1174,9 +1206,7 @@ struct PanelStyle {
 static PanelStyle         g_style;
 static wchar_t            g_segText[6][64];        // 天气 节日 节气 农历 时间 日期（host 下发缓存）
 static unsigned           g_panelGen = 0;          // 建立时代次令牌
-static wfnd::IInspectable g_seg[6]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
-static wfnd::IInspectable g_hpanelRef{ nullptr };   // 自建横板（时间行：行1 段+time 段）
-static wfnd::IInspectable g_hpanel2Ref{ nullptr };  // 第二行横板（date 段+行2 段）
+// （v66：g_seg/SEGNAME/g_hpanelRef/g_hpanel2Ref 定义已前置至 RunC0Job 之前——c0meas 段级 dump 需要）
 static wfnd::IInspectable g_timeRef{ nullptr };     // 原生 Time（v64：原位隐藏；样式模板+VM 持续写其 Text）
 static wfnd::IInspectable g_dateRef = nullptr;      // 原生 Date（v64：原位隐藏；日期行字号基准只读）
 static double g_dateFontSize = 0;                   // v56 原生 Date 字号（只读；0=未知→回退 Time 字号）
@@ -1192,6 +1222,12 @@ static int64_t g_timeVisTok = 0, g_dateVisTok = 0;
 static bool g_timeVisCb = false, g_dateVisCb = false;
 static int  g_visGuard = 0;
 static wfnd::IInspectable g_spRef{ nullptr }, g_contRef{ nullptr };
+// v66 右缘收紧（B）：原生 sp Margin 快照。模板值 [0,-2,-1,0]；接管期改为 right=-5
+// （约 4 DIP 外延，内容仍按钮盒内 → 命中区域不变）。WinUI 无法区分模板值是样式还是
+// 本地值（无 ValueSource 公开口径），恢复=回写快照值（渲染等价且幂等；主题翻转走
+// gen++ 新元素，PanelOrphan 重置快照标志后由新 build 重取）。
+static wux::Thickness g_snapSpMargin{ 0, 0, 0, 0 };
+static bool g_spMarginSnapped = false;
 static double             g_segDesired[6] = { 0,0,0,0,0,0 };
 static bool               g_segHidden[6] = { false,false,false,false,false,false };
 static winrt::event_token g_szToken{}, g_themeToken{};
@@ -1270,7 +1306,7 @@ static volatile LONG      g_lastResyncTick = 0;    // 上次僵尸重同步时�
 static volatile LONG      g_lastSizeTick = 0;      // 横板最近一次尺寸变化时刻（v44 稳定门）
 // 隐藏优先级：v51 起按当前显示顺序（reflow 自左向右先藏/自右向左先恢复）；
 // v64：time(4)/date(5) 段与原生 Time 一样永不丢（隐藏候选=数据段 0..3）
-static const char* SEGNAME[6] = { "weather", "festival", "term", "lunar", "time", "date" };
+// （v66：SEGNAME 定义已前置至 RunC0Job 之前——c0meas 段级 dump 需要）
 static void AutoRestoreOnDisconnect(); // 定义于后（B0 恢复序列）
 static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::StackPanel const& hp2); // 定义于后（v41 tick 兜底调用；v55 双行）
 
@@ -1371,6 +1407,7 @@ static void PanelOrphan() {
     for (int i = 0; i < 6; i++) { g_segHidden[i] = false; }
     g_eventsOn = false;
     g_timeVisCb = false; g_dateVisCb = false; // v64a 旧代元素消亡，重放后由 PanelBuild 重注册
+    g_spMarginSnapped = false; // v66：新树新 sp，margin 快照由新 build 重取（旧元素随树消亡）
     InterlockedExchange(&g_panelOn, 0);
 }
 
@@ -1596,6 +1633,43 @@ static void SendTapEvent(const char* button, double x, double y) {
 
 // 维护定时器 Tick（UI 线程）：v34 结构校验（自建面板在场/Time 在自建面板内/Date 隐藏/
 // border 在场）+ 僵尸检测（原生 sp 脱离视觉树 ⇒ 引擎全盲的静默重建）。
+// v66 右缘收紧（A）：横板 Width 真值同步。基线实测（docs/taskbar-clock-right-spacing-plan.md
+// §9.2）：DesiredSize 求和口径与渲染几何偏差可达 21 DIP（行2 面板 Width=256.6 而末字形
+// 仅 235.4 DIP），且 v48 Width 硬钳制下文本变窄不触发 SizeChanged→reflow，宽度停在历史
+// 峰值。此处读布局真值——末可见子项在面板内的渲染右缘（TransformToVisual 偏移 +
+// ActualWidth，左 margin 已含在偏移中；右 margin 恒 0）——差超 1 DIP 才回写，防每秒
+// 布局抖动。在 PanelReflow 之后调用：reflow 仍按 DesiredSize 口径管理可见性预算，
+// 最终宽度以真值为准（同 tick 至多两次写，子树极小）。
+static void TruthWidthSync() {
+    auto sync = [](wux::Controls::StackPanel const& panel, const char* which) {
+        try {
+            double lastRight = 0;
+            bool any = false;
+            auto ch = panel.Children();
+            for (uint32_t i = 0; i < ch.Size(); i++) {
+                auto f = ch.GetAt(i).try_as<wux::FrameworkElement>();
+                if (!f) continue;
+                if (f.Visibility() != wux::Visibility::Visible) continue;
+                double w = f.ActualWidth();
+                if (w <= 0) return; // 度量未就绪，本轮放弃
+                auto off = f.TransformToVisual(panel.as<wux::UIElement>())
+                               .TransformPoint(wfnd::Point{ 0, 0 });
+                lastRight = off.X + w;
+                any = true;
+            }
+            if (!any) return;
+            double cur = panel.Width();
+            double d = cur - lastRight;
+            if (d < 0) d = -d;
+            if (d <= 1.0) return; // NaN 比较为 false → 未设 Width 时必写
+            panel.Width(lastRight);
+            log_line("PANEL truth-width %s: %.1f -> %.1f", which, cur, lastRight);
+        } catch (...) {}
+    };
+    if (auto hp = g_hpanelRef.try_as<wux::Controls::StackPanel>()) sync(hp, "row1");
+    if (auto hp2 = g_hpanel2Ref.try_as<wux::Controls::StackPanel>()) sync(hp2, "row2");
+}
+
 static void PanelTick() {
     try {
         if (g_unloading) return; // v49：卸载序列开始后 tick 静默
@@ -1727,6 +1801,7 @@ static void PanelTick() {
             auto hp2R = g_hpanel2Ref ? g_hpanel2Ref.try_as<wux::Controls::StackPanel>() : nullptr;
             if (hpR) PanelReflow(hpR, hp2R);
         }
+        TruthWidthSync(); // v66（A）：最终宽度以渲染真值为准（须在 reflow 之后）
     } catch (const winrt::hresult_error& e) {
         log_line("PANEL tick hresult hr=0x%08lx — lie flat", (unsigned long)e.code().value);
     } catch (...) {
@@ -1749,10 +1824,11 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
         int seq[6];
         int n = 0;
         for (int k = 0; k < 6; k++) seq[n++] = g_style.order[k];
-        // 行内期望宽求和（gap 计入，v51 纪律修订）；row=1|2；返回行预算下限（含 time/date 让位）
+        // 行内期望宽求和（v66 修订：段 DesiredSize 已含自身 Margin——LayoutHpanelChildren
+        // 把段间距写在非首位段 left margin 上，再显式加 gap 即**双计**；基线实测行1 虚增
+        // ≈1×gap、行2 ≈2×gap，即右缘多余留白主项）。只求和 DesiredSize，间距由 margin 携带。
         auto rowSum = [&](int row, bool* measuredOut) -> double {
             double sum = 0;
-            bool anyVisible = false;
             for (int i = 0; i < n; i++) {
                 int id = seq[i];
                 if (g_style.rows[id] != row) continue;
@@ -1760,10 +1836,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
                 if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                     double d = f.DesiredSize().Width;
                     if (d <= 0) { *measuredOut = false; break; }
-                    // 可见段之间的 gap 计入需求宽（gap 是 host 下发的确定常数）
-                    if (anyVisible) sum += (row == 1 ? g_style.gap : g_style.gap2);
                     sum += d;
-                    anyVisible = true;
                 }
             }
             return sum;
@@ -1809,9 +1882,9 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             }
         }
         // v64 日期行：date 段=普通行2 成员（期望宽经 g_seg[5] 计入），数据段参与隐藏
+        // （v66：只求和 DesiredSize，间距由段 left margin 携带——双计修订同行1）
         if (!hp2) return;
         double sum2 = 0;
-        bool any2 = false;
         for (int i = 0; i < n; i++) {
             int id = seq[i];
             if (g_style.rows[id] != 2) continue;
@@ -1819,9 +1892,7 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             if (auto f = g_seg[id].try_as<wux::FrameworkElement>()) {
                 double d = f.DesiredSize().Width;
                 if (d <= 0) return; // 未就绪，跳过本轮日期行评估
-                if (any2) sum2 += g_style.gap2;
                 sum2 += d;
-                any2 = true;
             }
         }
         double budget2 = g_style.capw;
@@ -1951,6 +2022,27 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
     if (dateIns) g_dateRef = dateIns;
     g_spRef = sp; g_timeRef = tb;
     g_contRef = getObj(hCont);
+
+    // v66 右缘收紧（B）：原生 sp 右 margin −1 → −5。基线（docs §9.2）：sp 右缘距按钮
+    // 右 7 DIP（两层 ContainerGrid 各 4 内缩 − 模板 −1 溢出），−5 后距细条 ≈3 DIP
+    // 正中目标。幂等：快照仅首接管取一次；right 已 ≤−4.5 不再写（防重复触发布局）。
+    // 恢复路径=PanelFree(restoreNative=true)（c1free/AUTO/退出全走此函数）。
+    {
+        try {
+            auto mg = sp.Margin();
+            if (!g_spMarginSnapped) {
+                g_snapSpMargin = mg;
+                g_spMarginSnapped = true;
+                log_line("PANEL build: sp margin snap [%.1f %.1f %.1f %.1f]",
+                         mg.Left, mg.Top, mg.Right, mg.Bottom);
+            }
+            if (mg.Right > -4.5) {
+                mg.Right = -5.0;
+                sp.Margin(mg);
+                log_line("PANEL build: sp margin right -> -5 (right-edge tighten)");
+            }
+        } catch (...) { log_line("PANEL build: sp margin apply exception"); }
+    }
 
     // 自建横板（新建或复用）
     wux::Controls::StackPanel hp{ nullptr };
@@ -2247,6 +2339,21 @@ static void PanelFree(bool restoreNative) {
         }
         if (auto u = g_dateRef.try_as<wux::UIElement>()) {
             try { u.Visibility(g_snapDateVis); } catch (...) {}
+        }
+        // v66（B）原生 sp 右 margin 回写快照值（模板值），交还系统布局。幂等：值相同
+        // 不写；快照标志复位后下次 build 重新快照。PanelFree(false)（仍在接管）不动
+        // margin 也不复位标志——保留原模板快照，重建后不致误存 -5。
+        if (g_spMarginSnapped) {
+            if (auto spp = g_spRef ? g_spRef.try_as<wux::Controls::StackPanel>() : nullptr) {
+                try {
+                    auto mg = spp.Margin();
+                    if (mg.Right != g_snapSpMargin.Right) {
+                        spp.Margin(g_snapSpMargin);
+                        log_line("PANEL free: sp margin restored -> %.1f", g_snapSpMargin.Right);
+                    }
+                } catch (...) {}
+            }
+            g_spMarginSnapped = false;
         }
     }
     // 摘两块自建横板（段全在其中；不触碰原生 Time/Date 位置）
