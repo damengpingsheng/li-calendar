@@ -71,6 +71,7 @@ const DEFAULT_CLOCKBAR_STYLE: ClockbarStyle = {
   weatherCity: '',
   weatherAdcode: '',
   weatherEmoji: true,
+  weatherEmojiScale: 1,
   weatherEmojiColor: true,
   weatherText: true,
   weatherWind: true,
@@ -159,6 +160,10 @@ function normalizeStyle(raw: unknown): ClockbarStyle {
         ? r.weatherAdcode.replace(/\D/g, '').slice(0, 6)
         : d.weatherAdcode,
     weatherEmoji: r.weatherEmoji !== false,
+    weatherEmojiScale:
+      typeof r.weatherEmojiScale === 'number'
+        ? Math.min(2, Math.max(0.5, r.weatherEmojiScale))
+        : 1,
     weatherEmojiColor: r.weatherEmojiColor !== false,
     weatherText: r.weatherText !== false,
     weatherWind: r.weatherWind !== false,
@@ -666,6 +671,21 @@ const WidgetShowForm: React.FC = () => {
                       { value: 'off', label: '关闭' },
                     ]}
                     style={{ width: 76 }}
+                  />
+                </Tooltip>
+                <Tooltip title="图标字号倍率（1.00×=与天气段文字同大小，最大 2.00×；只放大图标不动文字）">
+                  <Slider
+                    min={0.5}
+                    max={2}
+                    step={0.05}
+                    value={clockbarStyle.weatherEmojiScale ?? 1}
+                    disabled={!clockbarStyle.weatherEmoji}
+                    onChange={(v) => previewStyle({ ...clockbarStyle, weatherEmojiScale: v })}
+                    onChangeComplete={(v) =>
+                      void commitStyle({ ...clockbarStyle, weatherEmojiScale: v })
+                    }
+                    style={{ width: 110 }}
+                    tooltip={{ formatter: (v) => `${v?.toFixed(2)}×` }}
                   />
                 </Tooltip>
                 <span style={{ color: 'var(--ant-color-text-tertiary, #999)', fontSize: 12 }}>

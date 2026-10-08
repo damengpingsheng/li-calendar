@@ -178,16 +178,19 @@ fn format_wind(dir: &str, power: &str) -> String {
     }
 }
 
-/// 任务栏天气段展示文案（T 阶段）：`[城区名 ][emoji ]温度℃[ 现象]`。
-/// 从未成功获取（w=None）恒为占位符 "--"（降级态保持最小，不拼图标/城区名）。
+/// 任务栏天气段展示拆分（v68）：`(整串, emoji Run 文本)`。整串恒为旧 format_now
+/// 口径 `[城区名 ][emoji ]温度℃[ 现象][ 风向]`（比较/日志/兼容用）；emoji Run=
+/// 图标基字符+变体符（不含尾随空格；空=无图标/图标关/降级态）——host 经 c1set
+/// `wxemo` 下发，tap 据此把天气文案拆 [前段][emoji][后段] 三段 Inlines 实现图标
+/// 单独放大（esize_weather）。
 /// 每次天气刷新后由数据线程按当前配置重算——配置变更随下一 tick 上屏（≤1s）。
-pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
+pub fn format_now_parts(w: Option<&WeatherNow>, o: &DisplayOpts) -> (String, String) {
     let Some(w) = w else {
-        return "--".to_string();
+        return ("--".to_string(), String::new());
     };
     let t = w.temp.trim();
     if t.is_empty() {
-        return "--".to_string();
+        return ("--".to_string(), String::new());
     }
     let mut s = String::new();
     let city = if o.city.is_empty() { w.city_auto.trim() } else { o.city.trim() };
@@ -195,11 +198,13 @@ pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
         s.push_str(city);
         s.push(' ');
     }
+    let mut emo = String::new();
     if o.emoji {
         let e = weather_code_emoji(w.code);
         if !e.is_empty() {
-            s.push_str(e);
-            s.push(if o.emoji_color { '\u{FE0F}' } else { '\u{FE0E}' });
+            emo.push_str(e);
+            emo.push(if o.emoji_color { '\u{FE0F}' } else { '\u{FE0E}' });
+            s.push_str(&emo);
             s.push(' ');
         }
     }
@@ -219,7 +224,13 @@ pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
             s.push_str(wind);
         }
     }
-    sanitize_seg(&s, 60)
+    (sanitize_seg(&s, 60), sanitize_seg(&emo, 8))
+}
+
+/// 任务栏天气段展示文案（T 阶段）：`[城区名 ][emoji ]温度℃[ 现象]`。
+/// 从未成功获取（w=None）恒为占位符 "--"（降级态保持最小，不拼图标/城区名）。
+pub fn format_now(w: Option<&WeatherNow>, o: &DisplayOpts) -> String {
+    format_now_parts(w, o).0
 }
 
 /// 天气代码表（weather.com.cn 通用码表；d1 接口 weathercode 形如 d00/n13，
@@ -675,6 +686,59 @@ pub fn resolve_cityid() -> String {
             super::dbg_log(&format!("weather: locate_cityid failed: {e}"));
             String::new()
         }
+    }
+}
+
+/// v68 天气段拆分：emoji Run 文本与整串的关系（重组恒等/开关/降级态）。
+#[cfg(test)]
+mod weather_v68_tests {
+    use super::*;
+
+    fn opts() -> DisplayOpts {
+        DisplayOpts { city: "昌平".into(), ..DisplayOpts::default() }
+    }
+
+    /// 有图标：emoji Run=基字符+FE0F；前段(城区名+空格)+Run+空格+后段=整串。
+    #[test]
+    fn parts_with_emoji() {
+        let w = WeatherNow {
+            temp: "26.1".into(),
+            text: "雷阵雨".into(),
+            code: 4,
+            wind: String::new(),
+            city_auto: String::new(),
+        };
+        let (full, emo) = format_now_parts(Some(&w), &opts());
+        assert_eq!(emo, "\u{26C8}\u{FE0F}");
+        // 整串=城区名+"⛈️ "+"26.1℃ 雷阵雨"——emoji Run 恰在整串中出现一次
+        assert!(full.starts_with("昌平 "));
+        assert!(full.matches(emo.as_str()).count() == 1);
+        let (pre, rest) = full.split_once(&emo).unwrap();
+        assert_eq!(format!("{pre}{emo} {}", &rest[1..]), full); // rest 以空格开头
+    }
+
+    /// 图标关/黑白变体/无数据：emoji Run 为空串（tap 回退整体 Text）。
+    #[test]
+    fn parts_without_emoji() {
+        let w = WeatherNow {
+            temp: "26.1".into(),
+            text: "晴".into(),
+            code: 0,
+            wind: String::new(),
+            city_auto: String::new(),
+        };
+        let off = DisplayOpts { emoji: false, ..opts() };
+        let (full, emo) = format_now_parts(Some(&w), &off);
+        assert!(emo.is_empty());
+        assert_eq!(full, "昌平 26.1℃ 晴");
+
+        let mono = DisplayOpts { emoji_color: false, ..opts() };
+        let (_, emo2) = format_now_parts(Some(&w), &mono);
+        assert_eq!(emo2, "\u{1F31E}\u{FE0E}");
+
+        let (none, emo3) = format_now_parts(None, &opts());
+        assert_eq!(none, "--");
+        assert!(emo3.is_empty());
     }
 }
 

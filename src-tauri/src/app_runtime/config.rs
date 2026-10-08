@@ -66,6 +66,10 @@ pub struct ClockbarStyleConfig {
     /// 天气段 emoji 图标开关（T 阶段：缺省开）。
     #[serde(default)]
     pub weather_emoji: Option<bool>,
+    /// 天气段 emoji 图标字号倍率（v68：0.5~2.0 作用于天气段字号之上，单独放大
+    /// 图标不动文字；缺省 1.0=与文字同大小。tap 经 Inlines 双字号混排实现）。
+    #[serde(default)]
+    pub weather_emoji_scale: Option<f64>,
     /// emoji 变体（缺省 true=彩色 U+FE0F；false=黑白 U+FE0E——2026-09-16 实测仅
     /// ☁ 等有文本字形者真黑白，无文本字形回落彩色，任务栏渲染零方框）。
     #[serde(default)]

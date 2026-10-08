@@ -7,10 +7,14 @@
 use tyme4rs::tyme::solar::SolarDay;
 use tyme4rs::tyme::{Culture, Tyme}; // Culture=各类 get_name()；Tyme=LunarDay::next()（探针同款导入）
 
-/// 单日四段数据（weather 由 weather.rs 注入；空段发单空格——tap 侧限界 JSON
-/// 解析拒绝空串值，且 reflow 对 DesiredSize=0 的段跳过评估，故不能发空串）。
+/// 单日四段数据（weather/weather_emoji 由 weather.rs 注入；空段发单空格——tap
+/// 侧限界 JSON 解析拒绝空串值，且 reflow 对 DesiredSize=0 的段跳过评估，故不能
+/// 发空串。wxemo 例外：恒发空串=显式清除，tap 侧用允许空值的解析口径）。
 pub struct DayData {
     pub weather: String,
+    /// v68 天气段 emoji Run 文本（图标基字符+变体符；空=无图标——host 恒发，
+    /// tap 据此拆 [前段][emoji][后段] Inlines 实现图标单独放大）
+    pub weather_emoji: String,
     pub festival: String,
     pub term: String,
     pub lunar: String,
@@ -32,8 +36,9 @@ impl DayData {
     /// 时间/日期=会话引导/重建即时有值（走时线程 c1t 补差）。
     pub fn c1set_json_with_clock(&self, style: &str, clock: &str) -> String {
         format!(
-            "{{\"weather\":\"{}\",\"festival\":\"{}\",\"term\":\"{}\",\"lunar\":\"{}\"{}{}{}{}}}",
+            "{{\"weather\":\"{}\",\"wxemo\":\"{}\",\"festival\":\"{}\",\"term\":\"{}\",\"lunar\":\"{}\"{}{}{}{}}}",
             self.weather,
+            self.weather_emoji,
             self.festival,
             self.term,
             self.lunar,
@@ -165,12 +170,21 @@ pub fn festival_segment_text(y: i32, m: u32, d: u32) -> String {
     String::new()
 }
 
-/// 计算某日数据（weather=天气段文本；festival_seg=节日段文本（v63 含倒计时，
-/// 由调用方按日缓存后传入——倒计时需正向扫描多日，不能每秒重算））。
-pub fn compute_day(y: i32, m: u32, d: u32, weather: &str, festival_seg: &str) -> DayData {
+/// 计算某日数据（weather=天气段文本、weather_emoji=天气段 emoji Run 文本（v68）；
+/// festival_seg=节日段文本（v63 含倒计时，由调用方按日缓存后传入——倒计时需正向
+/// 扫描多日，不能每秒重算））。
+pub fn compute_day(
+    y: i32,
+    m: u32,
+    d: u32,
+    weather: &str,
+    weather_emoji: &str,
+    festival_seg: &str,
+) -> DayData {
     let solar = SolarDay::from_ymd(y as isize, m as usize, d as usize);
     DayData {
         weather: weather.to_string(),
+        weather_emoji: weather_emoji.to_string(),
         festival: DayData::seg_or_blank(festival_seg.to_string()),
         term: DayData::seg_or_blank(term_text(&solar)),
         lunar: lunar_text(&solar),
@@ -417,6 +431,14 @@ pub fn style_ext_json() -> String {
         f.push(format!("\"size_{id}\":{v:.2}"));
     }
 
+    // v68 天气 emoji 图标字号倍率（恒发，缺省 1.00=不放大；钳制 0.5~2.0，
+    // tap 侧再钳一次——双端防御。作用于天气段字号之上，仅放大图标不动文字）
+    let es = match cfg.weather_emoji_scale {
+        Some(v) if v.is_finite() => clamp_f64(v, 0.5, 2.0),
+        _ => 1.0,
+    };
+    f.push(format!("\"esize_weather\":{es:.2}"));
+
     // gap/gap2：0~40 钳制（恒发，缺省 10；gap=时间行，gap2=日期行——v57 分开调节）
     f.push(format!(
         "\"gap\":{:.0}",
@@ -520,16 +542,17 @@ pub fn spawn_data_thread() {
                     }
                 }
                 let dd = {
-                    // T 阶段：展示串按当前 liConfig 每 tick 重算（含 emoji/城区名/现象文字）
+                    // T 阶段：展示串按当前 liConfig 每 tick 重算（含 emoji/城区名/现象文字）；
+                    // v68 同场取 emoji Run 文本（wxemo 下发，tap 图标单独放大用）
                     let cfg = super::current_style();
                     let opts = super::weather::DisplayOpts::from_config(cfg.as_ref());
-                    let wx_disp = super::weather::format_now(wx.as_ref(), &opts);
+                    let (wx_disp, wx_emo) = super::weather::format_now_parts(wx.as_ref(), &opts);
                     if just_refreshed {
                         // 刷新当轮日志带展示串（含 emoji），确认映射与配置生效
                         just_refreshed = false;
                         super::dbg_log(&format!("data: weather display: {wx_disp}"));
                     }
-                    compute_day(y, m, d, &wx_disp, &fest_seg)
+                    compute_day(y, m, d, &wx_disp, &wx_emo, &fest_seg)
                 };
                 // v57：样式每 tick 重读全局（设置变更 ≤1s 生效）；行变化才发 c1set。
                 // v64：发送行恒带当前时间/日期文本（会话引导/重建即时有值）；

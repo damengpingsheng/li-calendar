@@ -84,6 +84,8 @@ export interface ClockbarStyle {
   weatherAdcode: string;
   /** 天气段 emoji 图标开关（缺省开） */
   weatherEmoji: boolean;
+  /** 天气段 emoji 图标字号倍率（0.5~2.0，缺省 1.0=与文字同大小；单独放大图标不动文字） */
+  weatherEmojiScale: number;
   /** emoji 变体（true=彩色 U+FE0F 缺省 / false=黑白 U+FE0E；实测仅部分字形真黑白） */
   weatherEmojiColor: boolean;
   /** 天气现象文字开关（缺省开） */

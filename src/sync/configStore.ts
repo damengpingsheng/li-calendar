@@ -44,6 +44,7 @@ const configWindowsDefaults = {
     weatherCity: '',
     weatherAdcode: '',
     weatherEmoji: true,
+    weatherEmojiScale: 1,
     weatherEmojiColor: true,
     weatherText: true,
     weatherWind: true,

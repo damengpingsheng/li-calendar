@@ -1,5 +1,45 @@
 // lical_clock_tap — E/S 阶段 TAP DLL（方案 v2 §5 E；v30=B 阶段，v31~v48=C/D 阶段，
 // v49/v50=E，v51=S 阶段时钟段自定义，v64=六段统一）
+// v76 变更（用户反馈）：分隔线与悬停高亮右缘重叠——sp 右 margin −5 → −7.2（用户
+//   02:14 悬停全屏截图实测：高亮右缘 x≈3817-3818，线在 x≈3813，越过线右延 ~5px；
+//   右移 2.2 DIP 后线压在缘上，距细条 ~1px。文字随盒同步右移）。
+// v75 变更（用户反馈）：半透明白再提一档 alpha 0xAA(67%) → 0xCC(80%)。
+// v74 变更（用户实测反馈）：①分隔线**不再穿出任务栏顶部描边**——上端负 margin 改
+//   +2 DIP（顶部描边=任务栏模板自带 ~1 DIP 暗色顶缘分界条，纯视觉无交互；线从描边
+//   下方 ~1 DIP 起，下端保持 -2 通到任务栏底缘）；②更明显——半透明白 alpha
+//   0x80(50%) → 0xAA(67%) → 0xCC(80%)（v75 用户再要求加明显）。
+// v73 变更（用户实测反馈，外观修订）：①线高扩至**通高**——上下负 margin -2 把线撑出
+//   Grid 槽位（Grid 高 ≈46.3 → 线 ≈50.3，任务栏窗口边界裁齐 48 DIP），不再缩进 3 DIP；
+//   ②颜色弃主题跟随（拷 Time 前景+Opacity 0.5），改**固定半透明白**（ColorHelper
+//   FromArgb 0x80 白，Win10 桌面细条分界风格；主题翻转钩子中的竖线回填随之删除）。
+// v72 变更（用户需求）：时钟区右缘与显示桌面细条之间加分隔线——
+//   包裹 Grid 结构：原生 sp[Grid[行1横板(0,0)/行2横板(1,0) | 分隔竖线(列1 RowSpan=2)],
+//   原生Time/Date(原位隐藏)]。竖线=Border 宽 1 DIP、左距横板 4 DIP、上下各缩 3 DIP、
+//   Stretch 贯穿两行（两行宽度不同/行1 居中，逐行各画一段会断成两个 x 位置，列1
+//   单一 x 位置才连续）；Fill 拷 Time 前景 + Opacity 0.5（build 创建与
+//   ActualThemeChanged 钩子两处回填=主题跟随）；IsHitTestVisible=false 不吃点击
+//   （落回时钟按钮，host 命中矩形按 HWND 自动跟随）。reflow/TruthWidthSync 零改动
+//   （线不在横板内，行宽预算/真值口径不受影响）；面板加宽 ≈5 DIP 槽位向左传导。
+//   PanelFree/tick 在场校验以 Grid 为摘挂/重插单位（横板引用与行内布局语义不变；
+//   Grid 复用跨 zombie 重建，仅 Grid↔sp 重挂接）。
+//   v71→v72 修复（v71 部署实测血泪）：get_abi 跨接口指针比较必败——Grid
+//   Children().GetAt() 返回 UIElement（IUIElement*），与 try_as<FrameworkElement>
+//   的 IFrameworkElement* 是不同 vtable 指针永不相等 → 在场判定恒 false →
+//   Append 已有父级元素抛 0x800F1000（症状=tick 每秒抛错、第二次 c1set 构建必败、
+//   横板 Width 恒 NaN）。铁律：get_abi 比较两侧必须同一投影类型（比较=UIElement，
+//   SetRow/SetColumn=FrameworkElement）。
+// v68 变更（用户需求）：天气段 emoji 图标可单独放大——
+//   ① c1set 新增 "wxemo":"<emoji基字符+变体符>"（host 恒发；空=无图标/降级态，
+//      JGetStrEmpty 允许空串值——显式清除防会话内残留）。
+//   ② style 新增 "esize_weather"（0.5~2.0，缺省 1.0=不放大；host 恒发钳制后值）。
+//   ③ reflow 行宽写入加 ≤2 DIP 微差门——混排字形度量与渲染真值有 ~1 DIP 差
+//      （209.7↔208.6 实测），无门时与 TruthWidthSync 逐秒互写拉锯；微差交真值收敛。
+// v70 变更（v68 实测修订）：emoji 放大渲染弃 Inlines 混排改**三元素横板**——
+//   Inlines 下大号 emoji Run 的字形度量撑高行盒、基线按最大 ascent 下移，段内
+//   小字整体下沉 ~2 DIP（02:22 vs 昌平 实测截图），与其它段基线错位。改为
+//   g_seg[0]=自建横板 [城区名TB][emojiTB][其余文字TB]，三元素各自 VerticalCenter
+//   独立居中——对齐机制与六段彼此对齐同源（时间 1.2× 与天气 1.05× 长期对齐的
+//   同一机制），任意倍率组合基线天然一致；间距由原串空格保持（文本仍全串拆分）。
 // v64 变更（时间/日期字号与格式可调，六段统一）：
 //   ① 段模型 4→6：time/date 成为自建段（SEGNAME[6]，order[6]，show/colors/sizes
 //      全部 [6]；rows[4]=1/rows[5]=2 恒定不收配置）。默认 order={0,1,2,5,3,4}=
@@ -913,6 +953,8 @@ static void DumpTextBlockStyle(wux::Controls::TextBlock const& tb, const char* w
 // v66：自建横板引用定义前置至此（c0meas 段级 dump 在本函数内引用；原定义在 UI 状态区）。
 static wfnd::IInspectable g_hpanelRef{ nullptr };   // 自建横板（时间行：行1 段+time 段）
 static wfnd::IInspectable g_hpanel2Ref{ nullptr };  // 第二行横板（date 段+行2 段）
+static wfnd::IInspectable g_gridRef{ nullptr };     // v71 包裹 Grid（两行横板+右缘分隔竖线的宿主）
+static wfnd::IInspectable g_sepRef{ nullptr };      // v71 右缘分隔竖线（Border 1 DIP，主题跟随半透明）
 static wfnd::IInspectable g_seg[6]{ nullptr, nullptr, nullptr, nullptr, nullptr, nullptr };
 static const char* SEGNAME[6] = { "weather", "festival", "term", "lunar", "time", "date" };
 static int RunC0Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
@@ -1066,6 +1108,19 @@ static int RunC0Job(std::shared_ptr<UiJob> job, DWORD timeoutMs) {
                                          row, p.ActualWidth(), wd, (int)p.HorizontalAlignment());
                             }
                         }
+                        // v71：包裹 Grid/分隔竖线几何（右缘分隔线定位诊断）
+                        if (auto g = g_gridRef.try_as<wux::FrameworkElement>()) {
+                            log_line("C0MEAS grid act=%.1f desired=%.1f", g.ActualWidth(), g.DesiredSize().Width);
+                        }
+                        if (auto sepF = g_sepRef.try_as<wux::Controls::Border>()) {
+                            try {
+                                auto mg = sepF.Margin();
+                                log_line("C0MEAS sep act=%.1fx%.1f margin=[%.1f %.1f %.1f %.1f] vis=%d",
+                                         sepF.ActualWidth(), sepF.ActualHeight(),
+                                         mg.Left, mg.Top, mg.Right, mg.Bottom,
+                                         (int)sepF.Visibility());
+                            } catch (...) {}
+                        }
                     }
                     job->hr = S_OK; InterlockedExchange(&job->done, 1); return;
                 }
@@ -1202,9 +1257,16 @@ struct PanelStyle {
     double  vgap = 0;                 // v59 两行垂直间距 px（钳制 0~20；第二行横板 Margin 上边距）
     int     rows[6] = { 1,1,1,2,1,2 }; // v55 段行归属：1=时间行，2=日期行（v64：4=time 恒 1，5=date 恒 2）
     int     halign[2] = { 0,0 };      // v58 行水平对齐：0=左(缺省/现状) 1=居中 2=右（作用于自建横板）
+    double  esizeWx = 1.0;            // v68 天气 emoji 图标字号倍率（0.5~2.0；1.0=不放大）
 };
 static PanelStyle         g_style;
 static wchar_t            g_segText[6][64];        // 天气 节日 节气 农历 时间 日期（host 下发缓存）
+static wchar_t            g_segEmoji[64];          // v68 天气段 emoji Run 文本（host 下发；空=无图标）
+// v70 天气段三元素横板的内层引用（仅 UI 线程触碰；容器 g_seg[0] 持有强引用，
+// 引用置空≠元素销毁——随容器统一摘除）
+static wfnd::IInspectable g_wxPreRef{ nullptr };   // [城区名]（pre 空=不存在）
+static wfnd::IInspectable g_wxEmoRef{ nullptr };   // [emoji 大号]
+static wfnd::IInspectable g_wxRestRef{ nullptr };  // [温度℃ 现象 风向]
 static unsigned           g_panelGen = 0;          // 建立时代次令牌
 // （v66：g_seg/SEGNAME/g_hpanelRef/g_hpanel2Ref 定义已前置至 RunC0Job 之前——c0meas 段级 dump 需要）
 static wfnd::IInspectable g_timeRef{ nullptr };     // 原生 Time（v64：原位隐藏；样式模板+VM 持续写其 Text）
@@ -1244,7 +1306,6 @@ static int g_tipSavedCount = 0;
 // 未收到，泄漏持续 7 分钟）。volatile LONG64 对齐 64 位读写在 x64 原子。
 static volatile LONG64 g_tipLeaseDeadline = 0;
 static volatile LONG g_tipWatchRunning = 0;
-
 // 恢复全部已保存的 tooltip 附加属性（UI 线程专用；幂等，零保存对时为无害空操作）。
 static void TipRestoreAllUi() {
     if (g_tipSavedCount <= 0) return;
@@ -1348,6 +1409,72 @@ static void ApplySegLook(wux::Controls::TextBlock const& seg, int i, wux::Contro
         }
     } catch (...) {}
 }
+// v70：天气段 emoji 容器模式判定（倍率≠1 且 host 下发了 emoji 且能在文案中定位；
+// 任一不成立=单 TextBlock 形态，与旧渲染逐字节一致）
+static bool WxEmojiMode() {
+    double es = g_style.esizeWx;
+    if (es > 0.999 && es < 1.001) return false;
+    if (!g_segEmoji[0]) return false;
+    return wcsstr(g_segText[0], g_segEmoji) != nullptr;
+}
+
+// v70：段元素从父面板摘除（先摘再弃引用——v51 实测教训：先弃引用会让元素残留
+// 视觉树继续渲染占位）
+static void DetachSegElement(int i) {
+    if (!g_seg[i]) return;
+    if (auto ui = g_seg[i].try_as<wux::UIElement>()) {
+        try {
+            auto curParent = wuxm::VisualTreeHelper::GetParent(ui.as<wux::DependencyObject>());
+            if (curParent) {
+                if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
+                    auto pch = pp.Children();
+                    for (uint32_t c = 0; c < pch.Size(); c++) {
+                        if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(ui)) { pch.RemoveAt(c); break; }
+                    }
+                }
+            }
+        } catch (...) {}
+    }
+}
+
+// v70：天气段内层三 TB 外观+文本（UI 线程）。外观口径同 ApplySegLook（行感知基准
+// ×fontscale×size_weather），emoji 元素再乘 esizeWx；颜色自定义优先/theme 拷原生。
+// 前后元素不设 VerticalAlignment 以外的行盒干预——各元素独立居中，基线天然一致。
+static void WxPartsApply(wux::Controls::TextBlock const& tb, size_t pre, const wchar_t* rest) {
+    auto preTb = g_wxPreRef.try_as<wux::Controls::TextBlock>();
+    auto emoTb = g_wxEmoRef.try_as<wux::Controls::TextBlock>();
+    auto restTb = g_wxRestRef.try_as<wux::Controls::TextBlock>();
+    if (!emoTb || !restTb) return;
+    double sz = g_style.sizes[0] > 0 ? g_style.sizes[0] : 1.0;
+    double base = tb.FontSize();
+    if (g_style.rows[0] == 2 && g_dateFontSize > 0) base = g_dateFontSize;
+    double fs = base * g_style.fontscale * sz;
+    try {
+        restTb.FontSize(fs);
+        emoTb.FontSize(fs * g_style.esizeWx);
+        if (preTb) preTb.FontSize(fs);
+        restTb.FontFamily(tb.FontFamily());  emoTb.FontFamily(tb.FontFamily());
+        restTb.FontWeight(tb.FontWeight());  emoTb.FontWeight(tb.FontWeight());
+        if (preTb) { preTb.FontFamily(tb.FontFamily()); preTb.FontWeight(tb.FontWeight()); }
+        unsigned c = g_style.colors[0];
+        if (c) {
+            wuxm::SolidColorBrush brush;
+            brush.Color(winrt::Windows::UI::Color{ 255, (BYTE)(c >> 16), (BYTE)(c >> 8), (BYTE)c });
+            restTb.Foreground(brush); emoTb.Foreground(brush);
+            if (preTb) preTb.Foreground(brush);
+        } else {
+            auto fg = tb.Foreground();
+            restTb.Foreground(fg); emoTb.Foreground(fg);
+            if (preTb) preTb.Foreground(fg);
+        }
+    } catch (...) {}
+    try {
+        emoTb.Text(winrt::hstring(g_segEmoji));
+        restTb.Text(winrt::hstring(rest));
+        if (preTb) preTb.Text(winrt::hstring(std::wstring_view(g_segText[0], pre)));
+    } catch (...) {}
+}
+
 // v64：按 g_style.order + rows 重建两行横板子项顺序（UI 线程；winRT 调用非引擎调用）。
 // 六段全部是自建 TextBlock（含 time/date 段）——每行=rows[e]==该行的段依 order 相对序
 // 落位；不再触碰原生 Time/Date（它们原位隐藏，由 PanelBuild/tick 管理 Visibility）。
@@ -1448,6 +1575,24 @@ static bool JGetStr(const char* j, const char* key, wchar_t* out, size_t nOut) {
     }
     if (*p != '"' || n == 0) return false;
     val[n] = 0;
+    return MultiByteToWideChar(CP_UTF8, 0, val, -1, out, (int)nOut) > 0;
+}
+// v68：同 JGetStr 口径但接受空串值（"key":"" → out[0]=0 返回 true）——wxemo 恒发
+// 需要「显式清除」语义（空=无图标），JGetStr 的 n==0 拒绝会把清除误当缺键。
+static bool JGetStrEmpty(const char* j, const char* key, wchar_t* out, size_t nOut) {
+    char pat[40];
+    _snprintf_s(pat, sizeof(pat), _TRUNCATE, "\"%s\":\"", key);
+    const char* p = strstr(j, pat);
+    if (!p) return false;
+    p += strlen(pat);
+    char val[180]; size_t n = 0;
+    while (*p && *p != '"' && n < sizeof(val) - 1) {
+        if (*p == '\\' || (unsigned char)*p < 0x20) return false;
+        val[n++] = *p++;
+    }
+    if (*p != '"') return false;
+    val[n] = 0;
+    if (n == 0) { out[0] = 0; return true; }
     return MultiByteToWideChar(CP_UTF8, 0, val, -1, out, (int)nOut) > 0;
 }
 static bool JGetDbl(const char* j, const char* key, double* out) {
@@ -1699,32 +1844,48 @@ static void PanelTick() {
             return;
         }
         unsigned fixed = 0;
-        // 自建横板在场校验（在原生 sp 中；hp2 同检，缺失→补插，位置 1）
+        // v71 包裹 Grid 在场校验（两行横板都住在 Grid 里；Grid 缺失→补插 sp 第 0 位），
+        // Grid 内横板缺失（半建态兜底）→ 补挂回 Grid。
         auto spCh = sp.Children();
         auto hp = g_hpanelRef.try_as<wux::Controls::StackPanel>();
         auto hp2 = g_hpanel2Ref ? g_hpanel2Ref.try_as<wux::Controls::StackPanel>() : nullptr;
-        if (hp) {
-            auto hpU = g_hpanelRef.try_as<wux::UIElement>();
+        if (auto grid = g_gridRef.try_as<wux::Controls::Grid>()) {
+            auto gU = g_gridRef.try_as<wux::UIElement>();
             bool present = false;
             for (uint32_t c = 0; c < spCh.Size(); c++)
-                if (hpU && winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(hpU)) { present = true; break; }
+                if (gU && winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(gU)) { present = true; break; }
             if (!present) {
-                spCh.InsertAt(0, g_hpanelRef.try_as<wux::UIElement>());
+                try {
+                    auto par = wuxm::VisualTreeHelper::GetParent(gU.as<wux::DependencyObject>());
+                    if (auto pp = par ? par.try_as<wux::Controls::Panel>() : nullptr) {
+                        auto pch = pp.Children();
+                        for (uint32_t c = 0; c < pch.Size(); c++)
+                            if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(gU)) { pch.RemoveAt(c); break; }
+                    }
+                } catch (...) {}
+                spCh.InsertAt(0, gU);
                 fixed++;
-                log_line("PANEL tick: re-insert hpanel at 0");
+                log_line("PANEL tick: re-insert grid at 0");
             }
-        }
-        if (hp2) {
-            auto h2U = g_hpanel2Ref.try_as<wux::UIElement>();
-            bool present = false;
-            for (uint32_t c = 0; c < spCh.Size(); c++)
-                if (h2U && winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(h2U)) { present = true; break; }
-            if (!present) {
-                uint32_t at = spCh.Size() < 1 ? 0 : 1;
-                spCh.InsertAt(at, g_hpanel2Ref.try_as<wux::UIElement>());
-                fixed++;
-                log_line("PANEL tick: re-insert hpanel2 at %u", (unsigned)at);
-            }
+            auto gch = grid.Children();
+            auto reattach = [&](wfnd::IInspectable const& ref, int row, const char* which) {
+                // 比较必须 UIElement 同接口（见 PanelBuild place 注释）
+                auto ui = ref.try_as<wux::UIElement>();
+                auto fe = ref.try_as<wux::FrameworkElement>();
+                if (!ui || !fe) return;
+                bool in = false;
+                for (uint32_t c = 0; c < gch.Size(); c++)
+                    if (winrt::get_abi(gch.GetAt(c)) == winrt::get_abi(ui)) { in = true; break; }
+                if (!in) {
+                    wux::Controls::Grid::SetRow(fe, row);
+                    wux::Controls::Grid::SetColumn(fe, 0);
+                    gch.Append(ui);
+                    fixed++;
+                    log_line("PANEL tick: re-append %s to grid", which);
+                }
+            };
+            reattach(g_hpanelRef, 0, "hpanel");
+            if (g_hpanel2Ref) reattach(g_hpanel2Ref, 1, "hpanel2");
         }
         // v64 原生 Time/Date 隐藏复核：自建 time/date 段在场（wanted）时原生元素必须
         // Collapsed；段缺席（引导期）不动。系统若回写可见性 → 再压 + 记日志（拉锯观测：
@@ -1850,7 +2011,14 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             if (td > budget) budget = td; // 时间段让位：预算下限=时间期望宽
         }
         double target = sum1 > budget ? budget : sum1;
-        try { hp.Width(target); } catch (...) {}  // v48：Width 硬钳制（MaxWidth 被环境无视）
+        // v68：Width 微差（≤2 DIP）不写——emoji 放大后混排 Run 的 DesiredSize 与
+        // 渲染真值有 ~1 DIP 字形度量差（209.7↔208.6 实测），逐秒互写与
+        // TruthWidthSync 形成拉锯循环；微差交 TruthWidthSync 兜底收敛。
+        double curW1 = 0;
+        try { curW1 = hp.Width(); } catch (...) {}
+        if (!(curW1 > target - 2.0 && curW1 < target + 2.0)) {
+            try { hp.Width(target); } catch (...) {} // v48：Width 硬钳制（MaxWidth 被环境无视）
+        }
         double overflow = sum1 - budget;
         if (overflow > 2) {
             for (int i = 0; i < n; i++) {         // 显示序自左向右：先藏离时间最远的段
@@ -1901,7 +2069,11 @@ static void PanelReflow(wux::Controls::StackPanel const& hp, wux::Controls::Stac
             if (dd > budget2) budget2 = dd; // 日期段让位
         }
         double target2 = sum2 > budget2 ? budget2 : sum2;
-        try { hp2.Width(target2); } catch (...) {}
+        double curW2 = 0;
+        try { curW2 = hp2.Width(); } catch (...) {}
+        if (!(curW2 > target2 - 2.0 && curW2 < target2 + 2.0)) {
+            try { hp2.Width(target2); } catch (...) {} // v48：同 row1（v68 微差不写防拉锯）
+        }
         double overflow2 = sum2 - budget2;
         if (overflow2 > 2) {
             for (int i = 0; i < n; i++) {         // 日期行自左向右先藏（date 段不参与）
@@ -2023,9 +2195,12 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
     g_spRef = sp; g_timeRef = tb;
     g_contRef = getObj(hCont);
 
-    // v66 右缘收紧（B）：原生 sp 右 margin −1 → −5。基线（docs §9.2）：sp 右缘距按钮
-    // 右 7 DIP（两层 ContainerGrid 各 4 内缩 − 模板 −1 溢出），−5 后距细条 ≈3 DIP
-    // 正中目标。幂等：快照仅首接管取一次；right 已 ≤−4.5 不再写（防重复触发布局）。
+    // v66 右缘收紧（B）→ v76 悬停高亮对齐：原生 sp 右 margin 模板 −1 → −5（v66 收紧
+    // 留白）→ **−7.2（v76）**。用户悬停截图实测（02:14 全屏图）：时钟按钮悬停高亮右缘
+    // x≈3817-3818（高亮越过竖线右延 ~5px 才结束），竖线在 x≈3813——右移 2.2 DIP 后线
+    // 中心 ≈3817.3 恰压在高亮右缘上（重叠），距显示桌面细条(3819)仍留 ~1px。margin 只
+    // 平移内容盒不改变期望宽以外的布局语义；文字随线同步右移，行尾距细条 ~9px。
+    // 幂等：快照仅首接管取一次；right 已 ≤−6.9 不再写（防重复触发布局）。
     // 恢复路径=PanelFree(restoreNative=true)（c1free/AUTO/退出全走此函数）。
     {
         try {
@@ -2036,10 +2211,10 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                 log_line("PANEL build: sp margin snap [%.1f %.1f %.1f %.1f]",
                          mg.Left, mg.Top, mg.Right, mg.Bottom);
             }
-            if (mg.Right > -4.5) {
-                mg.Right = -5.0;
+            if (mg.Right > -6.9) {
+                mg.Right = -7.2;
                 sp.Margin(mg);
-                log_line("PANEL build: sp margin right -> -5 (right-edge tighten)");
+                log_line("PANEL build: sp margin right -> -7.2 (hover-highlight edge overlap)");
             }
         } catch (...) { log_line("PANEL build: sp margin apply exception"); }
     }
@@ -2127,31 +2302,93 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                 // 【v51 实测教训】必须先从横板摘除再弃引用——先弃引用会让
                 // LayoutHpanelChildren 摘不到（g_seg 已空），元素残留在视觉树里
                 // 继续渲染占位，时间被 Width 钳制裁切（23:15 关天气实测）。
-                if (auto ui = g_seg[i].try_as<wux::UIElement>()) {
-                    try {
-                        auto curParent = wuxm::VisualTreeHelper::GetParent(ui.as<wux::DependencyObject>());
-                        if (curParent) {
-                            if (auto pp = curParent.try_as<wux::Controls::Panel>()) {
-                                auto pch = pp.Children();
-                                for (uint32_t c = 0; c < pch.Size(); c++) {
-                                    if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(ui)) { pch.RemoveAt(c); break; }
-                                }
-                            }
-                        }
-                    } catch (...) {}
-                }
+                DetachSegElement(i);
                 g_seg[i] = nullptr;
                 g_segHidden[i] = false;
                 g_segDesired[i] = 0;
+                if (i == 0) { g_wxPreRef = nullptr; g_wxEmoRef = nullptr; g_wxRestRef = nullptr; }
             }
             continue;
+        }
+        // v70 天气段双形态：emoji 放大=自建横板[pre|emoji|rest]（三元素独立居中，
+        // 对齐与其它段同源）；否则=单 TextBlock（旧行为）。形态切换先摘旧再换建。
+        if (i == 0 && WxEmojiMode()) {
+            bool hasContainer = g_seg[0] && !g_seg[0].try_as<wux::Controls::TextBlock>();
+            if (!hasContainer) {
+                DetachSegElement(0);
+                g_seg[0] = nullptr;
+                g_segHidden[0] = false;
+                g_segDesired[0] = 0;
+            }
+            wux::Controls::StackPanel wx{ nullptr };
+            if (g_seg[0]) wx = g_seg[0].try_as<wux::Controls::StackPanel>();
+            if (!wx) {
+                wx = wux::Controls::StackPanel{};
+                wx.Orientation(wux::Controls::Orientation::Horizontal);
+                g_seg[0] = wx;
+                g_segHidden[0] = false;
+                g_segDesired[0] = 0; // 清陈旧缓存
+            }
+            wx.VerticalAlignment(wux::VerticalAlignment::Center);
+            wx.MaxWidth(g_style.segmaxw);
+            const wchar_t* hit = wcsstr(g_segText[0], g_segEmoji);
+            size_t pre = hit ? (size_t)(hit - g_segText[0]) : 0;
+            const wchar_t* rest = hit ? hit + wcslen(g_segEmoji) : g_segText[0];
+            auto preTb = g_wxPreRef.try_as<wux::Controls::TextBlock>();
+            auto emoTb = g_wxEmoRef.try_as<wux::Controls::TextBlock>();
+            auto restTb = g_wxRestRef.try_as<wux::Controls::TextBlock>();
+            try {
+                if (!emoTb) {
+                    emoTb = wux::Controls::TextBlock{};
+                    g_wxEmoRef = emoTb;
+                    wx.Children().Append(emoTb);
+                }
+                if (!restTb) {
+                    restTb = wux::Controls::TextBlock{};
+                    g_wxRestRef = restTb;
+                    wx.Children().Append(restTb);
+                }
+                // 城区名缺失（自动定位无城区名/配置空）时无需 pre 元素；残留则摘除
+                if (pre > 0 && !preTb) {
+                    preTb = wux::Controls::TextBlock{};
+                    g_wxPreRef = preTb;
+                    wx.Children().InsertAt(0, preTb);
+                }
+                if (pre == 0 && preTb) {
+                    auto pch = wx.Children();
+                    auto pu = preTb.try_as<wux::UIElement>();
+                    for (uint32_t c = 0; pu && c < pch.Size(); c++) {
+                        if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(pu)) { pch.RemoveAt(c); break; }
+                    }
+                    g_wxPreRef = nullptr;
+                }
+                // 内层共性：独立垂直居中（对齐本体）+不换行；rest 兼具省略号截断
+                for (auto const& ref : { g_wxPreRef, g_wxEmoRef, g_wxRestRef }) {
+                    if (auto t = ref.try_as<wux::Controls::TextBlock>()) {
+                        t.VerticalAlignment(wux::VerticalAlignment::Center);
+                        t.TextWrapping(wux::TextWrapping::NoWrap);
+                    }
+                }
+                restTb.TextTrimming(wux::TextTrimming::CharacterEllipsis);
+                restTb.MaxWidth(g_style.segmaxw);
+            } catch (...) { log_line("PANEL wx container EXCEPTION"); }
+            WxPartsApply(tb, pre, rest);
+            continue;
+        }
+        if (i == 0 && g_seg[0] && !g_seg[0].try_as<wux::Controls::TextBlock>()) {
+            // 容器→单 TextBlock 形态回退（倍率调回 1.0/图标关）：先摘容器再重建
+            DetachSegElement(0);
+            g_seg[0] = nullptr;
+            g_segHidden[0] = false;
+            g_segDesired[0] = 0;
+            g_wxPreRef = nullptr; g_wxEmoRef = nullptr; g_wxRestRef = nullptr;
         }
         wux::Controls::TextBlock seg{ nullptr };
         if (g_seg[i]) seg = g_seg[i].try_as<wux::Controls::TextBlock>();
         bool makeNew = !seg;
         if (makeNew) seg = wux::Controls::TextBlock{};
-        seg.Text(winrt::hstring(g_segText[i]));
         ApplySegLook(seg, i, tb);
+        seg.Text(winrt::hstring(g_segText[i]));
         seg.VerticalAlignment(wux::VerticalAlignment::Center);
         seg.TextWrapping(wux::TextWrapping::NoWrap);
         seg.TextTrimming(wux::TextTrimming::CharacterEllipsis);
@@ -2164,21 +2401,90 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
     }
     // 子项顺序+间距统一落位（v64 六段：time/date 段=普通自建成员；原生元素不动）
     LayoutHpanelChildren(hp, hp2);
-    // 横板插到原生面板第 0 位，第二行插到第 1 位
+    // v71 包裹 Grid：两行横板装入 Grid（列0 行0/行1），列1=右缘全高分隔竖线
+    // （RowSpan=2）。Grid 复用跨重建：zombie/gen++ 后横板仍在 Grid 里，仅
+    // Grid↔sp 重新挂接（v33 同型：脱离旧树后 InsertAt 新宿主已实证可行）。
     {
+        auto grid = g_gridRef.try_as<wux::Controls::Grid>();
+        if (!grid) {
+            grid = wux::Controls::Grid{};
+            g_gridRef = grid;
+            try { // 两列（横板|竖线）两行（行1|行2）全 Auto——默认 * 平分会挤坏布局，必须显式
+                wux::Controls::ColumnDefinition c0{}, c1{};
+                c0.Width(wux::GridLengthHelper::Auto());
+                c1.Width(wux::GridLengthHelper::Auto());
+                auto cd = grid.ColumnDefinitions(); cd.Append(c0); cd.Append(c1);
+                wux::Controls::RowDefinition r0{}, r1{};
+                r0.Height(wux::GridLengthHelper::Auto());
+                r1.Height(wux::GridLengthHelper::Auto());
+                auto rd = grid.RowDefinitions(); rd.Append(r0); rd.Append(r1);
+            } catch (...) { log_line("PANEL grid defs EXCEPTION"); }
+            try {
+                // 分隔竖线（v74 外观修订，用户实测反馈）：宽 1 DIP，左距横板 4 DIP；
+                // 上端 +2 DIP 从任务栏顶部描边（~1 DIP 系统顶缘分界条）下方起笔，
+                // 下端 -2 通到任务栏底缘（Grid 拉伸=通高 48，线 48+2-2=48 → 顶留描边、
+                // 底贴边）；固定半透明白 alpha 0xCC(80%)，v75 再提一档，不吃点击，主题翻转无需回填。
+                wux::Controls::Border sep;
+                sep.Width(1.0);
+                sep.Margin({ 4, 2, 0, -2 });
+                sep.VerticalAlignment(wux::VerticalAlignment::Stretch);
+                sep.HorizontalAlignment(wux::HorizontalAlignment::Left);
+                sep.IsHitTestVisible(false);
+                wuxm::SolidColorBrush sepBrush;
+                sepBrush.Color(winrt::Windows::UI::ColorHelper::FromArgb(0xCC, 0xFF, 0xFF, 0xFF));
+                sep.Background(sepBrush);
+                wux::Controls::Grid::SetColumn(sep, 1);
+                wux::Controls::Grid::SetRowSpan(sep, 2);
+                g_sepRef = sep;
+                grid.Children().Append(sep);
+                log_line("PANEL grid: separator line created");
+            } catch (...) { log_line("PANEL grid sep EXCEPTION"); }
+        }
+        auto gch = grid.Children();
+        // 【接口指针铁律】get_abi 比较必须同接口：Grid Children().GetAt() 返回
+        // UIElement（IUIElement*），与 try_as<FrameworkElement> 的 IFrameworkElement*
+        // 是不同 vtable 指针，永不相等 → Append 误判「不在场」→ 对已有父级的元素
+        // Append 抛 0x800F1000（v71 部署实测：tick 每秒抛错+第二次 build 必败）。
+        // 比较=UIElement，SetRow/SetColumn=FrameworkElement，两者各取。
+        auto place = [&](wfnd::IInspectable const& ref, int row) {
+            auto ui = ref.try_as<wux::UIElement>();
+            auto fe = ref.try_as<wux::FrameworkElement>();
+            if (!ui || !fe) return;
+            wux::Controls::Grid::SetRow(fe, row);
+            wux::Controls::Grid::SetColumn(fe, 0);
+            bool in = false;
+            for (uint32_t c = 0; c < gch.Size(); c++)
+                if (winrt::get_abi(gch.GetAt(c)) == winrt::get_abi(ui)) { in = true; break; }
+            if (!in) {
+                try { // 旧父（升级/zombie 旧树遗留）摘除再入 Grid
+                    auto par = wuxm::VisualTreeHelper::GetParent(ui.as<wux::DependencyObject>());
+                    if (auto pp = par ? par.try_as<wux::Controls::Panel>() : nullptr) {
+                        auto pch = pp.Children();
+                        for (uint32_t c = 0; c < pch.Size(); c++)
+                            if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(ui)) { pch.RemoveAt(c); break; }
+                    }
+                } catch (...) {}
+                gch.Append(ui);
+            }
+        };
+        place(g_hpanelRef, 0);
+        place(g_hpanel2Ref, 1);
+        // Grid 插到原生面板第 0 位（已在场不动；跨 zombie 重建重挂，原生 Time/Date 顺位其后）
         auto spCh = sp.Children();
-        auto hpU = g_hpanelRef.try_as<wux::UIElement>();
+        auto gU = g_gridRef.try_as<wux::UIElement>();
         bool present = false;
-        for (uint32_t c = 0; c < spCh.Size(); c++)
-            if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(hpU)) { present = true; break; }
-        if (!present) spCh.InsertAt(0, hpU);
-        auto h2U = g_hpanel2Ref.try_as<wux::UIElement>();
-        present = false;
-        for (uint32_t c = 0; c < spCh.Size(); c++)
-            if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(h2U)) { present = true; break; }
+        for (uint32_t c = 0; gU && c < spCh.Size(); c++)
+            if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(gU)) { present = true; break; }
         if (!present) {
-            uint32_t at = spCh.Size() < 1 ? 0 : 1;
-            spCh.InsertAt(at, h2U);
+            try { // 同 place：旧父摘除（脱树子树 GetParent 可能为 null，无妨）
+                auto par = gU ? wuxm::VisualTreeHelper::GetParent(gU.as<wux::DependencyObject>()) : nullptr;
+                if (auto pp = par ? par.try_as<wux::Controls::Panel>() : nullptr) {
+                    auto pch = pp.Children();
+                    for (uint32_t c = 0; c < pch.Size(); c++)
+                        if (winrt::get_abi(pch.GetAt(c)) == winrt::get_abi(gU)) { pch.RemoveAt(c); break; }
+                }
+            } catch (...) {}
+            spCh.InsertAt(0, gU);
         }
     }
     g_panelGen = gen;
@@ -2200,10 +2506,11 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                                  k ? "|" : "", item);
             }
         }
-        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f timeFS=%.0f dateFS=%.1f szT=%.2f szD=%.2f (timeIdx=%d dateIdx=%d)",
+        log_line("PANEL %s gen=%u order=[%s] segs=[%s|%s|%s|%s|%s|%s] scale=%.2f gap=%.0f capw=%.0f timeFS=%.0f dateFS=%.1f szT=%.2f szD=%.2f esWx=%.2f emo=%d (timeIdx=%d dateIdx=%d)",
                  rebuildAfterGen ? "rebuild" : "build", gen, ordA, s0, s1, s2, s3, s4, s5,
                  g_style.fontscale, g_style.gap, g_style.capw, tb.FontSize(), g_dateFontSize,
-                 g_style.sizes[4], g_style.sizes[5], timeIdx, dateIdx);
+                 g_style.sizes[4], g_style.sizes[5], g_style.esizeWx, (int)(g_segEmoji[0] != 0),
+                 timeIdx, dateIdx);
         log_line("PANEL gaps: row1=%.0f row2=%.0f", g_style.gap, g_style.gap2);
     }
 
@@ -2295,6 +2602,12 @@ static HRESULT PanelBuild(bool rebuildAfterGen) {
                         if (g_style.colors[i]) continue;
                         if (auto s = g_seg[i].try_as<wux::Controls::TextBlock>()) s.Foreground(fg);
                     }
+                    // v70：天气容器形态 g_seg[0] 非 TextBlock——内层三元素同步主题前景
+                    if (!g_style.colors[0]) {
+                        for (auto const& ref : { g_wxPreRef, g_wxEmoRef, g_wxRestRef }) {
+                            if (auto s = ref.try_as<wux::Controls::TextBlock>()) s.Foreground(fg);
+                        }
+                    }
                     log_line("PANEL theme changed: theme-follow foreground re-copied");
                 }
             } catch (...) { log_line("PANEL theme EXCEPTION"); }
@@ -2356,10 +2669,15 @@ static void PanelFree(bool restoreNative) {
             g_spMarginSnapped = false;
         }
     }
-    // 摘两块自建横板（段全在其中；不触碰原生 Time/Date 位置）
+    // 摘自建包裹 Grid（两行横板+分隔竖线全在其内，随 Grid 一起离开视觉树；
+    // 不触碰原生 Time/Date 位置）。横板直插 sp 的旧路径兜底保留（引用半建态防御）。
     auto sp = g_spRef ? g_spRef.try_as<wux::Controls::StackPanel>() : nullptr;
     if (sp) {
         auto spCh = sp.Children();
+        auto gU = g_gridRef.try_as<wux::UIElement>();
+        for (uint32_t c = 0; gU && c < spCh.Size(); c++) {
+            if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(gU)) { spCh.RemoveAt(c); break; }
+        }
         auto hpU = g_hpanelRef.try_as<wux::UIElement>();
         for (uint32_t c = 0; hpU && c < spCh.Size(); c++) {
             if (winrt::get_abi(spCh.GetAt(c)) == winrt::get_abi(hpU)) { spCh.RemoveAt(c); break; }
@@ -2372,6 +2690,8 @@ static void PanelFree(bool restoreNative) {
     for (int i = 0; i < 6; i++) { g_seg[i] = nullptr; g_segHidden[i] = false; g_segDesired[i] = 0; }
     g_hpanelRef = nullptr;
     g_hpanel2Ref = nullptr;
+    g_gridRef = nullptr;  // v71：Grid/竖线随引用释放（横板是它的子项，无独立残留）
+    g_sepRef = nullptr;
     // 摘输入 Border
     if (g_borderRef) {
         try {
@@ -2832,6 +3152,12 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                                 any = true;
                             }
                         }
+                        // v68 天气段 emoji Run 文本（允许空串=显式清除；host 与天气
+                        // 文案同源生成，tap 只做定位不做校验）
+                        if (JGetStrEmpty(rest, "wxemo", tmp, 64)) {
+                            wcsncpy_s(g_segEmoji, tmp, _TRUNCATE);
+                            any = true;
+                        }
                         // v51 style 对象（一层扁平键；逐键校验，非法键整键拒绝、
                         // 非法值忽略保留旧值——与平面字段同款防御）
                         char scope[600];
@@ -2876,6 +3202,14 @@ static DWORD WINAPI pipe_thread(LPVOID) {
                             double dA2;
                             if (JGetDbl(scope, "align2", &dA2)) {
                                 st.halign[1] = dA2 < 0.5 ? 0 : (dA2 < 1.5 ? 1 : 2);
+                                any = true;
+                            }
+                            // v68 天气 emoji 图标字号倍率（0.5~2.0 钳制；缺省保持 1.0）
+                            double dEs;
+                            if (JGetDbl(scope, "esize_weather", &dEs)) {
+                                if (dEs < 0.5) dEs = 0.5;
+                                if (dEs > 2.0) dEs = 2.0;
+                                st.esizeWx = dEs;
                                 any = true;
                             }
                         }
